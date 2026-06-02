@@ -51,6 +51,43 @@ METRICS = {
     },
 }
 
+# Units that mark an operating-parameter cell in the lower/right section of a
+# plant sheet. Each reading is laid out as a (tag, value, unit) triple, e.g.
+# "PI 1601" | 56 | "bar". The unit normalizes (see normalize_text) to one of
+# these keys, which also tells us what kind of parameter it is.
+OP_PARAM_KINDS = {
+    "bar": "pressure",
+    "deg c": "temperature",
+    "us cm": "conductivity",
+    "lit hrs": "flow",
+    "m3 hr": "flow",
+}
+
+PARAM_COLUMNS = [
+    "source_file",
+    "plant_group",
+    "plant",
+    "report_date",
+    "tag",
+    "kind",
+    "value",
+    "unit",
+]
+
+# Differential pressure across the high-pressure membrane array. The standard
+# instrument scheme on these reports tags the array feed as PI 1601 and the
+# array reject/concentrate as PI 1602; dP = feed - reject. Rising dP over time
+# is the classic membrane fouling / scaling signal.
+DP_FEED_TAG = "1601"
+DP_REJECT_TAG = "1602"
+
+DP_METRIC = {
+    "axis_label": "Differential Pressure (bar)",
+    "unit": "bar",
+    "bad_direction": "up",
+    "threshold_factor": 1.30,
+}
+
 
 @dataclass(frozen=True)
 class ReportMeta:
@@ -423,6 +460,77 @@ def read_report(path: Path) -> list[dict[str, object]]:
     return records
 
 
+def display_tag(normalized_tag: str) -> str:
+    return normalized_tag.upper()
+
+
+def extract_operating_parameters(
+    raw: pd.DataFrame,
+    *,
+    report_path: Path,
+    sheet_name: str,
+    metadata: ReportMeta,
+) -> list[dict[str, object]]:
+    """Scan a raw sheet for (tag, value, unit) instrument readings.
+
+    Operating parameters appear in two layouts: a key-value block below the
+    module table, or extra columns to the right of it. Both place the unit
+    immediately right of the value, with the instrument tag one cell further
+    left, so a single scan keyed on the unit cell handles both. The last
+    occurrence of a tag wins.
+    """
+    plant = clean_sheet_name(sheet_name)
+    found: dict[str, dict[str, object]] = {}
+    rows, cols = raw.shape
+
+    for row_index in range(rows):
+        for col_index in range(cols):
+            unit = normalize_text(raw.iat[row_index, col_index])
+            kind = OP_PARAM_KINDS.get(unit)
+            if kind is None or col_index < 2:
+                continue
+
+            value = pd.to_numeric(raw.iat[row_index, col_index - 1], errors="coerce")
+            tag = normalize_text(raw.iat[row_index, col_index - 2])
+            if not tag or pd.isna(value):
+                continue
+
+            found[tag] = {
+                "source_file": report_path.name,
+                "plant_group": metadata.plant_group,
+                "plant": plant,
+                "report_date": metadata.report_date,
+                "tag": display_tag(tag),
+                "kind": kind,
+                "value": float(value),
+                "unit": unit,
+            }
+
+    return list(found.values())
+
+
+def read_report_parameters(path: Path) -> list[dict[str, object]]:
+    if path.suffix.lower() == ".csv":
+        return []
+
+    metadata = parse_report_metadata(path)
+    records: list[dict[str, object]] = []
+    workbook = pd.ExcelFile(path)
+    for sheet_name in workbook.sheet_names:
+        if clean_sheet_name(sheet_name).lower() == "mis":
+            continue
+        raw = pd.read_excel(path, sheet_name=sheet_name, header=None)
+        records.extend(
+            extract_operating_parameters(
+                raw,
+                report_path=path,
+                sheet_name=sheet_name,
+                metadata=metadata,
+            )
+        )
+    return records
+
+
 def read_manual_readings(root: Path) -> list[dict[str, object]]:
     manual_path = root / MANUAL_DATA_FILE
     if not manual_path.exists():
@@ -526,6 +634,55 @@ def load_reports(data_dir: str) -> tuple[pd.DataFrame, list[str]]:
     )
     df = df.sort_values(["plant_group", "plant", "module_number", "report_date"])
     return df.reset_index(drop=True), skipped
+
+
+@st.cache_data(show_spinner="Reading plant operating parameters...")
+def load_parameters(data_dir: str) -> pd.DataFrame:
+    root = Path(data_dir)
+    records: list[dict[str, object]] = []
+
+    for path in report_paths(root):
+        try:
+            records.extend(read_report_parameters(path))
+        except Exception:  # noqa: BLE001
+            continue
+
+    if not records:
+        return pd.DataFrame(columns=PARAM_COLUMNS)
+
+    df = pd.DataFrame(records)
+    df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["report_date", "value"])
+    df = df.drop_duplicates(
+        subset=["plant_group", "plant", "report_date", "tag"], keep="last"
+    )
+    return df.sort_values(["plant_group", "plant", "tag", "report_date"]).reset_index(drop=True)
+
+
+def differential_pressure_series(
+    params: pd.DataFrame, plant_group: str, plant: str
+) -> pd.DataFrame:
+    pressures = params[
+        (params["plant_group"] == plant_group)
+        & (params["plant"] == plant)
+        & (params["kind"] == "pressure")
+    ]
+    if pressures.empty:
+        return pd.DataFrame(columns=["report_date", "value"])
+
+    rows: list[dict[str, object]] = []
+    for report_date, group in pressures.groupby("report_date"):
+        feed = group[group["tag"].str.contains(DP_FEED_TAG, regex=False)]["value"]
+        reject = group[group["tag"].str.contains(DP_REJECT_TAG, regex=False)]["value"]
+        if feed.empty or reject.empty:
+            continue
+        rows.append({"report_date": report_date, "value": float(feed.iloc[0]) - float(reject.iloc[0])})
+
+    series = pd.DataFrame(rows)
+    if series.empty:
+        return pd.DataFrame(columns=["report_date", "value"])
+    return series.sort_values("report_date").reset_index(drop=True)
 
 
 def format_module_number(value: object) -> str:
@@ -801,6 +958,7 @@ def render_add_data_controls(
         if st.button("Save Uploaded Report(s)", disabled=not uploaded_files):
             saved, skipped = save_uploaded_reports(uploaded_files or [], APP_DIR)
             load_reports.clear()
+            load_parameters.clear()
             if saved:
                 st.success(f"Saved {len(saved)} report(s).")
             if skipped:
@@ -873,7 +1031,310 @@ def render_add_data_controls(
             rerun_app()
 
 
-def render_dashboard(df: pd.DataFrame) -> None:
+def make_pressure_overview_chart(pressures: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    for tag, group in pressures.groupby("tag"):
+        ordered = group.sort_values("report_date")
+        fig.add_trace(
+            go.Scatter(
+                x=ordered["report_date"],
+                y=ordered["value"],
+                mode="lines+markers",
+                name=str(tag),
+                hovertemplate=f"{tag}<br>%{{x|%d %b %Y}}<br>%{{y:,.2f}} bar<extra></extra>",
+            )
+        )
+    fig.update_layout(
+        title="All Pressure Tags",
+        xaxis_title="Report Date",
+        yaxis_title="Pressure (bar)",
+        hovermode="x unified",
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
+        template="plotly_white",
+        height=420,
+    )
+    return fig
+
+
+def render_pressure_section(
+    params: pd.DataFrame,
+    selected_group: str,
+    selected_plant: str,
+    show_trend: bool,
+) -> None:
+    if params.empty:
+        return
+
+    pressures = params[
+        (params["plant_group"] == selected_group)
+        & (params["plant"] == selected_plant)
+        & (params["kind"] == "pressure")
+    ]
+
+    st.markdown("---")
+    st.subheader("Membrane Differential Pressure")
+    st.caption(
+        "Differential pressure across the high-pressure array "
+        f"(dP = PI {DP_FEED_TAG} array feed − PI {DP_REJECT_TAG} array reject). "
+        "A rising dP is the classic membrane fouling / scaling signal."
+    )
+
+    if pressures.empty:
+        st.info("No pressure (bar) readings were found for this plant.")
+        return
+
+    dp = differential_pressure_series(params, selected_group, selected_plant)
+    unit = str(DP_METRIC["unit"])
+    bad_direction = str(DP_METRIC["bad_direction"])
+
+    if dp.empty:
+        st.info(
+            "Pressure readings exist, but this plant is missing one side of the "
+            f"PI {DP_FEED_TAG}/PI {DP_REJECT_TAG} pair needed to compute differential pressure. "
+            "Raw pressures are shown below."
+        )
+    else:
+        trend = fit_linear_trend(dp)
+        threshold_default = default_threshold(dp, DP_METRIC)
+        threshold_step = max(threshold_default * 0.05, 0.1)
+        threshold = st.number_input(
+            "Differential Pressure Failure Threshold (bar)",
+            min_value=0.0,
+            value=float(round(threshold_default, 2)),
+            step=float(round(threshold_step, 2)),
+            help="Rising dP crossing this value flags fouling. Used for status and failure-date prediction.",
+            key="dp_threshold",
+        )
+
+        latest_row = dp.sort_values("report_date").iloc[-1]
+        latest = float(latest_row["value"])
+        status, status_color = system_status(latest, threshold, bad_direction)
+        slope_30 = float(trend["slope_per_day"]) * 30 if trend else np.nan
+        failure_date = predicted_failure_date(trend, threshold, bad_direction)
+        already_critical = is_at_or_beyond_threshold(latest, threshold, bad_direction)
+        failure_marker_date = None if already_critical else failure_date
+        latest_date = pd.Timestamp(latest_row["report_date"]).strftime("%d %b %Y")
+
+        if trend:
+            slope_text = f"{slope_30:+,.2f} {unit}/30d"
+            slope_subtitle = f"R2 {float(trend['r_squared']):.2f}"
+        else:
+            slope_text = "Need more data"
+            slope_subtitle = "At least 2 report months required"
+
+        if already_critical:
+            failure_text = "Already Critical"
+            failure_subtitle = f"dP crossed threshold on {latest_date}"
+        elif failure_date is not None:
+            failure_text = failure_date.strftime("%d %b %Y")
+            failure_subtitle = "Linear trend threshold crossing"
+        else:
+            failure_text = "Not projected"
+            failure_subtitle = "Trend does not cross threshold"
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            metric_card("Latest dP", f"{latest:,.2f} {unit}", latest_date)
+        with col2:
+            metric_card("30-Day dP Rate", slope_text, slope_subtitle)
+        with col3:
+            metric_card("Fouling Status", status, f"Threshold: {threshold:,.2f} {unit}", status_color)
+        with col4:
+            metric_card("Predicted Failure", failure_text, failure_subtitle)
+
+        st.plotly_chart(
+            make_chart(
+                dp,
+                metric_name="Membrane Differential Pressure",
+                metric_config=DP_METRIC,
+                trend=trend,
+                threshold=threshold,
+                show_trend=show_trend,
+                failure_date=failure_marker_date,
+            ),
+            width="stretch",
+        )
+
+    st.plotly_chart(make_pressure_overview_chart(pressures), width="stretch")
+
+    with st.expander("Pressure readings"):
+        display = (
+            pressures[["report_date", "tag", "value", "unit"]]
+            .sort_values(["report_date", "tag"])
+            .rename(
+                columns={
+                    "report_date": "Report Date",
+                    "tag": "Tag",
+                    "value": "Value",
+                    "unit": "Unit",
+                }
+            )
+        )
+        st.dataframe(display, width="stretch", hide_index=True)
+
+
+def module_series_map(
+    plant_df: pd.DataFrame, module_labels: list[str], metric_col: str
+) -> dict[str, pd.DataFrame]:
+    series_map: dict[str, pd.DataFrame] = {}
+    for module_label in module_labels:
+        module_df = plant_df[plant_df["module_label"] == module_label]
+        series = aggregate_series(module_df, metric_col)
+        if not series.empty:
+            series_map[module_label] = series
+    return series_map
+
+
+def make_comparison_chart(
+    series_map: dict[str, pd.DataFrame],
+    *,
+    metric_config: dict[str, object],
+    average: pd.DataFrame | None,
+) -> go.Figure:
+    fig = go.Figure()
+    for module_label, series in series_map.items():
+        ordered = series.sort_values("report_date")
+        fig.add_trace(
+            go.Scatter(
+                x=ordered["report_date"],
+                y=ordered["value"],
+                mode="lines+markers",
+                name=f"Module {module_label}",
+                marker={"size": 7},
+                hovertemplate=f"Module {module_label}<br>%{{x|%d %b %Y}}<br>%{{y:,.2f}}<extra></extra>",
+            )
+        )
+
+    if average is not None and not average.empty:
+        ordered = average.sort_values("report_date")
+        fig.add_trace(
+            go.Scatter(
+                x=ordered["report_date"],
+                y=ordered["value"],
+                mode="lines",
+                name="Plant average",
+                line={"color": "#475569", "width": 2, "dash": "dash"},
+                hovertemplate="Plant average<br>%{x|%d %b %Y}<br>%{y:,.2f}<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        title="Module Comparison",
+        xaxis_title="Report Date",
+        yaxis_title=str(metric_config["axis_label"]),
+        hovermode="x unified",
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1},
+        template="plotly_white",
+        height=470,
+    )
+    return fig
+
+
+def build_comparison_table(
+    series_map: dict[str, pd.DataFrame], metric_config: dict[str, object]
+) -> pd.DataFrame:
+    unit = str(metric_config["unit"])
+    bad_direction = str(metric_config["bad_direction"])
+    rows: list[dict[str, object]] = []
+
+    for module_label, series in series_map.items():
+        ordered = series.sort_values("report_date")
+        latest_row = ordered.iloc[-1]
+        latest = float(latest_row["value"])
+        trend = fit_linear_trend(series)
+        threshold = default_threshold(series, metric_config)
+        status, _ = system_status(latest, threshold, bad_direction)
+        failure_date = predicted_failure_date(trend, threshold, bad_direction)
+        already_critical = is_at_or_beyond_threshold(latest, threshold, bad_direction)
+
+        if trend:
+            rate = float(trend["slope_per_day"]) * 30
+            rate_text = f"{rate:+,.2f} {unit}/30d"
+            r2_text = f"{float(trend['r_squared']):.2f}"
+        else:
+            rate_text = "n/a"
+            r2_text = "n/a"
+
+        if already_critical:
+            failure_text = "Already critical"
+        elif failure_date is not None:
+            failure_text = failure_date.strftime("%d %b %Y")
+        else:
+            failure_text = "Not projected"
+
+        rows.append(
+            {
+                "Module": module_label,
+                "Latest": f"{latest:,.2f} {unit}",
+                "Latest Date": pd.Timestamp(latest_row["report_date"]).strftime("%d %b %Y"),
+                "30-Day Rate": rate_text,
+                "R2": r2_text,
+                "Status": status,
+                "Predicted Failure": failure_text,
+                "_sort": failure_date if failure_date is not None else pd.Timestamp.max,
+            }
+        )
+
+    table = pd.DataFrame(rows)
+    if table.empty:
+        return table
+    return table.sort_values("_sort").drop(columns="_sort").reset_index(drop=True)
+
+
+def render_comparison_section(
+    plant_df: pd.DataFrame,
+    selected_module: str,
+    metric_name: str,
+    metric_config: dict[str, object],
+) -> None:
+    module_labels = sorted(
+        plant_df["module_label"].dropna().unique(),
+        key=lambda item: pd.to_numeric(item, errors="coerce"),
+    )
+    if len(module_labels) < 2:
+        return
+
+    st.markdown("---")
+    st.subheader("Compare Modules")
+    st.caption(
+        f"Overlay multiple modules for {metric_name.lower()} to spot outliers against their peers. "
+        "Status and predicted failure use each module's own baseline-derived threshold."
+    )
+
+    default_selection = [selected_module] if selected_module in module_labels else module_labels[:1]
+    chosen = st.multiselect(
+        "Modules to compare",
+        options=module_labels,
+        default=default_selection,
+        key="compare_modules",
+    )
+    show_average = st.checkbox("Show plant average", value=True, key="compare_average")
+
+    if not chosen:
+        st.info("Select at least one module to compare.")
+        return
+
+    metric_col = str(metric_config["column"])
+    series_map = module_series_map(plant_df, chosen, metric_col)
+    if not series_map:
+        st.warning("No valid readings for the selected modules and metric.")
+        return
+
+    average = aggregate_series(plant_df, metric_col) if show_average else None
+
+    st.plotly_chart(
+        make_comparison_chart(series_map, metric_config=metric_config, average=average),
+        width="stretch",
+    )
+
+    table = build_comparison_table(series_map, metric_config)
+    if not table.empty:
+        st.caption("Sorted by predicted failure date (soonest first).")
+        st.dataframe(table, width="stretch", hide_index=True)
+
+
+def render_dashboard(df: pd.DataFrame, params: pd.DataFrame) -> None:
     filtered, selected_group, selected_plant, selected_module, metric_name, show_trend = sidebar_filters(df)
     render_add_data_controls(df, selected_group, selected_plant, selected_module)
     metric_config = METRICS[metric_name]
@@ -975,6 +1436,11 @@ def render_dashboard(df: pd.DataFrame) -> None:
         )
         st.dataframe(display, width="stretch", hide_index=True)
 
+    plant_df = df[(df["plant_group"] == selected_group) & (df["plant"] == selected_plant)]
+    render_comparison_section(plant_df, selected_module, metric_name, metric_config)
+
+    render_pressure_section(params, selected_group, selected_plant, show_trend)
+
 
 def main() -> None:
     st.set_page_config(
@@ -1032,7 +1498,8 @@ def main() -> None:
             for item in skipped:
                 st.write(item)
 
-    render_dashboard(df)
+    params = load_parameters(str(APP_DIR))
+    render_dashboard(df, params)
 
 
 if __name__ == "__main__":
