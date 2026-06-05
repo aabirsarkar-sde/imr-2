@@ -1,31 +1,36 @@
 from __future__ import annotations
 
 import calendar
+import hashlib
+import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from sqlalchemy import (
+    Column,
+    Date,
+    DateTime,
+    Float,
+    Integer,
+    MetaData,
+    Table,
+    Text,
+    create_engine,
+    text,
+)
+from sqlalchemy.engine import Engine
 
 
 APP_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR_NAME = "uploaded_reports"
 MANUAL_DATA_FILE = "manual_readings.csv"
 REPORT_GLOBS = ("*.xlsx", "*.xls", "*.csv")
-MANUAL_COLUMNS = [
-    "source_file",
-    "plant_group",
-    "plant",
-    "stage",
-    "module_number",
-    "install_date",
-    "report_date",
-    "flow_lph",
-    "conductivity_us_cm",
-]
 MONTHS = {
     month.lower(): index
     for index, month in enumerate(calendar.month_name)
@@ -74,19 +79,11 @@ PARAM_COLUMNS = [
     "unit",
 ]
 
-# Differential pressure across the high-pressure membrane array. The standard
-# instrument scheme on these reports tags the array feed as PI 1601 and the
-# array reject/concentrate as PI 1602; dP = feed - reject. Rising dP over time
-# is the classic membrane fouling / scaling signal.
-DP_FEED_TAG = "1601"
-DP_REJECT_TAG = "1602"
-
-DP_METRIC = {
-    "axis_label": "Differential Pressure (bar)",
-    "unit": "bar",
-    "bad_direction": "up",
-    "threshold_factor": 1.30,
-}
+# Feed pressure to the high-pressure membrane array. The standard instrument
+# scheme on these reports tags the array feed as PI 1601. We surface this as the
+# operating pressure at which each flow/conductivity reading was taken. Other
+# pressure tags are ignored for now.
+FEED_TAG = "1601"
 
 
 @dataclass(frozen=True)
@@ -111,6 +108,13 @@ def clean_label(value: object) -> str:
 
 def clean_sheet_name(sheet_name: str) -> str:
     return re.sub(r"\s+", " ", sheet_name).strip()
+
+
+def plant_sr_no_from_name(name: object) -> int | None:
+    """Pull the trailing "(NNNN)" plant id from a sheet name, e.g.
+    "Lupin Ank RO1 (1639)" -> 1639. This joins a reading to its MIS row."""
+    match = re.search(r"\((\d+)\)\s*$", str(name))
+    return int(match.group(1)) if match else None
 
 
 def parse_report_metadata(path: Path) -> ReportMeta:
@@ -259,6 +263,7 @@ def find_module_blocks(raw: pd.DataFrame, header_row: int) -> list[dict[str, int
         required = {"module_col", "install_date_col", "flow_col", "conductivity_col"}
         if required.issubset(block):
             block["stage"] = find_stage_label(raw, header_row, module_col, next_module_col)
+            block["end_col"] = next_module_col
             blocks.append(block)
 
     return blocks
@@ -268,6 +273,19 @@ def value_at(raw: pd.DataFrame, row: int, col: int | str) -> object:
     if not isinstance(col, int) or row >= len(raw) or col >= raw.shape[1]:
         return np.nan
     return raw.iat[row, col]
+
+
+def is_bypass_marker(values: list[object]) -> bool:
+    """A module is bypassed when any cell in its block reads BY PASS / Bypass.
+
+    A bypassed membrane has a module number but empty flow/conductivity cells,
+    so it would otherwise be dropped — yet it is the strongest replacement
+    signal we have, so we keep it as data (status="bypass")."""
+    for value in values:
+        normalized = normalize_text(value)
+        if "by pass" in normalized or "bypass" in normalized:
+            return True
+    return False
 
 
 def extract_rows_from_sheet(
@@ -287,6 +305,7 @@ def extract_rows_from_sheet(
 
     records: list[dict[str, object]] = []
     plant = clean_sheet_name(sheet_name)
+    plant_sr_no = plant_sr_no_from_name(sheet_name)
 
     for row_index in range(header_row + 1, len(raw)):
         for block in blocks:
@@ -295,25 +314,37 @@ def extract_rows_from_sheet(
             if pd.isna(module_number):
                 continue
 
-            flow = pd.to_numeric(value_at(raw, row_index, block["flow_col"]), errors="coerce")
-            conductivity = pd.to_numeric(
-                value_at(raw, row_index, block["conductivity_col"]),
-                errors="coerce",
-            )
-            if pd.isna(flow) and pd.isna(conductivity):
-                continue
+            block_cells = [
+                value_at(raw, row_index, col)
+                for col in range(int(block["module_col"]), int(block["end_col"]))
+            ]
+            bypass = is_bypass_marker(block_cells)
+
+            if bypass:
+                flow = np.nan
+                conductivity = np.nan
+            else:
+                flow = pd.to_numeric(value_at(raw, row_index, block["flow_col"]), errors="coerce")
+                conductivity = pd.to_numeric(
+                    value_at(raw, row_index, block["conductivity_col"]),
+                    errors="coerce",
+                )
+                if pd.isna(flow) and pd.isna(conductivity):
+                    continue
 
             records.append(
                 {
                     "source_file": report_path.name,
                     "plant_group": metadata.plant_group,
                     "plant": plant,
+                    "plant_sr_no": plant_sr_no,
                     "stage": block.get("stage", ""),
                     "module_number": float(module_number),
                     "install_date": value_at(raw, row_index, block["install_date_col"]),
                     "report_date": metadata.report_date,
                     "flow_lph": float(flow) if pd.notna(flow) else np.nan,
                     "conductivity_us_cm": float(conductivity) if pd.notna(conductivity) else np.nan,
+                    "status": "bypass" if bypass else "active",
                 }
             )
 
@@ -359,10 +390,15 @@ def extract_rows_from_structured_table(
         if pd.isna(module_number):
             continue
 
-        flow = pd.to_numeric(row.get(flow_col), errors="coerce")
-        conductivity = pd.to_numeric(row.get(conductivity_col), errors="coerce")
-        if pd.isna(flow) and pd.isna(conductivity):
-            continue
+        bypass = is_bypass_marker(list(row.values))
+        if bypass:
+            flow = np.nan
+            conductivity = np.nan
+        else:
+            flow = pd.to_numeric(row.get(flow_col), errors="coerce")
+            conductivity = pd.to_numeric(row.get(conductivity_col), errors="coerce")
+            if pd.isna(flow) and pd.isna(conductivity):
+                continue
 
         reading_date = metadata.report_date
         if reading_date_col is not None and pd.notna(row.get(reading_date_col)):
@@ -391,12 +427,14 @@ def extract_rows_from_structured_table(
                 "source_file": report_path.name,
                 "plant_group": plant_group,
                 "plant": plant,
+                "plant_sr_no": plant_sr_no_from_name(plant),
                 "stage": stage,
                 "module_number": float(module_number),
                 "install_date": install_date,
                 "report_date": reading_date,
                 "flow_lph": float(flow) if pd.notna(flow) else np.nan,
                 "conductivity_us_cm": float(conductivity) if pd.notna(conductivity) else np.nan,
+                "status": "bypass" if bypass else "active",
             }
         )
 
@@ -531,28 +569,109 @@ def read_report_parameters(path: Path) -> list[dict[str, object]]:
     return records
 
 
-def read_manual_readings(root: Path) -> list[dict[str, object]]:
-    manual_path = root / MANUAL_DATA_FILE
-    if not manual_path.exists():
+def find_mis_header_row(raw: pd.DataFrame) -> int | None:
+    for row_index in range(min(len(raw), 8)):
+        joined = " ".join(normalize_text(value) for value in raw.iloc[row_index].tolist())
+        if "plant sr no" in joined and "site name" in joined:
+            return row_index
+    return None
+
+
+def map_mis_columns(header_cells: list[object]) -> dict[str, int]:
+    """Map MIS field name -> column index by matching the normalized header.
+    'plant sr no' is checked before the plain 'sr no' so the two don't collide."""
+    mapping: dict[str, int] = {}
+    for col, cell in enumerate(header_cells):
+        normalized = normalize_text(cell)
+        if not normalized:
+            continue
+        if "plant sr no" in normalized:
+            mapping["plant_sr_no"] = col
+        elif normalized == "zone":
+            mapping["zone"] = col
+        elif "zm name" in normalized:
+            mapping["zm_name"] = col
+        elif "site name" in normalized:
+            mapping["site_name"] = col
+        elif normalized == "status":
+            mapping["status"] = col
+        elif "membrane required" in normalized:
+            mapping["membrane_required"] = col
+        elif "remark" in normalized:
+            mapping["remarks"] = col
+    return mapping
+
+
+def extract_mis_rows(
+    raw: pd.DataFrame, *, report_path: Path, metadata: ReportMeta
+) -> list[dict[str, object]]:
+    """Parse the MIS register sheet (one per workbook).
+
+    ZONE and ZM NAME are merged cells that are blank on continuation rows, so we
+    forward-fill them down. Rows without a PLANT SR NO are skipped.
+    """
+    header_row = find_mis_header_row(raw)
+    if header_row is None:
         return []
 
-    table = pd.read_csv(manual_path)
-    for column in MANUAL_COLUMNS:
-        if column not in table.columns:
-            table[column] = np.nan
+    mapping = map_mis_columns(raw.iloc[header_row].tolist())
+    if "plant_sr_no" not in mapping:
+        return []
 
-    return table[MANUAL_COLUMNS].to_dict("records")
+    def cell_text(row_index: int, field: str) -> str | None:
+        value = value_at(raw, row_index, mapping.get(field))
+        if pd.isna(value):
+            return None
+        return str(value).strip() or None
+
+    records: list[dict[str, object]] = []
+    last_zone: str | None = None
+    last_zm: str | None = None
+
+    for row_index in range(header_row + 1, len(raw)):
+        zone = cell_text(row_index, "zone")
+        if zone:  # merged cell: only set on the group's first row
+            last_zone = zone
+        zm_name = cell_text(row_index, "zm_name")
+        if zm_name:
+            last_zm = zm_name
+
+        plant_sr_no = pd.to_numeric(value_at(raw, row_index, mapping["plant_sr_no"]), errors="coerce")
+        if pd.isna(plant_sr_no):
+            continue
+
+        records.append(
+            {
+                "source_file": report_path.name,
+                "report_date": metadata.report_date,
+                "zone": last_zone,
+                "zm_name": last_zm,
+                "plant_sr_no": int(plant_sr_no),
+                "site_name": cell_text(row_index, "site_name"),
+                "status": cell_text(row_index, "status"),
+                "membrane_required": pd.to_numeric(
+                    value_at(raw, row_index, mapping.get("membrane_required")), errors="coerce"
+                ),
+                "remarks": cell_text(row_index, "remarks"),
+            }
+        )
+
+    return records
 
 
-def append_manual_reading(root: Path, row: dict[str, object]) -> None:
-    manual_path = root / MANUAL_DATA_FILE
-    if manual_path.exists():
-        table = pd.read_csv(manual_path)
-    else:
-        table = pd.DataFrame(columns=MANUAL_COLUMNS)
+def read_report_mis(path: Path) -> list[dict[str, object]]:
+    if path.suffix.lower() == ".csv":
+        return []
 
-    table = pd.concat([table, pd.DataFrame([row], columns=MANUAL_COLUMNS)], ignore_index=True)
-    table.to_csv(manual_path, index=False)
+    metadata = parse_report_metadata(path)
+    records: list[dict[str, object]] = []
+    workbook = pd.ExcelFile(path)
+    for sheet_name in workbook.sheet_names:
+        if clean_sheet_name(sheet_name).lower() != "mis":
+            continue
+        raw = pd.read_excel(path, sheet_name=sheet_name, header=None)
+        records.extend(extract_mis_rows(raw, report_path=path, metadata=metadata))
+    return records
 
 
 def safe_upload_name(filename: str) -> str:
@@ -567,7 +686,7 @@ def save_uploaded_reports(files: list[object], root: Path) -> tuple[list[str], l
 
     saved: list[str] = []
     skipped: list[str] = []
-    allowed_suffixes = {".xlsx", ".xls", ".csv"}
+    allowed_suffixes = {".xlsx", ".xls"}
 
     for uploaded_file in files:
         filename = safe_upload_name(getattr(uploaded_file, "name", "uploaded_report.xlsx"))
@@ -586,30 +705,130 @@ def save_uploaded_reports(files: list[object], root: Path) -> tuple[list[str], l
     return saved, skipped
 
 
-@st.cache_data(show_spinner="Loading and cleaning monthly RO reports...")
-def load_reports(data_dir: str) -> tuple[pd.DataFrame, list[str]]:
-    root = Path(data_dir)
-    paths = report_paths(root)
+# --------------------------------------------------------------------------- #
+# Persistence (PostgreSQL)
+#
+# Reports are parsed exactly once, at ingest. Each report's normalized rows are
+# written to the `readings` and `parameters` tables and the file is recorded in
+# `ingested_files` with a content hash. On every startup we re-scan the report
+# folder, but only files whose hash is new or changed are parsed again — so the
+# dashboard never re-parses Excel to render; it just queries the database.
+#
+# The schema uses SQLAlchemy's generic column types, so the same code runs on
+# Postgres (production) and SQLite (tests) without change.
+# --------------------------------------------------------------------------- #
 
-    skipped: list[str] = []
-    records: list[dict[str, object]] = []
+DB_METADATA = MetaData()
 
-    for path in paths:
+READINGS_TABLE = Table(
+    "readings",
+    DB_METADATA,
+    Column("source_file", Text),
+    Column("plant_group", Text),
+    Column("plant", Text),
+    # Trailing "(NNNN)" id parsed from the plant sheet name; joins to mis.plant_sr_no.
+    Column("plant_sr_no", Integer),
+    Column("stage", Text),
+    Column("module_number", Float),
+    Column("module_label", Text),
+    Column("install_date", Date),
+    Column("report_date", Date),
+    Column("flow_lph", Float),
+    Column("conductivity_us_cm", Float),
+    Column("status", Text),
+)
+
+PARAMETERS_TABLE = Table(
+    "parameters",
+    DB_METADATA,
+    Column("source_file", Text),
+    Column("plant_group", Text),
+    Column("plant", Text),
+    Column("report_date", Date),
+    Column("tag", Text),
+    Column("kind", Text),
+    Column("value", Float),
+    Column("unit", Text),
+)
+
+# The MIS sheet (one per workbook) is the plant register: real ZONE, owner
+# (ZM NAME), per-plant STATUS, membrane-required quantity, and PLANT SR NO,
+# which joins to readings.plant_sr_no.
+MIS_TABLE = Table(
+    "mis",
+    DB_METADATA,
+    Column("source_file", Text),
+    Column("report_date", Date),
+    Column("zone", Text),
+    Column("zm_name", Text),
+    Column("plant_sr_no", Integer),
+    Column("site_name", Text),
+    Column("status", Text),
+    Column("membrane_required", Float),
+    Column("remarks", Text),
+)
+
+INGESTED_FILES_TABLE = Table(
+    "ingested_files",
+    DB_METADATA,
+    Column("filename", Text, primary_key=True),
+    Column("content_hash", Text, nullable=False),
+    Column("ingested_at", DateTime),
+    Column("n_readings", Integer),
+    Column("n_parameters", Integer),
+    Column("n_mis", Integer),
+)
+
+READINGS_COLUMNS = [c.name for c in READINGS_TABLE.columns]
+MIS_COLUMNS = [c.name for c in MIS_TABLE.columns]
+
+
+def database_url() -> str | None:
+    """Resolve the DB connection string from DATABASE_URL or st.secrets, and
+    normalize it to the psycopg2 driver SQLAlchemy expects."""
+    url = os.environ.get("DATABASE_URL")
+    if not url:
         try:
-            report_records = read_report(path)
-        except Exception as exc:  # noqa: BLE001
-            skipped.append(f"{path.name}: {exc}")
-            continue
+            url = st.secrets["postgres"]["url"]
+        except Exception:  # noqa: BLE001 - secrets file may be absent
+            url = None
+    if not url:
+        return None
+    if url.startswith("postgres://"):
+        url = "postgresql+psycopg2://" + url[len("postgres://") :]
+    elif url.startswith("postgresql://"):
+        url = "postgresql+psycopg2://" + url[len("postgresql://") :]
+    return url
 
-        if report_records:
-            records.extend(report_records)
-        else:
-            skipped.append(f"{path.name}: no module table found")
 
-    records.extend(read_manual_readings(root))
+@st.cache_resource
+def get_engine() -> Engine | None:
+    url = database_url()
+    if not url:
+        return None
+    return create_engine(url, pool_pre_ping=True)
 
+
+def init_db(engine: Engine) -> None:
+    DB_METADATA.create_all(engine)
+
+
+def file_fingerprint(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# Conductivity readings above this are data-entry errors (the raw sheets contain
+# values like 2,984,050 uS/cm); blank them rather than let them skew the analysis.
+MAX_PLAUSIBLE_CONDUCTIVITY_US_CM = 50000.0
+
+
+def normalize_reading_records(records: list[dict[str, object]]) -> pd.DataFrame:
     if not records:
-        return pd.DataFrame(), skipped
+        return pd.DataFrame(columns=READINGS_COLUMNS)
 
     df = pd.DataFrame(records)
     df["install_date"] = pd.to_datetime(df["install_date"], errors="coerce")
@@ -618,35 +837,34 @@ def load_reports(data_dir: str) -> tuple[pd.DataFrame, list[str]]:
     df["conductivity_us_cm"] = pd.to_numeric(df["conductivity_us_cm"], errors="coerce")
     df["module_number"] = pd.to_numeric(df["module_number"], errors="coerce")
     df["module_label"] = df["module_number"].map(format_module_number)
+    if "plant_sr_no" not in df.columns:
+        df["plant_sr_no"] = pd.NA
+    df["plant_sr_no"] = pd.to_numeric(df["plant_sr_no"], errors="coerce").astype("Int64")
+    if "status" not in df.columns:
+        df["status"] = "active"
+    df["status"] = df["status"].fillna("active")
+    # Implausibly high conductivity is a data-entry error, not a reading.
+    df.loc[df["conductivity_us_cm"] > MAX_PLAUSIBLE_CONDUCTIVITY_US_CM, "conductivity_us_cm"] = np.nan
     df = df.dropna(subset=["report_date", "module_number"])
-    df = df.dropna(subset=["flow_lph", "conductivity_us_cm"], how="all")
-    df = df.drop_duplicates(
-        subset=[
-            "source_file",
-            "plant_group",
-            "plant",
-            "stage",
-            "module_number",
-            "report_date",
-            "flow_lph",
-            "conductivity_us_cm",
-        ]
+    # Keep a row if it has a module number AND (it is bypassed OR has at least
+    # one of flow/conductivity). Bypassed membranes carry no flow/conductivity
+    # but are the strongest replacement signal, so they must be retained.
+    keep = (
+        (df["status"] == "bypass")
+        | df["flow_lph"].notna()
+        | df["conductivity_us_cm"].notna()
     )
-    df = df.sort_values(["plant_group", "plant", "module_number", "report_date"])
-    return df.reset_index(drop=True), skipped
+    df = df[keep]
+    # One reading per (file, plant, stage, module, month); a re-ingest of the
+    # same file replaces its rows wholesale, so file-local dedup is enough.
+    df = df.drop_duplicates(
+        subset=["source_file", "plant", "stage", "module_number", "report_date"],
+        keep="last",
+    )
+    return df.reindex(columns=READINGS_COLUMNS)
 
 
-@st.cache_data(show_spinner="Reading plant operating parameters...")
-def load_parameters(data_dir: str) -> pd.DataFrame:
-    root = Path(data_dir)
-    records: list[dict[str, object]] = []
-
-    for path in report_paths(root):
-        try:
-            records.extend(read_report_parameters(path))
-        except Exception:  # noqa: BLE001
-            continue
-
+def normalize_parameter_records(records: list[dict[str, object]]) -> pd.DataFrame:
     if not records:
         return pd.DataFrame(columns=PARAM_COLUMNS)
 
@@ -655,12 +873,155 @@ def load_parameters(data_dir: str) -> pd.DataFrame:
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df = df.dropna(subset=["report_date", "value"])
     df = df.drop_duplicates(
-        subset=["plant_group", "plant", "report_date", "tag"], keep="last"
+        subset=["source_file", "plant", "report_date", "tag"], keep="last"
     )
+    return df.reindex(columns=PARAM_COLUMNS)
+
+
+def normalize_mis_records(records: list[dict[str, object]]) -> pd.DataFrame:
+    if not records:
+        return pd.DataFrame(columns=MIS_COLUMNS)
+
+    df = pd.DataFrame(records)
+    df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
+    df["plant_sr_no"] = pd.to_numeric(df["plant_sr_no"], errors="coerce")
+    df["membrane_required"] = pd.to_numeric(df["membrane_required"], errors="coerce")
+    df = df.dropna(subset=["plant_sr_no"])
+    df["plant_sr_no"] = df["plant_sr_no"].astype(int)
+    df = df.drop_duplicates(subset=["source_file", "plant_sr_no"], keep="last")
+    return df.reindex(columns=MIS_COLUMNS)
+
+
+def ingest_reports(engine: Engine, data_dir: str) -> dict[str, list[str]]:
+    """Parse and store any report whose content hash is new or changed.
+
+    Returns a summary of what was ingested / skipped (already up to date) /
+    failed. Already-ingested files are never re-parsed.
+    """
+    root = Path(data_dir)
+    summary: dict[str, list[str]] = {"ingested": [], "skipped": [], "failed": []}
+
+    with engine.connect() as conn:
+        known = dict(
+            conn.execute(text("SELECT filename, content_hash FROM ingested_files")).all()
+        )
+
+    for path in report_paths(root):
+        try:
+            fingerprint = file_fingerprint(path)
+        except OSError as exc:
+            summary["failed"].append(f"{path.name}: {exc}")
+            continue
+
+        if known.get(path.name) == fingerprint:
+            summary["skipped"].append(path.name)
+            continue
+
+        try:
+            readings = normalize_reading_records(read_report(path))
+            parameters = normalize_parameter_records(read_report_parameters(path))
+            mis = normalize_mis_records(read_report_mis(path))
+        except Exception as exc:  # noqa: BLE001 - one bad report shouldn't sink the rest
+            summary["failed"].append(f"{path.name}: {exc}")
+            continue
+
+        if readings.empty:
+            summary["failed"].append(f"{path.name}: no module table found")
+            continue
+
+        with engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM readings WHERE source_file = :f"), {"f": path.name}
+            )
+            conn.execute(
+                text("DELETE FROM parameters WHERE source_file = :f"), {"f": path.name}
+            )
+            conn.execute(
+                text("DELETE FROM mis WHERE source_file = :f"), {"f": path.name}
+            )
+            readings.to_sql(
+                "readings", conn, if_exists="append", index=False,
+                method="multi", chunksize=1000,
+            )
+            if not parameters.empty:
+                parameters.to_sql(
+                    "parameters", conn, if_exists="append", index=False,
+                    method="multi", chunksize=1000,
+                )
+            if not mis.empty:
+                mis.to_sql(
+                    "mis", conn, if_exists="append", index=False,
+                    method="multi", chunksize=1000,
+                )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO ingested_files
+                        (filename, content_hash, ingested_at, n_readings, n_parameters, n_mis)
+                    VALUES (:f, :h, :ts, :nr, :np, :nm)
+                    ON CONFLICT (filename) DO UPDATE SET
+                        content_hash = excluded.content_hash,
+                        ingested_at = excluded.ingested_at,
+                        n_readings = excluded.n_readings,
+                        n_parameters = excluded.n_parameters,
+                        n_mis = excluded.n_mis
+                    """
+                ),
+                {
+                    "f": path.name,
+                    "h": fingerprint,
+                    "ts": datetime.now(timezone.utc),
+                    "nr": int(len(readings)),
+                    "np": int(len(parameters)),
+                    "nm": int(len(mis)),
+                },
+            )
+        summary["ingested"].append(path.name)
+
+    return summary
+
+
+@st.cache_data(show_spinner="Loading readings from the database...")
+def load_readings() -> pd.DataFrame:
+    engine = get_engine()
+    if engine is None:
+        return pd.DataFrame(columns=READINGS_COLUMNS)
+    df = pd.read_sql(
+        "SELECT * FROM readings",
+        engine,
+        parse_dates=["install_date", "report_date"],
+    )
+    if df.empty:
+        return df
+    df["module_label"] = df["module_label"].astype("string")
+    return df.sort_values(["plant_group", "plant", "module_number", "report_date"]).reset_index(
+        drop=True
+    )
+
+
+@st.cache_data(show_spinner="Loading operating parameters from the database...")
+def load_parameters() -> pd.DataFrame:
+    engine = get_engine()
+    if engine is None:
+        return pd.DataFrame(columns=PARAM_COLUMNS)
+    df = pd.read_sql("SELECT * FROM parameters", engine, parse_dates=["report_date"])
+    if df.empty:
+        return pd.DataFrame(columns=PARAM_COLUMNS)
     return df.sort_values(["plant_group", "plant", "tag", "report_date"]).reset_index(drop=True)
 
 
-def differential_pressure_series(
+@st.cache_data(show_spinner="Loading the plant register (MIS) from the database...")
+def load_mis() -> pd.DataFrame:
+    engine = get_engine()
+    if engine is None:
+        return pd.DataFrame(columns=MIS_COLUMNS)
+    df = pd.read_sql("SELECT * FROM mis", engine, parse_dates=["report_date"])
+    if df.empty:
+        return pd.DataFrame(columns=MIS_COLUMNS)
+    return df.sort_values(["zone", "plant_sr_no", "report_date"]).reset_index(drop=True)
+
+
+def feed_pressure_series(
     params: pd.DataFrame, plant_group: str, plant: str
 ) -> pd.DataFrame:
     pressures = params[
@@ -673,11 +1034,10 @@ def differential_pressure_series(
 
     rows: list[dict[str, object]] = []
     for report_date, group in pressures.groupby("report_date"):
-        feed = group[group["tag"].str.contains(DP_FEED_TAG, regex=False)]["value"]
-        reject = group[group["tag"].str.contains(DP_REJECT_TAG, regex=False)]["value"]
-        if feed.empty or reject.empty:
+        feed = group[group["tag"].str.contains(FEED_TAG, regex=False)]["value"]
+        if feed.empty:
             continue
-        rows.append({"report_date": report_date, "value": float(feed.iloc[0]) - float(reject.iloc[0])})
+        rows.append({"report_date": report_date, "value": float(feed.iloc[0])})
 
     series = pd.DataFrame(rows)
     if series.empty:
@@ -712,93 +1072,45 @@ def aggregate_series(df: pd.DataFrame, metric_col: str) -> pd.DataFrame:
     return grouped
 
 
-def fit_linear_trend(series: pd.DataFrame) -> dict[str, object] | None:
-    clean = series.dropna(subset=["report_date", "value"]).sort_values("report_date")
-    if len(clean) < 2:
-        return None
-
-    x = (clean["report_date"] - clean["report_date"].min()).dt.days.to_numpy(dtype=float)
-    y = clean["value"].to_numpy(dtype=float)
-    if np.isclose(x.max(), x.min()):
-        return None
-
-    slope, intercept = np.polyfit(x, y, 1)
-    fitted = intercept + slope * x
-    ss_res = float(np.sum((y - fitted) ** 2))
-    ss_tot = float(np.sum((y - y.mean()) ** 2))
-    r_squared = 1 - ss_res / ss_tot if ss_tot else 1.0
-
-    return {
-        "slope_per_day": float(slope),
-        "intercept": float(intercept),
-        "start_date": clean["report_date"].min(),
-        "last_date": clean["report_date"].max(),
-        "r_squared": float(r_squared),
-    }
+# Teal, distinct from the blue reading line, so the operating-pressure context
+# reads clearly on its own right-hand axis.
+PRESSURE_LINE_COLOR = "#0d9488"
 
 
-def default_threshold(series: pd.DataFrame, metric_config: dict[str, object]) -> float:
-    values = series["value"].dropna()
-    if values.empty:
-        return 0.0
-    baseline = float(values.iloc[0])
-    factor = float(metric_config["threshold_factor"])
-    return max(baseline * factor, 0.0)
+def add_feed_pressure_axis(fig: go.Figure, pressure: pd.DataFrame | None) -> None:
+    """Overlay PI 1601 feed pressure as a dashed line on a secondary right-hand axis.
 
-
-def system_status(latest: float, threshold: float, bad_direction: str) -> tuple[str, str]:
-    if threshold <= 0 or pd.isna(latest):
-        return "Unknown", "#64748b"
-
-    if bad_direction == "down":
-        if latest <= threshold:
-            return "Critical", "#dc2626"
-        if latest <= threshold * 1.15:
-            return "Warning", "#d97706"
-        return "Healthy", "#059669"
-
-    if latest >= threshold:
-        return "Critical", "#dc2626"
-    if latest >= threshold * 0.85:
-        return "Warning", "#d97706"
-    return "Healthy", "#059669"
-
-
-def predicted_failure_date(
-    trend: dict[str, object] | None,
-    threshold: float,
-    bad_direction: str,
-) -> pd.Timestamp | None:
-    if trend is None:
-        return None
-
-    slope = float(trend["slope_per_day"])
-    intercept = float(trend["intercept"])
-    start_date = pd.Timestamp(trend["start_date"])
-    last_date = pd.Timestamp(trend["last_date"])
-
-    if np.isclose(slope, 0.0):
-        return None
-    if bad_direction == "down" and slope >= 0:
-        return None
-    if bad_direction == "up" and slope <= 0:
-        return None
-
-    crossing_day = (threshold - intercept) / slope
-    crossing_date = start_date + pd.to_timedelta(crossing_day, unit="D")
-    if crossing_date < last_date:
-        return last_date
-    if crossing_date > last_date + pd.Timedelta(days=3650):
-        return None
-    return crossing_date.normalize()
-
-
-def is_at_or_beyond_threshold(latest: float, threshold: float, bad_direction: str) -> bool:
-    if threshold <= 0 or pd.isna(latest):
-        return False
-    if bad_direction == "down":
-        return latest <= threshold
-    return latest >= threshold
+    Shared by the single-module and comparison charts so the operating pressure
+    each reading was taken at is visible at a glance, not just on hover. Pressure
+    is a plant-level series, so in the comparison view this is one shared line
+    behind all the module lines.
+    """
+    if pressure is None or pressure.empty:
+        return
+    ordered = pressure.dropna(subset=["value"]).sort_values("report_date")
+    if ordered.empty:
+        return
+    fig.add_trace(
+        go.Scatter(
+            x=ordered["report_date"],
+            y=ordered["value"],
+            mode="lines+markers",
+            name="Feed pressure (PI 1601)",
+            yaxis="y2",
+            line={"color": PRESSURE_LINE_COLOR, "width": 2, "dash": "dot"},
+            marker={"size": 6, "symbol": "diamond"},
+            hovertemplate="Feed pressure (PI 1601)<br>%{x|%d %b %Y}<br>%{y:,.2f} bar<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        yaxis2={
+            "title": "Feed Pressure (bar, PI 1601)",
+            "overlaying": "y",
+            "side": "right",
+            "showgrid": False,
+            "automargin": True,
+        }
+    )
 
 
 def make_chart(
@@ -806,10 +1118,7 @@ def make_chart(
     *,
     metric_name: str,
     metric_config: dict[str, object],
-    trend: dict[str, object] | None,
-    threshold: float,
-    show_trend: bool,
-    failure_date: pd.Timestamp | None,
+    pressure: pd.DataFrame | None = None,
 ) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(
@@ -824,61 +1133,7 @@ def make_chart(
         )
     )
 
-    fig.add_hline(
-        y=threshold,
-        line_dash="dot",
-        line_color="#dc2626",
-        annotation_text="Failure threshold",
-        annotation_position="top left",
-    )
-
-    if show_trend and trend is not None:
-        last_date = pd.Timestamp(trend["last_date"])
-        start_date = pd.Timestamp(trend["start_date"])
-        forecast_end = last_date + pd.Timedelta(days=365)
-        if failure_date is not None:
-            forecast_end = max(forecast_end, failure_date + pd.Timedelta(days=30))
-            forecast_end = min(forecast_end, last_date + pd.Timedelta(days=1095))
-
-        dates = pd.date_range(start=start_date, end=forecast_end, periods=80)
-        days = (dates - start_date).days.to_numpy(dtype=float)
-        values = float(trend["intercept"]) + float(trend["slope_per_day"]) * days
-
-        fig.add_trace(
-            go.Scatter(
-                x=dates,
-                y=values,
-                mode="lines",
-                name="Predictive ML Trendline",
-                line={"color": "#7c3aed", "width": 2, "dash": "dash"},
-                hovertemplate="%{x|%d %b %Y}<br>%{y:,.2f}<extra></extra>",
-            )
-        )
-
-        if failure_date is not None:
-            failure_marker = pd.Timestamp(failure_date).to_pydatetime()
-            fig.add_shape(
-                type="line",
-                x0=failure_marker,
-                x1=failure_marker,
-                y0=0,
-                y1=1,
-                xref="x",
-                yref="paper",
-                line={"color": "#dc2626", "dash": "dash", "width": 2},
-            )
-            fig.add_annotation(
-                x=failure_marker,
-                y=1,
-                xref="x",
-                yref="paper",
-                text="Predicted failure",
-                showarrow=False,
-                xanchor="left",
-                yanchor="bottom",
-                bgcolor="rgba(255,255,255,0.85)",
-                font={"color": "#dc2626", "size": 12},
-            )
+    add_feed_pressure_axis(fig, pressure)
 
     fig.update_layout(
         title=f"{metric_name} History",
@@ -913,7 +1168,7 @@ def rerun_app() -> None:
         st.experimental_rerun()
 
 
-def sidebar_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str, str, str, bool]:
+def sidebar_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str, str, str]:
     st.sidebar.header("Filters")
 
     plant_groups = sorted(df["plant_group"].dropna().unique())
@@ -935,242 +1190,28 @@ def sidebar_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str, str, str,
     selected_module = st.sidebar.selectbox("Module Number", module_labels)
 
     metric_name = st.sidebar.radio("View Metric", list(METRICS), horizontal=False)
-    show_trend = st.sidebar.checkbox("Show Predictive ML Trendline", value=True)
 
     filtered = plant_df[plant_df["module_label"] == selected_module].copy()
-    return filtered, selected_group, selected_plant, selected_module, metric_name, show_trend
+    return filtered, selected_group, selected_plant, selected_module, metric_name
 
 
-def render_add_data_controls(
-    df: pd.DataFrame,
-    selected_group: str,
-    selected_plant: str,
-    selected_module: str,
-) -> None:
+def render_add_data_controls() -> None:
     st.sidebar.markdown("---")
     with st.sidebar.expander("Add New Data"):
         uploaded_files = st.file_uploader(
-            "Upload monthly Excel/CSV report",
-            type=["xlsx", "xls", "csv"],
+            "Upload monthly Excel report",
+            type=["xlsx", "xls"],
             accept_multiple_files=True,
             help="Saved files are loaded from the uploaded_reports folder on the next refresh.",
         )
         if st.button("Save Uploaded Report(s)", disabled=not uploaded_files):
             saved, skipped = save_uploaded_reports(uploaded_files or [], APP_DIR)
-            load_reports.clear()
-            load_parameters.clear()
             if saved:
-                st.success(f"Saved {len(saved)} report(s).")
+                st.success(f"Saved {len(saved)} report(s). Ingesting on refresh…")
             if skipped:
                 st.warning("; ".join(skipped))
+            # Saved files are parsed into the database by ingest on the rerun.
             rerun_app()
-
-        st.markdown("---")
-        default_stage = ""
-        selected_rows = df[
-            (df["plant_group"] == selected_group)
-            & (df["plant"] == selected_plant)
-            & (df["module_label"] == selected_module)
-        ]
-        if not selected_rows.empty:
-            stages = selected_rows["stage"].dropna()
-            if not stages.empty:
-                default_stage = clean_label(stages.iloc[-1])
-                if default_stage == "Unknown":
-                    default_stage = ""
-
-        with st.form("manual_reading_form"):
-            st.caption("Manual module reading")
-            plant_group = st.text_input("Plant Group", value=selected_group)
-            plant = st.text_input("Plant", value=selected_plant)
-            module_number = st.text_input("Module Number", value=selected_module)
-            stage = st.text_input("Stage", value=default_stage)
-            reading_date = st.date_input("Reading Date", value=pd.Timestamp.today().date())
-            install_date = st.date_input("Install Date", value=pd.Timestamp.today().date())
-            flow_lph = st.number_input(
-                "Total flow liter/hr.",
-                min_value=0.0,
-                value=0.0,
-                step=1.0,
-                format="%.2f",
-            )
-            conductivity = st.number_input(
-                "Cond. us/cm",
-                min_value=0.0,
-                value=0.0,
-                step=1.0,
-                format="%.2f",
-            )
-            submitted = st.form_submit_button("Add Reading")
-
-        if submitted:
-            module_value = pd.to_numeric(module_number, errors="coerce")
-            if pd.isna(module_value):
-                st.error("Module Number must be numeric.")
-                return
-            if not plant_group.strip() or not plant.strip():
-                st.error("Plant Group and Plant are required.")
-                return
-
-            append_manual_reading(
-                APP_DIR,
-                {
-                    "source_file": "Manual Entry",
-                    "plant_group": plant_group.strip(),
-                    "plant": plant.strip(),
-                    "stage": stage.strip(),
-                    "module_number": float(module_value),
-                    "install_date": pd.Timestamp(install_date).date().isoformat(),
-                    "report_date": pd.Timestamp(reading_date).date().isoformat(),
-                    "flow_lph": float(flow_lph),
-                    "conductivity_us_cm": float(conductivity),
-                },
-            )
-            load_reports.clear()
-            st.success("Manual reading added.")
-            rerun_app()
-
-
-def make_pressure_overview_chart(pressures: pd.DataFrame) -> go.Figure:
-    fig = go.Figure()
-    for tag, group in pressures.groupby("tag"):
-        ordered = group.sort_values("report_date")
-        fig.add_trace(
-            go.Scatter(
-                x=ordered["report_date"],
-                y=ordered["value"],
-                mode="lines+markers",
-                name=str(tag),
-                hovertemplate=f"{tag}<br>%{{x|%d %b %Y}}<br>%{{y:,.2f}} bar<extra></extra>",
-            )
-        )
-    fig.update_layout(
-        title="All Pressure Tags",
-        xaxis_title="Report Date",
-        yaxis_title="Pressure (bar)",
-        hovermode="x unified",
-        margin={"l": 20, "r": 20, "t": 60, "b": 20},
-        template="plotly_white",
-        height=420,
-    )
-    return fig
-
-
-def render_pressure_section(
-    params: pd.DataFrame,
-    selected_group: str,
-    selected_plant: str,
-    show_trend: bool,
-) -> None:
-    if params.empty:
-        return
-
-    pressures = params[
-        (params["plant_group"] == selected_group)
-        & (params["plant"] == selected_plant)
-        & (params["kind"] == "pressure")
-    ]
-
-    st.markdown("---")
-    st.subheader("Membrane Differential Pressure")
-    st.caption(
-        "Differential pressure across the high-pressure array "
-        f"(dP = PI {DP_FEED_TAG} array feed − PI {DP_REJECT_TAG} array reject). "
-        "A rising dP is the classic membrane fouling / scaling signal."
-    )
-
-    if pressures.empty:
-        st.info("No pressure (bar) readings were found for this plant.")
-        return
-
-    dp = differential_pressure_series(params, selected_group, selected_plant)
-    unit = str(DP_METRIC["unit"])
-    bad_direction = str(DP_METRIC["bad_direction"])
-
-    if dp.empty:
-        st.info(
-            "Pressure readings exist, but this plant is missing one side of the "
-            f"PI {DP_FEED_TAG}/PI {DP_REJECT_TAG} pair needed to compute differential pressure. "
-            "Raw pressures are shown below."
-        )
-    else:
-        trend = fit_linear_trend(dp)
-        threshold_default = default_threshold(dp, DP_METRIC)
-        threshold_step = max(threshold_default * 0.05, 0.1)
-        threshold = st.number_input(
-            "Differential Pressure Failure Threshold (bar)",
-            min_value=0.0,
-            value=float(round(threshold_default, 2)),
-            step=float(round(threshold_step, 2)),
-            help="Rising dP crossing this value flags fouling. Used for status and failure-date prediction.",
-            key="dp_threshold",
-        )
-
-        latest_row = dp.sort_values("report_date").iloc[-1]
-        latest = float(latest_row["value"])
-        status, status_color = system_status(latest, threshold, bad_direction)
-        slope_30 = float(trend["slope_per_day"]) * 30 if trend else np.nan
-        failure_date = predicted_failure_date(trend, threshold, bad_direction)
-        already_critical = is_at_or_beyond_threshold(latest, threshold, bad_direction)
-        failure_marker_date = None if already_critical else failure_date
-        latest_date = pd.Timestamp(latest_row["report_date"]).strftime("%d %b %Y")
-
-        if trend:
-            slope_text = f"{slope_30:+,.2f} {unit}/30d"
-            slope_subtitle = f"R2 {float(trend['r_squared']):.2f}"
-        else:
-            slope_text = "Need more data"
-            slope_subtitle = "At least 2 report months required"
-
-        if already_critical:
-            failure_text = "Already Critical"
-            failure_subtitle = f"dP crossed threshold on {latest_date}"
-        elif failure_date is not None:
-            failure_text = failure_date.strftime("%d %b %Y")
-            failure_subtitle = "Linear trend threshold crossing"
-        else:
-            failure_text = "Not projected"
-            failure_subtitle = "Trend does not cross threshold"
-
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            metric_card("Latest dP", f"{latest:,.2f} {unit}", latest_date)
-        with col2:
-            metric_card("30-Day dP Rate", slope_text, slope_subtitle)
-        with col3:
-            metric_card("Fouling Status", status, f"Threshold: {threshold:,.2f} {unit}", status_color)
-        with col4:
-            metric_card("Predicted Failure", failure_text, failure_subtitle)
-
-        st.plotly_chart(
-            make_chart(
-                dp,
-                metric_name="Membrane Differential Pressure",
-                metric_config=DP_METRIC,
-                trend=trend,
-                threshold=threshold,
-                show_trend=show_trend,
-                failure_date=failure_marker_date,
-            ),
-            width="stretch",
-        )
-
-    st.plotly_chart(make_pressure_overview_chart(pressures), width="stretch")
-
-    with st.expander("Pressure readings"):
-        display = (
-            pressures[["report_date", "tag", "value", "unit"]]
-            .sort_values(["report_date", "tag"])
-            .rename(
-                columns={
-                    "report_date": "Report Date",
-                    "tag": "Tag",
-                    "value": "Value",
-                    "unit": "Unit",
-                }
-            )
-        )
-        st.dataframe(display, width="stretch", hide_index=True)
 
 
 def module_series_map(
@@ -1190,6 +1231,7 @@ def make_comparison_chart(
     *,
     metric_config: dict[str, object],
     average: pd.DataFrame | None,
+    pressure: pd.DataFrame | None = None,
 ) -> go.Figure:
     fig = go.Figure()
     for module_label, series in series_map.items():
@@ -1218,6 +1260,8 @@ def make_comparison_chart(
             )
         )
 
+    add_feed_pressure_axis(fig, pressure)
+
     fig.update_layout(
         title="Module Comparison",
         xaxis_title="Report Date",
@@ -1235,44 +1279,18 @@ def build_comparison_table(
     series_map: dict[str, pd.DataFrame], metric_config: dict[str, object]
 ) -> pd.DataFrame:
     unit = str(metric_config["unit"])
-    bad_direction = str(metric_config["bad_direction"])
     rows: list[dict[str, object]] = []
 
     for module_label, series in series_map.items():
         ordered = series.sort_values("report_date")
         latest_row = ordered.iloc[-1]
         latest = float(latest_row["value"])
-        trend = fit_linear_trend(series)
-        threshold = default_threshold(series, metric_config)
-        status, _ = system_status(latest, threshold, bad_direction)
-        failure_date = predicted_failure_date(trend, threshold, bad_direction)
-        already_critical = is_at_or_beyond_threshold(latest, threshold, bad_direction)
-
-        if trend:
-            rate = float(trend["slope_per_day"]) * 30
-            rate_text = f"{rate:+,.2f} {unit}/30d"
-            r2_text = f"{float(trend['r_squared']):.2f}"
-        else:
-            rate_text = "n/a"
-            r2_text = "n/a"
-
-        if already_critical:
-            failure_text = "Already critical"
-        elif failure_date is not None:
-            failure_text = failure_date.strftime("%d %b %Y")
-        else:
-            failure_text = "Not projected"
-
         rows.append(
             {
                 "Module": module_label,
                 "Latest": f"{latest:,.2f} {unit}",
                 "Latest Date": pd.Timestamp(latest_row["report_date"]).strftime("%d %b %Y"),
-                "30-Day Rate": rate_text,
-                "R2": r2_text,
-                "Status": status,
-                "Predicted Failure": failure_text,
-                "_sort": failure_date if failure_date is not None else pd.Timestamp.max,
+                "_sort": pd.to_numeric(module_label, errors="coerce"),
             }
         )
 
@@ -1287,6 +1305,7 @@ def render_comparison_section(
     selected_module: str,
     metric_name: str,
     metric_config: dict[str, object],
+    pressure: pd.DataFrame | None = None,
 ) -> None:
     module_labels = sorted(
         plant_df["module_label"].dropna().unique(),
@@ -1299,7 +1318,8 @@ def render_comparison_section(
     st.subheader("Compare Modules")
     st.caption(
         f"Overlay multiple modules for {metric_name.lower()} to spot outliers against their peers. "
-        "Status and predicted failure use each module's own baseline-derived threshold."
+        "The dashed teal line (right axis) is the shared plant feed pressure (PI 1601) "
+        "all modules were operating at."
     )
 
     default_selection = [selected_module] if selected_module in module_labels else module_labels[:1]
@@ -1324,19 +1344,655 @@ def render_comparison_section(
     average = aggregate_series(plant_df, metric_col) if show_average else None
 
     st.plotly_chart(
-        make_comparison_chart(series_map, metric_config=metric_config, average=average),
+        make_comparison_chart(
+            series_map, metric_config=metric_config, average=average, pressure=pressure
+        ),
         width="stretch",
     )
 
     table = build_comparison_table(series_map, metric_config)
     if not table.empty:
-        st.caption("Sorted by predicted failure date (soonest first).")
         st.dataframe(table, width="stretch", hide_index=True)
 
 
+# The replacement page offers two ways to flag a membrane. "Peer outlier" is
+# relative — who stands out above the rest of this stage. "Absolute limit" is a
+# fixed operator-set cutoff — who is over an acceptable conductivity outright,
+# which catches a whole stage that is uniformly degraded (where a relative test
+# finds nothing, because the peer baseline itself is elevated).
+PEER_METHOD = "Peer outlier (IQR)"
+ABSOLUTE_METHOD = "Absolute limit (uS/cm)"
+OUTLIER_METHODS = (PEER_METHOD, ABSOLUTE_METHOD)
+DEFAULT_ABSOLUTE_LIMIT = 500.0
+
+# Fleet-wide degradation cutoffs rise per RO stage: the reject side naturally
+# runs at higher TDS, so a higher bar avoids false positives. Used by the
+# Portfolio page via evaluate_stage_readings (absolute-limit method).
+STAGE_CONDUCTIVITY_CUTOFFS = {"i": 1000.0, "ii": 1500.0, "iii": 2000.0}
+DEFAULT_STAGE_CUTOFF = 1000.0
+
+
+def stage_cutoff(stage_label: str) -> float:
+    normalized = normalize_text(stage_label)
+    for roman in ("iii", "ii", "i"):
+        if re.search(rf"\b{roman}\b", normalized):
+            return STAGE_CONDUCTIVITY_CUTOFFS[roman]
+    return DEFAULT_STAGE_CUTOFF
+
+
+def iqr_outlier_stats(values: pd.Series, sensitivity: float) -> dict[str, object]:
+    """High-side IQR (Tukey) cutoff plus a per-module 'IQRs above Q3' score.
+
+    Conductivity degradation is a *rise*, so only the upper tail matters. The
+    median and upper fence are returned in uS/cm (for the chart line and the flag
+    test). IQR is robust: the very outliers we are hunting don't inflate the
+    cutoff the way a mean + std-dev would. Below 4 readings the quartiles are too
+    unstable, so the fence is left NaN and the caller flags nothing.
+    """
+    clean = pd.to_numeric(values, errors="coerce").dropna()
+    n = int(clean.shape[0])
+    stats: dict[str, object] = {
+        "n": n,
+        "median": float(clean.median()) if n else float("nan"),
+        "upper_fence": float("nan"),
+        "scores": pd.Series(np.zeros(len(values)), index=values.index),
+    }
+    if n < 4:
+        return stats
+
+    q1 = float(clean.quantile(0.25))
+    q3 = float(clean.quantile(0.75))
+    iqr = q3 - q1
+    stats["upper_fence"] = q3 + sensitivity * iqr
+    if iqr > 0:
+        stats["scores"] = (values - q3) / iqr
+    return stats
+
+
+def make_outlier_chart(
+    readings: pd.DataFrame,
+    *,
+    median: float,
+    fence: float,
+    unit: str,
+    title: str,
+    fence_label: str = "Cutoff",
+) -> go.Figure:
+    colors = ["#dc2626" if flag else "#2563eb" for flag in readings["flag"]]
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=readings["module_label"].astype(str),
+            y=readings["conductivity"],
+            marker_color=colors,
+            customdata=readings["pct_vs_median"],
+            hovertemplate=(
+                "Module %{x}<br>%{y:,.0f} " + unit
+                + "<br>%{customdata:+.0f}% vs stage median<extra></extra>"
+            ),
+        )
+    )
+    if pd.notna(median):
+        fig.add_hline(
+            y=median,
+            line_dash="dot",
+            line_color="#64748b",
+            annotation_text="Stage median",
+            annotation_position="top left",
+        )
+    if pd.notna(fence):
+        fig.add_hline(
+            y=fence,
+            line_dash="dash",
+            line_color="#dc2626",
+            annotation_text=fence_label,
+            annotation_position="top right",
+        )
+    fig.update_layout(
+        title=title,
+        xaxis_title="Module",
+        yaxis_title=f"Conductivity ({unit})",
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
+        template="plotly_white",
+        height=420,
+        showlegend=False,
+    )
+    fig.update_xaxes(
+        type="category",
+        categoryorder="array",
+        categoryarray=readings["module_label"].astype(str).tolist(),
+    )
+    return fig
+
+
+def evaluate_stage_readings(
+    readings: pd.DataFrame, *, method: str, sensitivity: float, limit: float
+) -> tuple[pd.DataFrame, float, float, bool]:
+    """Annotate one stage's per-module readings with flag / score / pct_vs_median.
+
+    Returns (readings, stage_median, cutoff_fence, too_few). The peer baseline is
+    per stage, so this is called once per stage when consolidating a whole plant.
+    """
+    readings = readings.copy()
+    median = float(pd.to_numeric(readings["conductivity"], errors="coerce").median())
+    n_modules = int(readings["conductivity"].notna().sum())
+    too_few = False
+
+    if method == PEER_METHOD:
+        stats = iqr_outlier_stats(readings["conductivity"], sensitivity)
+        fence = float(stats["upper_fence"])
+        readings["score"] = pd.Series(stats["scores"]).to_numpy()
+        too_few = n_modules < 4
+    else:  # ABSOLUTE_METHOD
+        fence = float(limit)
+        readings["score"] = readings["conductivity"] / fence if fence else np.nan
+
+    readings["pct_vs_median"] = (
+        (readings["conductivity"] / median - 1.0) * 100.0 if median else np.nan
+    )
+    readings["flag"] = readings["conductivity"] > fence if pd.notna(fence) else False
+    readings = readings.sort_values("conductivity", ascending=False).reset_index(drop=True)
+    return readings, median, fence, too_few
+
+
+def render_outlier_section(plant_df: pd.DataFrame) -> None:
+    metric_config = METRICS["Conductivity"]
+    col = str(metric_config["column"])
+    unit = str(metric_config["unit"])
+
+    data = plant_df.dropna(subset=[col]).copy()
+    if data.empty:
+        st.info("No conductivity readings for this plant.")
+        return
+
+    data["stage_label"] = data["stage"].fillna("").map(
+        lambda value: str(value).strip() if str(value).strip() else "Unspecified"
+    )
+
+    date_options = sorted(data["report_date"].dropna().unique(), reverse=True)
+    if not date_options:
+        st.info("No dated conductivity readings for this plant.")
+        return
+
+    controls = st.columns([2, 3])
+    with controls[0]:
+        report_date = st.selectbox(
+            "Report month",
+            date_options,
+            format_func=lambda value: pd.Timestamp(value).strftime("%b %Y"),
+            key="outlier_date",
+        )
+    with controls[1]:
+        method = st.selectbox("Detection method", OUTLIER_METHODS, key="outlier_method")
+
+    if method == PEER_METHOD:
+        sensitivity = st.slider(
+            "Sensitivity (k)",
+            min_value=1.0,
+            max_value=5.0,
+            value=1.5,
+            step=0.5,
+            help="Stricter = fewer flags. IQR cutoff = Q3 + k·IQR (1.5 standard, 3.0 = extreme).",
+            key="outlier_k",
+        )
+        limit = DEFAULT_ABSOLUTE_LIMIT
+        score_label = "IQR above Q3"
+        score_fmt = lambda value: f"{value:,.1f}"
+        cutoff_label = "IQR Fence"
+    else:  # ABSOLUTE_METHOD
+        sensitivity = 1.5
+        limit = st.number_input(
+            f"Replace above ({unit})",
+            min_value=0.0,
+            value=DEFAULT_ABSOLUTE_LIMIT,
+            step=50.0,
+            help="Flag every module over this fixed conductivity, regardless of its peers. "
+            "Use when a whole stage is degraded and the peer test finds nothing.",
+            key="outlier_limit",
+        )
+        score_label = "x Limit"
+        score_fmt = lambda value: f"{value:,.2f}x"
+        cutoff_label = "Replacement Limit"
+
+    snapshot = data[data["report_date"] == report_date]
+    month_text = pd.Timestamp(report_date).strftime("%b %Y")
+    stages_present = sorted(snapshot["stage_label"].unique())
+
+    # Evaluate every stage (each against its own peers) and collect the flags.
+    per_stage: dict[str, tuple[pd.DataFrame, float, float, bool]] = {}
+    flagged_records: list[dict[str, object]] = []
+    total_modules = 0
+    too_few_stages: list[str] = []
+
+    for stage in stages_present:
+        stage_readings = snapshot[snapshot["stage_label"] == stage].groupby(
+            "module_label", as_index=False
+        ).agg(
+            conductivity=(col, "mean"),
+            flow=("flow_lph", "mean"),
+            install_date=("install_date", "first"),
+        )
+        if stage_readings.empty:
+            continue
+        evaluated, median, fence, too_few = evaluate_stage_readings(
+            stage_readings, method=method, sensitivity=sensitivity, limit=limit
+        )
+        per_stage[stage] = (evaluated, median, fence, too_few)
+        total_modules += int(evaluated["conductivity"].notna().sum())
+        if too_few:
+            too_few_stages.append(stage)
+        for _, row in evaluated[evaluated["flag"]].iterrows():
+            flagged_records.append(
+                {
+                    "Stage": stage,
+                    "Module": row["module_label"],
+                    "conductivity": float(row["conductivity"]),
+                    "pct_vs_median": float(row["pct_vs_median"]),
+                    "score": float(row["score"]),
+                    "install_date": row["install_date"],
+                }
+            )
+
+    # ----- Consolidated headline + table (the whole plant, this month) -----
+    n_flagged = len(flagged_records)
+    card1, card2, card3 = st.columns(3)
+    with card1:
+        flag_color = "#dc2626" if n_flagged else "#16a34a"
+        metric_card("Modules Needing Replacement", str(n_flagged), month_text, flag_color)
+    with card2:
+        metric_card("Modules Evaluated", str(total_modules), f"{len(stages_present)} stage(s)")
+    with card3:
+        cutoff_text = f"{limit:,.0f} {unit}" if method == ABSOLUTE_METHOD else f"k = {sensitivity:g}"
+        metric_card("Method", method.split(" (")[0], cutoff_text)
+
+    if too_few_stages:
+        st.info(
+            "Too few modules (<4) for a reliable peer test in: "
+            + ", ".join(too_few_stages)
+            + ". Use an absolute limit to flag those stages."
+        )
+
+    if flagged_records:
+        consolidated = pd.DataFrame(flagged_records).sort_values(
+            ["Stage", "conductivity"], ascending=[True, False]
+        )
+        display_table = pd.DataFrame(
+            {
+                "Stage": consolidated["Stage"],
+                "Module": consolidated["Module"],
+                f"Conductivity ({unit})": consolidated["conductivity"].map(lambda v: f"{v:,.0f}"),
+                "vs Stage Median": consolidated["pct_vs_median"].map(lambda v: f"{v:+,.0f}%"),
+                score_label: consolidated["score"].map(score_fmt),
+                "Install Date": consolidated["install_date"].map(
+                    lambda v: pd.Timestamp(v).strftime("%d %b %Y") if pd.notna(v) else "Unknown"
+                ),
+            }
+        )
+        st.markdown(
+            f"**{n_flagged} module(s) need replacement** across "
+            f"{consolidated['Stage'].nunique()} stage(s) — {month_text}:"
+        )
+        st.dataframe(display_table, width="stretch", hide_index=True)
+        st.download_button(
+            "Download replacement list (CSV)",
+            display_table.to_csv(index=False).encode("utf-8"),
+            file_name=f"replacement_candidates_{month_text.replace(' ', '_')}.csv",
+            mime="text/csv",
+        )
+    else:
+        st.success(f"No modules need replacement in any stage for {month_text}.")
+
+    # ----- Per-stage drill-down chart -----
+    if per_stage:
+        st.markdown("---")
+        st.markdown("**Stage detail**")
+        stage = st.selectbox("Stage to chart", list(per_stage), key="outlier_stage")
+        evaluated, median, fence, _ = per_stage[stage]
+        st.plotly_chart(
+            make_outlier_chart(
+                evaluated,
+                median=median,
+                fence=fence,
+                unit=unit,
+                title=f"{stage} conductivity by module — {month_text}",
+                fence_label=cutoff_label,
+            ),
+            width="stretch",
+        )
+
+
+def select_group_plant(df: pd.DataFrame) -> tuple[str, str]:
+    """Sidebar plant picker for the standalone Replacement page (mirrors the
+    dashboard's group/plant selectors, with its own widget keys)."""
+    st.sidebar.header("Plant")
+    groups = sorted(df["plant_group"].dropna().unique())
+    if len(groups) > 1:
+        group = st.sidebar.selectbox("Plant Group", groups, key="rep_group")
+    else:
+        group = groups[0]
+        st.sidebar.caption(f"Plant group: {group}")
+    plants = sorted(df[df["plant_group"] == group]["plant"].dropna().unique())
+    plant = st.sidebar.selectbox("Plant", plants, key="rep_plant")
+    return group, plant
+
+
+def render_replacement_page(df: pd.DataFrame) -> None:
+    st.title("Membrane Replacement Candidates")
+    st.caption(
+        "For the selected plant and month, every stage is checked and the flagged "
+        "membranes are consolidated into one list with a total count — flagged either "
+        "for standing out above their stage peers (conductivity outliers) or for being "
+        "over a fixed acceptable limit. Each stage is judged on its own readings, so a "
+        "naturally high-TDS stage isn't penalised against a cleaner one."
+    )
+    group, plant = select_group_plant(df)
+    st.caption(f"{group} | {plant}")
+    plant_df = df[(df["plant_group"] == group) & (df["plant"] == plant)]
+    render_outlier_section(plant_df)
+
+
+@st.cache_data(show_spinner="Building the fleet view...")
+def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFrame:
+    """Annotate every reading with bypass / degraded / need, for all months.
+
+    Degradation reuses evaluate_stage_readings (absolute-limit method) once per
+    (plant, stage, month) with a stage-aware cutoff, so the definition matches
+    the Replacement page. A module "needs attention" if it is bypassed or
+    degraded. Returns one row per (plant, stage, module, month).
+    """
+    col = str(METRICS["Conductivity"]["column"])
+    columns = [
+        "plant_group", "plant", "plant_sr_no", "zone", "stage_label",
+        "module_label", "report_date", "conductivity", "install_date",
+        "status", "degraded", "need", "cutoff",
+    ]
+    if readings.empty:
+        return pd.DataFrame(columns=columns)
+
+    data = readings.copy()
+    data["stage_label"] = data["stage"].fillna("").map(
+        lambda value: str(value).strip() if str(value).strip() else "Unspecified"
+    )
+
+    # plant_sr_no -> zone, from the most recent MIS row for that plant.
+    zone_by_sr: dict[object, object] = {}
+    if not mis.empty:
+        latest_mis = mis.sort_values("report_date").drop_duplicates("plant_sr_no", keep="last")
+        for _, row in latest_mis.iterrows():
+            zone = row.get("zone")
+            zone_by_sr[row["plant_sr_no"]] = zone if (pd.notna(zone) and str(zone).strip()) else None
+
+    plant_meta: dict[str, tuple[object, object, str]] = {}
+    for plant, pdf in data.groupby("plant"):
+        plant_group = pdf["plant_group"].iloc[0]
+        srs = pdf["plant_sr_no"].dropna()
+        plant_sr = int(srs.iloc[0]) if not srs.empty else None
+        zone = zone_by_sr.get(plant_sr) if plant_sr is not None else None
+        plant_meta[plant] = (plant_group, plant_sr, zone if zone else "Unknown")
+
+    records: list[dict[str, object]] = []
+    for (plant, stage_label, report_date), group in data.groupby(
+        ["plant", "stage_label", "report_date"]
+    ):
+        agg = group.groupby("module_label", as_index=False).agg(
+            conductivity=(col, "mean"),
+            install_date=("install_date", "first"),
+            is_bypass=("status", lambda s: bool((s == "bypass").any())),
+        )
+        active = agg[~agg["is_bypass"]]
+        cutoff = stage_cutoff(stage_label)
+        degraded_map: dict[object, bool] = {}
+        if not active.empty:
+            evaluated, _, _, _ = evaluate_stage_readings(
+                active, method=ABSOLUTE_METHOD, sensitivity=1.5, limit=cutoff
+            )
+            degraded_map = dict(zip(evaluated["module_label"], evaluated["flag"]))
+
+        plant_group, plant_sr, zone = plant_meta[plant]
+        for _, row in agg.iterrows():
+            bypass = bool(row["is_bypass"])
+            degraded = (not bypass) and bool(degraded_map.get(row["module_label"], False))
+            records.append(
+                {
+                    "plant_group": plant_group,
+                    "plant": plant,
+                    "plant_sr_no": plant_sr,
+                    "zone": zone,
+                    "stage_label": stage_label,
+                    "module_label": row["module_label"],
+                    "report_date": report_date,
+                    "conductivity": row["conductivity"],
+                    "install_date": row["install_date"],
+                    "status": "bypass" if bypass else "active",
+                    "degraded": degraded,
+                    "need": bypass or degraded,
+                    "cutoff": cutoff,
+                }
+            )
+
+    return pd.DataFrame(records, columns=columns)
+
+
+def build_plant_ranking(snapshot: pd.DataFrame, latest: pd.Timestamp) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for plant, pdf in snapshot.groupby("plant"):
+        module_count = len(pdf)
+        bypassed = int((pdf["status"] == "bypass").sum())
+        degraded = int(pdf["degraded"].sum())
+        need = int(pdf["need"].sum())
+        avg_cond = pdf.loc[pdf["status"] == "active", "conductivity"].mean()
+        ages = (
+            pd.Timestamp(latest) - pd.to_datetime(pdf["install_date"], errors="coerce")
+        ).dt.days / 365.25
+        rows.append(
+            {
+                "Plant": plant,
+                "Zone": pdf["zone"].iloc[0],
+                "Modules": module_count,
+                "Bypassed": bypassed,
+                "Degraded": degraded,
+                "Need": need,
+                "Need %": round(need / module_count * 100, 1) if module_count else 0.0,
+                "Avg Cond (uS/cm)": round(float(avg_cond), 0) if pd.notna(avg_cond) else np.nan,
+                "Median Age (yrs)": round(float(ages.median()), 1) if ages.notna().any() else np.nan,
+            }
+        )
+    ranking = pd.DataFrame(rows)
+    if ranking.empty:
+        return ranking
+    return ranking.sort_values("Need", ascending=False).reset_index(drop=True)
+
+
+def make_fleet_trend_chart(status: pd.DataFrame) -> go.Figure:
+    months = sorted(status["report_date"].dropna().unique())
+    degraded_pct: list[float] = []
+    avg_cond: list[float] = []
+    for month in months:
+        sub = status[status["report_date"] == month]
+        total = len(sub)
+        degraded_pct.append(float(sub["degraded"].sum()) / total * 100 if total else np.nan)
+        avg_cond.append(sub.loc[sub["status"] == "active", "conductivity"].mean())
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=months, y=degraded_pct, name="Degraded %", mode="lines+markers",
+            line={"color": "#dc2626", "width": 3},
+            hovertemplate="%{x|%b %Y}<br>%{y:.1f}% degraded<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=months, y=avg_cond, name="Avg conductivity (uS/cm)", mode="lines+markers",
+            yaxis="y2", line={"color": "#2563eb", "width": 2, "dash": "dash"},
+            hovertemplate="%{x|%b %Y}<br>%{y:,.0f} uS/cm avg<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title="Fleet deterioration over time",
+        xaxis_title="Report month",
+        yaxis_title="Degraded %",
+        yaxis2={"title": "Avg conductivity (uS/cm)", "overlaying": "y", "side": "right", "showgrid": False},
+        hovermode="x unified",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1},
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
+        template="plotly_white",
+        height=420,
+    )
+    return fig
+
+
+def make_zone_rollup_chart(snapshot: pd.DataFrame) -> go.Figure:
+    rollup = (
+        snapshot.groupby("zone")
+        .agg(
+            bypassed=("status", lambda s: int((s == "bypass").sum())),
+            degraded=("degraded", "sum"),
+        )
+        .reset_index()
+    )
+    rollup["total"] = rollup["bypassed"] + rollup["degraded"]
+    rollup = rollup.sort_values("total", ascending=False)
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=rollup["zone"], y=rollup["degraded"], name="Degraded", marker_color="#d97706"))
+    fig.add_trace(go.Bar(x=rollup["zone"], y=rollup["bypassed"], name="Bypassed", marker_color="#dc2626"))
+    fig.update_layout(
+        barmode="stack",
+        title="Modules needing attention by zone",
+        xaxis_title="Zone",
+        yaxis_title="Modules",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1},
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
+        template="plotly_white",
+        height=380,
+    )
+    return fig
+
+
+def make_age_profile_chart(snapshot: pd.DataFrame, latest: pd.Timestamp) -> go.Figure | None:
+    years = pd.to_datetime(snapshot["install_date"], errors="coerce").dt.year.dropna()
+    if years.empty:
+        return None
+    counts = years.astype(int).value_counts().sort_index()
+    latest_year = pd.Timestamp(latest).year
+    colors = ["#dc2626" if (latest_year - year) > 5 else "#2563eb" for year in counts.index]
+
+    fig = go.Figure(
+        go.Bar(
+            x=[str(year) for year in counts.index],
+            y=counts.values,
+            marker_color=colors,
+            hovertemplate="%{x}<br>%{y} modules<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title="Membrane age profile — install year of fitted modules (>5 yrs old in red)",
+        xaxis_title="Install year",
+        yaxis_title="Modules",
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
+        template="plotly_white",
+        height=380,
+        showlegend=False,
+    )
+    fig.update_xaxes(type="category")
+    return fig
+
+
+def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
+    st.title("Fleet Portfolio")
+    st.caption(
+        "Fleet-wide membrane health across every plant — no plant selection needed. "
+        "A module needs attention if it is bypassed, or degraded (active and over its "
+        "stage's conductivity limit: Stage I > 1,000, II > 1,500, III > 2,000 uS/cm)."
+    )
+
+    status = compute_fleet_status(df, mis)
+    if status.empty:
+        st.info("No readings are available to build the fleet view.")
+        return
+
+    latest = status["report_date"].max()
+    latest_text = pd.Timestamp(latest).strftime("%b %Y")
+    snapshot = status[status["report_date"] == latest]
+
+    total_plants = int(snapshot["plant"].nunique())
+    total_modules = len(snapshot)
+    active_modules = int((snapshot["status"] == "active").sum())
+    degraded = int(snapshot["degraded"].sum())
+    bypassed = int((snapshot["status"] == "bypass").sum())
+    need = int(snapshot["need"].sum())
+    need_pct = need / total_modules * 100 if total_modules else 0.0
+
+    # ----- 1. KPI cards -----
+    st.subheader(f"Fleet snapshot — {latest_text}")
+    kpis = st.columns(5)
+    with kpis[0]:
+        metric_card("Plants", f"{total_plants:,}", "in fleet")
+    with kpis[1]:
+        metric_card("Active Modules", f"{active_modules:,}", f"{total_modules:,} total this month")
+    with kpis[2]:
+        metric_card("Degraded", f"{degraded:,}", "active, over stage limit", "#d97706")
+    with kpis[3]:
+        metric_card("Bypassed", f"{bypassed:,}", "offline membranes", "#dc2626")
+    with kpis[4]:
+        attention_color = "#dc2626" if need_pct >= 10 else "#16a34a"
+        metric_card("Needing Attention", f"{need_pct:.1f}%", f"{need:,} of {total_modules:,} modules", attention_color)
+
+    # ----- 2. Plant ranking (centerpiece) -----
+    st.markdown("---")
+    st.subheader("Plant ranking")
+    st.caption("One row per plant, sorted by modules needing attention. Click a column header to re-sort.")
+    ranking = build_plant_ranking(snapshot, latest)
+    st.dataframe(ranking, width="stretch", hide_index=True)
+    st.download_button(
+        "Download plant ranking (CSV)",
+        ranking.to_csv(index=False).encode("utf-8"),
+        file_name=f"fleet_ranking_{latest_text.replace(' ', '_')}.csv",
+        mime="text/csv",
+    )
+
+    # ----- 3. Fleet trend -----
+    st.markdown("---")
+    st.subheader("Fleet trend")
+    st.caption("Month-over-month deterioration across the whole fleet.")
+    st.plotly_chart(make_fleet_trend_chart(status), width="stretch")
+
+    # ----- 4 & 5. Zone rollup + worst modules -----
+    left, right = st.columns(2)
+    with left:
+        st.subheader("By zone")
+        st.plotly_chart(make_zone_rollup_chart(snapshot), width="stretch")
+    with right:
+        st.subheader(f"Worst 25 modules — {latest_text}")
+        active_snap = snapshot[snapshot["status"] == "active"].dropna(subset=["conductivity"])
+        worst = active_snap.sort_values("conductivity", ascending=False).head(25)
+        worst_table = pd.DataFrame(
+            {
+                "Plant": worst["plant"],
+                "Stage": worst["stage_label"],
+                "Module": worst["module_label"],
+                "Conductivity (uS/cm)": worst["conductivity"].map(lambda v: f"{v:,.0f}"),
+                "Install Date": worst["install_date"].map(
+                    lambda v: pd.Timestamp(v).strftime("%d %b %Y") if pd.notna(v) else "Unknown"
+                ),
+            }
+        )
+        st.dataframe(worst_table, width="stretch", hide_index=True, height=380)
+
+    # ----- 6. Membrane age profile -----
+    st.markdown("---")
+    st.subheader("Membrane age profile")
+    age_chart = make_age_profile_chart(snapshot, latest)
+    if age_chart is None:
+        st.info("No install dates available to build the age profile.")
+    else:
+        st.plotly_chart(age_chart, width="stretch")
+
+
 def render_dashboard(df: pd.DataFrame, params: pd.DataFrame) -> None:
-    filtered, selected_group, selected_plant, selected_module, metric_name, show_trend = sidebar_filters(df)
-    render_add_data_controls(df, selected_group, selected_plant, selected_module)
+    filtered, selected_group, selected_plant, selected_module, metric_name = sidebar_filters(df)
+    render_add_data_controls()
     metric_config = METRICS[metric_name]
     metric_col = str(metric_config["column"])
     series = aggregate_series(filtered, metric_col)
@@ -1348,64 +2004,38 @@ def render_dashboard(df: pd.DataFrame, params: pd.DataFrame) -> None:
         st.warning("No valid numeric readings are available for this module and metric.")
         return
 
-    trend = fit_linear_trend(series)
-    threshold_default = default_threshold(series, metric_config)
-    threshold_step = max(threshold_default * 0.05, 1.0)
-    threshold = st.sidebar.number_input(
-        f"{metric_name} Failure Threshold",
-        min_value=0.0,
-        value=float(round(threshold_default, 2)),
-        step=float(round(threshold_step, 2)),
-        help="Used for status and failure-date prediction.",
-    )
+    # PI 1601 feed pressure is the operating pressure each reading was taken at.
+    # It is plant-level (shared across modules), overlaid on a secondary axis.
+    pressure_by_date = feed_pressure_series(params, selected_group, selected_plant)
 
-    latest_row = series.sort_values("report_date").iloc[-1]
+    ordered = series.sort_values("report_date")
+    latest_row = ordered.iloc[-1]
+    first_row = ordered.iloc[0]
     latest = float(latest_row["value"])
+    first = float(first_row["value"])
     unit = str(metric_config["unit"])
-    bad_direction = str(metric_config["bad_direction"])
-    status, status_color = system_status(latest, threshold, bad_direction)
-    slope_30 = float(trend["slope_per_day"]) * 30 if trend else np.nan
-    failure_date = predicted_failure_date(trend, threshold, bad_direction)
-    already_critical = is_at_or_beyond_threshold(latest, threshold, bad_direction)
-    failure_marker_date = None if already_critical else failure_date
-
     latest_date = pd.Timestamp(latest_row["report_date"]).strftime("%d %b %Y")
-    if trend:
-        slope_text = f"{slope_30:+,.2f} {unit}/30d"
-        slope_subtitle = f"R2 {float(trend['r_squared']):.2f}"
-    else:
-        slope_text = "Need more data"
-        slope_subtitle = "At least 2 report months required"
 
-    if already_critical:
-        failure_text = "Already Critical"
-        failure_subtitle = f"Latest reading crossed threshold on {latest_date}"
-    elif failure_date is not None:
-        failure_text = failure_date.strftime("%d %b %Y")
-        failure_subtitle = "Linear trend threshold crossing"
+    change = latest - first
+    if first:
+        change_subtitle = f"{change / first * 100:+,.1f}% since {pd.Timestamp(first_row['report_date']).strftime('%b %Y')}"
     else:
-        failure_text = "Not projected"
-        failure_subtitle = "Trend does not cross threshold"
+        change_subtitle = f"since {pd.Timestamp(first_row['report_date']).strftime('%b %Y')}"
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
     with col1:
         metric_card("Latest Reading", f"{latest:,.2f} {unit}", latest_date)
     with col2:
-        metric_card("30-Day Degradation Rate", slope_text, slope_subtitle)
+        metric_card("Change Since First", f"{change:+,.2f} {unit}", change_subtitle)
     with col3:
-        metric_card("System Status", status, f"Threshold: {threshold:,.2f} {unit}", status_color)
-    with col4:
-        metric_card("Predicted Failure", failure_text, failure_subtitle)
+        metric_card("Readings on Record", str(len(ordered)), "report months")
 
     st.plotly_chart(
         make_chart(
             series,
             metric_name=metric_name,
             metric_config=metric_config,
-            trend=trend,
-            threshold=threshold,
-            show_trend=show_trend,
-            failure_date=failure_marker_date,
+            pressure=pressure_by_date,
         ),
         width="stretch",
     )
@@ -1437,9 +2067,9 @@ def render_dashboard(df: pd.DataFrame, params: pd.DataFrame) -> None:
         st.dataframe(display, width="stretch", hide_index=True)
 
     plant_df = df[(df["plant_group"] == selected_group) & (df["plant"] == selected_plant)]
-    render_comparison_section(plant_df, selected_module, metric_name, metric_config)
-
-    render_pressure_section(params, selected_group, selected_plant, show_trend)
+    render_comparison_section(
+        plant_df, selected_module, metric_name, metric_config, pressure_by_date
+    )
 
 
 def main() -> None:
@@ -1486,20 +2116,69 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    df, skipped = load_reports(str(APP_DIR))
-    if df.empty:
-        st.error("No RO module readings were found in the current folder.")
-        if skipped:
-            st.write(skipped)
+    engine = get_engine()
+    if engine is None:
+        st.error(
+            "No database is configured. Set a `DATABASE_URL` environment variable, "
+            "or add a `.streamlit/secrets.toml` with:\n\n"
+            "```toml\n[postgres]\nurl = \"postgresql://USER:PASSWORD@HOST:5432/DBNAME\"\n```"
+        )
         return
 
-    if skipped:
+    try:
+        init_db(engine)
+        summary = ingest_reports(engine, str(APP_DIR))
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Could not reach the database: {exc}")
+        return
+
+    # New/changed reports were parsed this run — drop the cached query results so
+    # the fresh rows show up.
+    if summary["ingested"]:
+        load_readings.clear()
+        load_parameters.clear()
+        load_mis.clear()
+        compute_fleet_status.clear()
+
+    df = load_readings()
+    if df.empty:
+        st.error("No RO module readings are in the database yet.")
+        if summary["failed"]:
+            st.write(summary["failed"])
+        return
+
+    if summary["failed"]:
         with st.sidebar.expander("Skipped inputs"):
-            for item in skipped:
+            for item in summary["failed"]:
                 st.write(item)
 
-    params = load_parameters(str(APP_DIR))
-    render_dashboard(df, params)
+    params = load_parameters()
+    mis = load_mis()
+
+    pages = st.navigation(
+        [
+            st.Page(
+                lambda: render_portfolio_page(df, mis),
+                title="Portfolio",
+                icon="🌐",
+                url_path="portfolio",
+                default=True,
+            ),
+            st.Page(
+                lambda: render_dashboard(df, params),
+                title="Dashboard",
+                icon="📊",
+                url_path="dashboard",
+            ),
+            st.Page(
+                lambda: render_replacement_page(df),
+                title="Replacement Candidates",
+                icon="🛠️",
+                url_path="replacement",
+            ),
+        ]
+    )
+    pages.run()
 
 
 if __name__ == "__main__":

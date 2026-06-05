@@ -3,3 +3,5 @@ pandas
 plotly
 openpyxl
 numpy
+sqlalchemy
+psycopg2-binary

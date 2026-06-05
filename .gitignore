@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local secrets — never commit DB credentials
+.streamlit/secrets.toml
+
+# Uploaded plant reports (data, not code)
+uploaded_reports/
+
+# Legacy manual entry file (no longer used)
+manual_readings.csv
