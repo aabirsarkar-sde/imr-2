@@ -1192,6 +1192,20 @@ def metric_card(title: str, value: str, subtitle: str = "", color: str = "#0f172
     )
 
 
+def hero_card(title: str, value: str, subtitle: str = "", color: str = "#dc2626") -> None:
+    """Oversized single-number card for the page's headline metric."""
+    st.markdown(
+        f"""
+        <div class="hero-card">
+            <div class="hero-title">{title}</div>
+            <div class="hero-value" style="color:{color};">{value}</div>
+            <div class="hero-subtitle">{subtitle}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def rerun_app() -> None:
     if hasattr(st, "rerun"):
         st.rerun()
@@ -1943,9 +1957,16 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
         st.info("No readings are available to build the fleet view.")
         return
 
-    latest = status["report_date"].max()
-    latest_text = pd.Timestamp(latest).strftime("%b %Y")
-    snapshot = status[status["report_date"] == latest]
+    # Month picker — the whole page renders for the chosen month, defaulting to
+    # the most recent one. Every downstream section keys off `snapshot`/`selected`.
+    months = sorted(status["report_date"].dropna().unique(), reverse=True)
+    month_labels = [pd.Timestamp(m).strftime("%b %Y") for m in months]
+    picker_col, _ = st.columns([1, 3])
+    with picker_col:
+        picked = st.selectbox("Report month", month_labels, index=0)
+    selected = months[month_labels.index(picked)]
+    month_text = picked
+    snapshot = status[status["report_date"] == selected]
 
     total_plants = int(snapshot["plant"].nunique())
     total_modules = len(snapshot)
@@ -1955,9 +1976,17 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
     need = int(snapshot["need"].sum())
     need_pct = need / total_modules * 100 if total_modules else 0.0
 
-    # ----- 1. KPI cards -----
-    st.subheader(f"Fleet snapshot — {latest_text}")
-    kpis = st.columns(5)
+    # ----- 1. Headline KPI: membranes to replace -----
+    hero_card(
+        "Membranes to Replace",
+        f"{need:,}",
+        f"{month_text} — {degraded:,} degraded + {bypassed:,} bypassed "
+        f"across {total_plants:,} plants ({need_pct:.1f}% of {total_modules:,} modules)",
+    )
+
+    # ----- 2. Supporting KPI cards -----
+    st.markdown("")
+    kpis = st.columns(4)
     with kpis[0]:
         metric_card("Plants", f"{total_plants:,}", "in fleet")
     with kpis[1]:
@@ -1966,20 +1995,17 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
         metric_card("Degraded", f"{degraded:,}", "active, over stage limit", "#d97706")
     with kpis[3]:
         metric_card("Bypassed", f"{bypassed:,}", "offline membranes", "#dc2626")
-    with kpis[4]:
-        attention_color = "#dc2626" if need_pct >= 10 else "#16a34a"
-        metric_card("Needing Attention", f"{need_pct:.1f}%", f"{need:,} of {total_modules:,} modules", attention_color)
 
     # ----- 2. Plant ranking (centerpiece) -----
     st.markdown("---")
     st.subheader("Plant ranking")
     st.caption("One row per plant, sorted by modules needing attention. Click a column header to re-sort.")
-    ranking = build_plant_ranking(snapshot, latest)
+    ranking = build_plant_ranking(snapshot, selected)
     st.dataframe(ranking, width="stretch", hide_index=True)
     st.download_button(
         "Download plant ranking (CSV)",
         ranking.to_csv(index=False).encode("utf-8"),
-        file_name=f"fleet_ranking_{latest_text.replace(' ', '_')}.csv",
+        file_name=f"fleet_ranking_{month_text.replace(' ', '_')}.csv",
         mime="text/csv",
     )
 
@@ -1995,7 +2021,7 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
         st.subheader("By zone")
         st.plotly_chart(make_zone_rollup_chart(snapshot), width="stretch")
     with right:
-        st.subheader(f"Worst 25 modules — {latest_text}")
+        st.subheader(f"Worst 25 modules — {month_text}")
         active_snap = snapshot[snapshot["status"] == "active"].dropna(subset=["conductivity"])
         worst = active_snap.sort_values("conductivity", ascending=False).head(25)
         worst_table = pd.DataFrame(
@@ -2014,7 +2040,7 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
     # ----- 6. Membrane age profile -----
     st.markdown("---")
     st.subheader("Membrane age profile")
-    age_chart = make_age_profile_chart(snapshot, latest)
+    age_chart = make_age_profile_chart(snapshot, selected)
     if age_chart is None:
         st.info("No install dates available to build the age profile.")
     else:
@@ -2141,6 +2167,31 @@ def main() -> None:
             font-size: 0.86rem;
             margin-top: 0.45rem;
             min-height: 1.1rem;
+        }
+        .hero-card {
+            border: 1px solid #fecaca;
+            border-radius: 12px;
+            background: linear-gradient(180deg, #fff5f5 0%, #ffffff 70%);
+            padding: 22px 26px;
+            box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+        }
+        .hero-title {
+            color: #64748b;
+            font-size: 0.95rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.02em;
+        }
+        .hero-value {
+            font-size: clamp(3rem, 7vw, 5rem);
+            line-height: 1.05;
+            font-weight: 800;
+            margin-top: 0.2rem;
+        }
+        .hero-subtitle {
+            color: #64748b;
+            font-size: 1rem;
+            margin-top: 0.35rem;
         }
         </style>
         """,
