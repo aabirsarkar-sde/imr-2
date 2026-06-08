@@ -110,6 +110,30 @@ def clean_sheet_name(sheet_name: str) -> str:
     return re.sub(r"\s+", " ", sheet_name).strip()
 
 
+# A plant group is the set of regions a workbook covers, taken verbatim from the
+# filename (e.g. "Ank,JH,Panoli"). A spelling/spacing/case slip in one month's
+# filename — "Panol" vs "Panoli" — would otherwise fragment one logical group
+# into two on the Portfolio/Dashboard pickers. canonicalize_plant_group() folds
+# known variants to one name. To merge a future typo, add its normalized key
+# here; do NOT special-case it in the parser.
+PLANT_GROUP_ALIASES = {
+    "ank,jh,panol": "Ank,JH,Panoli",
+    "ank,jh,panoli": "Ank,JH,Panoli",
+}
+
+
+def canonicalize_plant_group(value: object) -> str:
+    """Map a raw plant-group label to its canonical name. The lookup key is the
+    label with whitespace stripped, comma-spacing collapsed, and lower-cased, so
+    "Ank, JH, Panol" and "ank,jh,panoli" both resolve to the same entry. Unknown
+    labels pass through cleaned (whitespace collapsed) but otherwise unchanged."""
+    text = "" if pd.isna(value) else re.sub(r"\s+", " ", str(value)).strip()
+    if not text:
+        return text
+    key = re.sub(r"\s*,\s*", ",", text).lower()
+    return PLANT_GROUP_ALIASES.get(key, text)
+
+
 def plant_sr_no_from_name(name: object) -> int | None:
     """Pull the trailing "(NNNN)" plant id from a sheet name, e.g.
     "Lupin Ank RO1 (1639)" -> 1639. This joins a reading to its MIS row."""
@@ -140,7 +164,9 @@ def parse_report_metadata(path: Path) -> ReportMeta:
         plant_group = re.sub(r"^\d+\s*-\s*IMR\s*", "", stem, flags=re.IGNORECASE)
         plant_group = plant_group.strip(" -_") or stem
 
-    return ReportMeta(plant_group=plant_group, report_date=report_date)
+    return ReportMeta(
+        plant_group=canonicalize_plant_group(plant_group), report_date=report_date
+    )
 
 
 def report_paths(root: Path) -> list[Path]:
@@ -412,7 +438,7 @@ def extract_rows_from_structured_table(
 
         plant_group = metadata.plant_group
         if plant_group_col is not None and pd.notna(row.get(plant_group_col)):
-            plant_group = clean_label(row.get(plant_group_col))
+            plant_group = canonicalize_plant_group(row.get(plant_group_col))
 
         plant = default_plant
         if plant_col is not None and pd.notna(row.get(plant_col)):
@@ -994,6 +1020,10 @@ def load_readings() -> pd.DataFrame:
     if df.empty:
         return df
     df["module_label"] = df["module_label"].astype("string")
+    # Fold filename-typo group variants ("Panol" vs "Panoli") at read time too, so
+    # rows ingested before canonicalize_plant_group() existed are merged without a
+    # forced re-parse.
+    df["plant_group"] = df["plant_group"].map(canonicalize_plant_group)
     return df.sort_values(["plant_group", "plant", "module_number", "report_date"]).reset_index(
         drop=True
     )
@@ -1007,6 +1037,7 @@ def load_parameters() -> pd.DataFrame:
     df = pd.read_sql("SELECT * FROM parameters", engine, parse_dates=["report_date"])
     if df.empty:
         return pd.DataFrame(columns=PARAM_COLUMNS)
+    df["plant_group"] = df["plant_group"].map(canonicalize_plant_group)
     return df.sort_values(["plant_group", "plant", "tag", "report_date"]).reset_index(drop=True)
 
 
