@@ -4,6 +4,8 @@ import calendar
 import hashlib
 import os
 import re
+import shutil
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +20,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     Integer,
+    LargeBinary,
     MetaData,
     Table,
     Text,
@@ -31,11 +34,13 @@ APP_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR_NAME = "uploaded_reports"
 MANUAL_DATA_FILE = "manual_readings.csv"
 REPORT_GLOBS = ("*.xlsx", "*.xls", "*.csv")
-MONTHS = {
-    month.lower(): index
-    for index, month in enumerate(calendar.month_name)
-    if month
-}
+# Month name -> number, including abbreviations ("jan", "sept", "dec") so
+# filenames like "master sheet IMR Dec.-25" parse, not just full month names.
+MONTHS = {}
+for _month_index in range(1, 13):
+    MONTHS[calendar.month_name[_month_index].lower()] = _month_index
+    MONTHS[calendar.month_abbr[_month_index].lower()] = _month_index
+MONTHS["sept"] = 9
 
 METRICS = {
     "Flow Rate": {
@@ -90,6 +95,10 @@ FEED_TAG = "1601"
 class ReportMeta:
     plant_group: str
     report_date: pd.Timestamp
+    # False when no Month-Year was found in the filename and report_date had to
+    # be guessed from the file's mtime — the validation gate surfaces this as a
+    # warning instead of letting a wrong date land silently.
+    date_from_filename: bool = True
 
 
 def normalize_text(value: object) -> str:
@@ -119,6 +128,9 @@ def clean_sheet_name(sheet_name: str) -> str:
 PLANT_GROUP_ALIASES = {
     "ank,jh,panol": "Ank,JH,Panoli",
     "ank,jh,panoli": "Ank,JH,Panoli",
+    # The monthly "master sheet IMR <month>-<yy>" workbooks all cover the Dahej
+    # zone; fold their filename-derived label ("master sheet") to that zone name.
+    "master sheet": "Dahej",
 }
 
 
@@ -135,17 +147,27 @@ def canonicalize_plant_group(value: object) -> str:
 
 
 def plant_sr_no_from_name(name: object) -> int | None:
-    """Pull the trailing "(NNNN)" plant id from a sheet name, e.g.
-    "Lupin Ank RO1 (1639)" -> 1639. This joins a reading to its MIS row."""
-    match = re.search(r"\((\d+)\)\s*$", str(name))
+    """Pull the plant id from a sheet name. Prefer the last "(NNNN)" group, e.g.
+    "Lupin Ank RO1 (1639)" -> 1639 and "Bharat rasayan RO 6 (3523) ." -> 3523
+    (trailing junk after the parens). If there are no parentheses, fall back to a
+    trailing 3+ digit run ("BEIL PTHP 3550" -> 3550). The 3-digit floor avoids
+    grabbing a stray "(2" from a truncated name. This joins a reading to its MIS row."""
+    text = str(name)
+    parens = re.findall(r"\((\d+)\)", text)
+    if parens:
+        return int(parens[-1])
+    match = re.search(r"(\d{3,})\s*\.?\s*$", text)
     return int(match.group(1)) if match else None
 
 
 def parse_report_metadata(path: Path) -> ReportMeta:
     stem = path.stem
-    month_regex = "|".join(MONTHS)
+    # Longest names first so "march" wins over "mar", "sept" over "sep", etc.
+    month_regex = "|".join(sorted(MONTHS, key=len, reverse=True))
+    # Month (+ optional abbreviation dot), a spaces/dot/dash separator, then a
+    # 4- *or* 2-digit year. Handles "April-2025", "Jan-26", "Dec.-25", "June -25".
     match = re.search(
-        rf"\b({month_regex})\b\s*-?\s*(20\d{{2}}|19\d{{2}})",
+        rf"\b({month_regex})\b\.?\s*[-./]?\s*((?:19|20)\d{{2}}|\d{{2}})",
         stem,
         flags=re.IGNORECASE,
     )
@@ -153,19 +175,29 @@ def parse_report_metadata(path: Path) -> ReportMeta:
     if match:
         month_number = MONTHS[match.group(1).lower()]
         year = int(match.group(2))
+        if year < 100:  # 2-digit year -> 20xx
+            year += 2000
         day = calendar.monthrange(year, month_number)[1]
         report_date = pd.Timestamp(year=year, month=month_number, day=day)
-        plant_group = stem[match.end() :].strip(" -_")
+        date_from_filename = True
+        # The location label is whatever is NOT the date. The old filenames put it
+        # after the date ("IMR <date> <loc>"); the master-sheet naming puts it
+        # before ("<loc> IMR <date>"). Take both sides so either convention works.
+        remainder = stem[: match.start()] + " " + stem[match.end() :]
     else:
         report_date = pd.Timestamp(path.stat().st_mtime, unit="s").normalize()
-        plant_group = stem
+        date_from_filename = False
+        remainder = stem
 
-    if not plant_group:
-        plant_group = re.sub(r"^\d+\s*-\s*IMR\s*", "", stem, flags=re.IGNORECASE)
-        plant_group = plant_group.strip(" -_") or stem
+    # Strip the "IMR" report-type noise and any leading "NN - " index, then tidy.
+    remainder = re.sub(r"\bIMR\b", " ", remainder, flags=re.IGNORECASE)
+    remainder = re.sub(r"^\s*\d+\s*-\s*", "", remainder)
+    plant_group = re.sub(r"\s+", " ", remainder).strip(" -_,") or stem
 
     return ReportMeta(
-        plant_group=canonicalize_plant_group(plant_group), report_date=report_date
+        plant_group=canonicalize_plant_group(plant_group),
+        report_date=report_date,
+        date_from_filename=date_from_filename,
     )
 
 
@@ -706,31 +738,6 @@ def safe_upload_name(filename: str) -> str:
     return name or "uploaded_report.xlsx"
 
 
-def save_uploaded_reports(files: list[object], root: Path) -> tuple[list[str], list[str]]:
-    upload_dir = root / UPLOAD_DIR_NAME
-    upload_dir.mkdir(exist_ok=True)
-
-    saved: list[str] = []
-    skipped: list[str] = []
-    allowed_suffixes = {".xlsx", ".xls"}
-
-    for uploaded_file in files:
-        filename = safe_upload_name(getattr(uploaded_file, "name", "uploaded_report.xlsx"))
-        suffix = Path(filename).suffix.lower()
-        if suffix not in allowed_suffixes:
-            skipped.append(f"{filename}: unsupported file type")
-            continue
-        if (root / filename).exists():
-            skipped.append(f"{filename}: already exists in the main report folder")
-            continue
-
-        destination = upload_dir / filename
-        destination.write_bytes(uploaded_file.getbuffer())
-        saved.append(filename)
-
-    return saved, skipped
-
-
 # --------------------------------------------------------------------------- #
 # Persistence (PostgreSQL)
 #
@@ -803,6 +810,19 @@ INGESTED_FILES_TABLE = Table(
     Column("n_readings", Integer),
     Column("n_parameters", Integer),
     Column("n_mis", Integer),
+)
+
+# Durable copy of each uploaded workbook's raw bytes, so a report can be
+# re-parsed later (after a parser improvement) without depending on the
+# ephemeral Cloud disk. New table -> create_all makes it; no migration needed.
+REPORT_FILES_TABLE = Table(
+    "report_files",
+    DB_METADATA,
+    Column("filename", Text, primary_key=True),
+    Column("content_hash", Text, nullable=False),
+    Column("file_bytes", LargeBinary, nullable=False),
+    Column("uploaded_at", DateTime),
+    Column("status", Text),
 )
 
 READINGS_COLUMNS = [c.name for c in READINGS_TABLE.columns]
@@ -918,11 +938,162 @@ def normalize_mis_records(records: list[dict[str, object]]) -> pd.DataFrame:
     return df.reindex(columns=MIS_COLUMNS)
 
 
+@dataclass
+class ParseResult:
+    """The normalized output of parsing one report, before it is committed.
+    Carries the file's metadata plus a quality signal the gate surfaces."""
+    meta: ReportMeta
+    readings: pd.DataFrame
+    parameters: pd.DataFrame
+    mis: pd.DataFrame
+    n_cond_blanked: int  # raw conductivity values dropped as out-of-range
+
+
+def parse_report_file(path: Path) -> ParseResult:
+    """Parse a report on disk into normalized DataFrames WITHOUT committing.
+    The same parse the old ingest did inline, now reusable by the upload gate."""
+    meta = parse_report_metadata(path)
+    raw_readings = read_report(path)
+    n_blanked = 0
+    for record in raw_readings:
+        value = pd.to_numeric(record.get("conductivity_us_cm"), errors="coerce")
+        if pd.notna(value) and value > MAX_PLAUSIBLE_CONDUCTIVITY_US_CM:
+            n_blanked += 1
+    return ParseResult(
+        meta=meta,
+        readings=normalize_reading_records(raw_readings),
+        parameters=normalize_parameter_records(read_report_parameters(path)),
+        mis=normalize_mis_records(read_report_mis(path)),
+        n_cond_blanked=n_blanked,
+    )
+
+
+def parse_report_bytes(filename: str, data: bytes) -> ParseResult:
+    """Parse uploaded bytes without a durable disk write. The bytes are written
+    to a transient temp dir under their ORIGINAL (sanitized) filename — group and
+    report_date are derived from the name — then parsed via parse_report_file and
+    the temp dir removed. Use safe_upload_name(filename) as the canonical key for
+    staging / commit / byte storage so it matches the source_file stamped in rows."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="imr_stage_"))
+    try:
+        target = tmpdir / safe_upload_name(filename)
+        target.write_bytes(data)
+        return parse_report_file(target)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def commit_parse_result(
+    engine: Engine, filename: str, content_hash: str, result: ParseResult
+) -> dict[str, int]:
+    """Write a parsed result to the live tables (DELETE-then-insert by
+    source_file, idempotent) and record it in ingested_files. Returns counts."""
+    readings, parameters, mis = result.readings, result.parameters, result.mis
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM readings WHERE source_file = :f"), {"f": filename})
+        conn.execute(text("DELETE FROM parameters WHERE source_file = :f"), {"f": filename})
+        conn.execute(text("DELETE FROM mis WHERE source_file = :f"), {"f": filename})
+        readings.to_sql(
+            "readings", conn, if_exists="append", index=False,
+            method="multi", chunksize=1000,
+        )
+        if not parameters.empty:
+            parameters.to_sql(
+                "parameters", conn, if_exists="append", index=False,
+                method="multi", chunksize=1000,
+            )
+        if not mis.empty:
+            mis.to_sql(
+                "mis", conn, if_exists="append", index=False,
+                method="multi", chunksize=1000,
+            )
+        conn.execute(
+            text(
+                """
+                INSERT INTO ingested_files
+                    (filename, content_hash, ingested_at, n_readings, n_parameters, n_mis)
+                VALUES (:f, :h, :ts, :nr, :np, :nm)
+                ON CONFLICT (filename) DO UPDATE SET
+                    content_hash = excluded.content_hash,
+                    ingested_at = excluded.ingested_at,
+                    n_readings = excluded.n_readings,
+                    n_parameters = excluded.n_parameters,
+                    n_mis = excluded.n_mis
+                """
+            ),
+            {
+                "f": filename,
+                "h": content_hash,
+                "ts": datetime.now(timezone.utc),
+                "nr": int(len(readings)),
+                "np": int(len(parameters)),
+                "nm": int(len(mis)),
+            },
+        )
+    return {
+        "readings": int(len(readings)),
+        "parameters": int(len(parameters)),
+        "mis": int(len(mis)),
+    }
+
+
+def store_report_bytes(
+    engine: Engine, filename: str, content_hash: str, data: bytes, status: str = "committed"
+) -> None:
+    """Persist an uploaded workbook's raw bytes so it can be re-parsed later
+    without the original file on disk. Bytes are bound as a parameter (not via
+    to_sql) — psycopg2 adapts to bytea, sqlite3 to BLOB."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO report_files (filename, content_hash, file_bytes, uploaded_at, status)
+                VALUES (:f, :h, :b, :ts, :s)
+                ON CONFLICT (filename) DO UPDATE SET
+                    content_hash = excluded.content_hash,
+                    file_bytes = excluded.file_bytes,
+                    uploaded_at = excluded.uploaded_at,
+                    status = excluded.status
+                """
+            ),
+            {
+                "f": filename,
+                "h": content_hash,
+                "b": data,
+                "ts": datetime.now(timezone.utc),
+                "s": status,
+            },
+        )
+
+
+def load_report_bytes(engine: Engine, filename: str) -> bytes | None:
+    """Return the stored raw bytes for a report, or None if not stored."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT file_bytes FROM report_files WHERE filename = :f"), {"f": filename}
+        ).first()
+    if row is None or row[0] is None:
+        return None
+    return bytes(row[0])  # psycopg2 returns a memoryview; normalize to bytes
+
+
+def report_files_index(engine: Engine) -> list[str]:
+    """Filenames that have durable bytes stored (eligible for re-parse)."""
+    with engine.connect() as conn:
+        return [
+            r[0]
+            for r in conn.execute(
+                text("SELECT filename FROM report_files ORDER BY filename")
+            ).all()
+        ]
+
+
 def ingest_reports(engine: Engine, data_dir: str) -> dict[str, list[str]]:
-    """Parse and store any report whose content hash is new or changed.
+    """Parse and store any report on disk whose content hash is new or changed.
 
     Returns a summary of what was ingested / skipped (already up to date) /
-    failed. Already-ingested files are never re-parsed.
+    failed. Already-ingested files are never re-parsed. This is the startup path
+    for repo-committed files; uploads go through the validation gate instead.
     """
     root = Path(data_dir)
     summary: dict[str, list[str]] = {"ingested": [], "skipped": [], "failed": []}
@@ -944,67 +1115,138 @@ def ingest_reports(engine: Engine, data_dir: str) -> dict[str, list[str]]:
             continue
 
         try:
-            readings = normalize_reading_records(read_report(path))
-            parameters = normalize_parameter_records(read_report_parameters(path))
-            mis = normalize_mis_records(read_report_mis(path))
+            result = parse_report_file(path)
         except Exception as exc:  # noqa: BLE001 - one bad report shouldn't sink the rest
             summary["failed"].append(f"{path.name}: {exc}")
             continue
 
-        if readings.empty:
+        if result.readings.empty:
             summary["failed"].append(f"{path.name}: no module table found")
             continue
 
-        with engine.begin() as conn:
-            conn.execute(
-                text("DELETE FROM readings WHERE source_file = :f"), {"f": path.name}
-            )
-            conn.execute(
-                text("DELETE FROM parameters WHERE source_file = :f"), {"f": path.name}
-            )
-            conn.execute(
-                text("DELETE FROM mis WHERE source_file = :f"), {"f": path.name}
-            )
-            readings.to_sql(
-                "readings", conn, if_exists="append", index=False,
-                method="multi", chunksize=1000,
-            )
-            if not parameters.empty:
-                parameters.to_sql(
-                    "parameters", conn, if_exists="append", index=False,
-                    method="multi", chunksize=1000,
-                )
-            if not mis.empty:
-                mis.to_sql(
-                    "mis", conn, if_exists="append", index=False,
-                    method="multi", chunksize=1000,
-                )
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO ingested_files
-                        (filename, content_hash, ingested_at, n_readings, n_parameters, n_mis)
-                    VALUES (:f, :h, :ts, :nr, :np, :nm)
-                    ON CONFLICT (filename) DO UPDATE SET
-                        content_hash = excluded.content_hash,
-                        ingested_at = excluded.ingested_at,
-                        n_readings = excluded.n_readings,
-                        n_parameters = excluded.n_parameters,
-                        n_mis = excluded.n_mis
-                    """
-                ),
-                {
-                    "f": path.name,
-                    "h": fingerprint,
-                    "ts": datetime.now(timezone.utc),
-                    "nr": int(len(readings)),
-                    "np": int(len(parameters)),
-                    "nm": int(len(mis)),
-                },
-            )
+        commit_parse_result(engine, path.name, fingerprint, result)
         summary["ingested"].append(path.name)
 
     return summary
+
+
+def ingest_report_files(engine: Engine) -> dict[str, list[str]]:
+    """Startup safety net: re-commit any durably-stored report whose content_hash
+    is not already recorded in ingested_files — e.g. the derived tables were wiped
+    but report_files survived a Cloud restart. Normally a no-op (hashes match)."""
+    summary: dict[str, list[str]] = {"ingested": [], "skipped": [], "failed": []}
+    with engine.connect() as conn:
+        known = dict(
+            conn.execute(text("SELECT filename, content_hash FROM ingested_files")).all()
+        )
+        stored = conn.execute(
+            text("SELECT filename, content_hash FROM report_files")
+        ).all()
+
+    for filename, content_hash in stored:
+        if known.get(filename) == content_hash:
+            summary["skipped"].append(filename)
+            continue
+        data = load_report_bytes(engine, filename)
+        if data is None:
+            summary["failed"].append(f"{filename}: no stored bytes")
+            continue
+        try:
+            result = parse_report_bytes(filename, data)
+        except Exception as exc:  # noqa: BLE001
+            summary["failed"].append(f"{filename}: {exc}")
+            continue
+        if result.readings.empty:
+            summary["failed"].append(f"{filename}: no module table found")
+            continue
+        commit_parse_result(engine, filename, content_hash, result)
+        summary["ingested"].append(filename)
+
+    return summary
+
+
+@dataclass
+class Issue:
+    """One line in a report's data-quality report. level is ERROR (blocks the
+    commit), WARN (commit allowed, but something is off), or INFO (FYI)."""
+    level: str
+    code: str
+    message: str
+
+
+def looks_like_raw_filename(plant_group: str) -> bool:
+    """Heuristic: a plant_group that still looks like an undigested filename
+    (underscores, long digit runs, or many tokens) — a sign the date/label split
+    didn't cleanly isolate the location."""
+    if "_" in plant_group:
+        return True
+    if re.search(r"\d{4,}", plant_group):
+        return True
+    return len(plant_group.split()) > 4
+
+
+def validate_parse(engine: Engine, filename: str, result: ParseResult) -> list[Issue]:
+    """Produce a data-quality report for a parsed-but-not-yet-committed report.
+    The upload gate shows these and blocks Confirm if any ERROR is present."""
+    issues: list[Issue] = []
+    readings = result.readings
+
+    if readings.empty:
+        issues.append(Issue("ERROR", "no_readings",
+            "No module table found — there is nothing to commit."))
+        return issues
+
+    if not result.meta.date_from_filename:
+        issues.append(Issue("WARN", "date_fallback",
+            f"No month/year in the filename; report_date was guessed as "
+            f"{result.meta.report_date:%d %b %Y}. Rename like '… April-2025 …' to fix."))
+
+    if looks_like_raw_filename(result.meta.plant_group):
+        issues.append(Issue("WARN", "raw_group",
+            f"Plant group '{result.meta.plant_group}' looks like a raw filename, "
+            f"not a clean location label."))
+
+    missing = sorted(
+        str(p) for p in
+        readings.loc[readings["plant_sr_no"].isna(), "plant"].dropna().unique()
+    )
+    if missing:
+        shown = ", ".join(missing[:8]) + (" …" if len(missing) > 8 else "")
+        issues.append(Issue("WARN", "no_sr_no",
+            f"{len(missing)} sheet(s) have no plant id (NNNN) — their readings get "
+            f"zone 'Unknown': {shown}"))
+
+    # Zone match: of the distinct plant_sr_no in this file, how many resolve to a
+    # zone via this file's MIS or the existing DB register.
+    sr_nos = {int(x) for x in readings["plant_sr_no"].dropna().unique()}
+    if sr_nos:
+        known_sr = {int(x) for x in result.mis["plant_sr_no"].dropna().unique()}
+        with engine.connect() as conn:
+            known_sr |= {
+                int(r[0]) for r in
+                conn.execute(text("SELECT DISTINCT plant_sr_no FROM mis")).all()
+                if r[0] is not None
+            }
+        matched = len(sr_nos & known_sr)
+        if matched / len(sr_nos) < 0.5:
+            issues.append(Issue("WARN", "low_zone_match",
+                f"Only {matched}/{len(sr_nos)} plants match a zone in the MIS register; "
+                f"most readings will show zone 'Unknown'."))
+
+    if result.n_cond_blanked:
+        issues.append(Issue("INFO", "cond_blanked",
+            f"{result.n_cond_blanked} conductivity value(s) above "
+            f"{int(MAX_PLAUSIBLE_CONDUCTIVITY_US_CM):,} µS/cm dropped as data-entry errors."))
+
+    with engine.connect() as conn:
+        already = conn.execute(
+            text("SELECT 1 FROM ingested_files WHERE filename = :f"), {"f": filename}
+        ).first()
+    if already:
+        issues.append(Issue("INFO", "will_replace",
+            f"'{filename}' is already in the database — committing replaces it."))
+
+    return issues
 
 
 def ingested_report_summary(engine: Engine) -> pd.DataFrame:
@@ -1041,6 +1283,10 @@ def remove_report(engine: Engine, root: Path, filename: str) -> dict[str, int]:
             counts[table] = result.rowcount or 0
         conn.execute(
             text("DELETE FROM ingested_files WHERE filename = :f"), {"f": filename}
+        )
+        # Drop the durable byte copy too, else a re-parse could resurrect it.
+        conn.execute(
+            text("DELETE FROM report_files WHERE filename = :f"), {"f": filename}
         )
 
     # Delete the source file wherever it lives so it is not re-ingested on refresh.
@@ -1285,23 +1531,84 @@ def sidebar_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str, str, str]
     return filtered, selected_group, selected_plant, selected_module, metric_name
 
 
-def render_add_data_controls() -> None:
-    st.sidebar.markdown("---")
-    with st.sidebar.expander("Add New Data"):
-        uploaded_files = st.file_uploader(
-            "Upload monthly Excel report",
-            type=["xlsx", "xls"],
-            accept_multiple_files=True,
-            help="Saved files are loaded from the uploaded_reports folder on the next refresh.",
-        )
-        if st.button("Save Uploaded Report(s)", disabled=not uploaded_files):
-            saved, skipped = save_uploaded_reports(uploaded_files or [], APP_DIR)
-            if saved:
-                st.success(f"Saved {len(saved)} report(s). Ingesting on refresh…")
-            if skipped:
-                st.warning("; ".join(skipped))
-            # Saved files are parsed into the database by ingest on the rerun.
-            rerun_app()
+def stage_uploaded_files(engine: Engine, files: list[object]) -> None:
+    """Parse + validate each uploaded file into st.session_state['staged']
+    WITHOUT committing. Keyed by sanitized filename so a re-upload overwrites."""
+    staged = st.session_state.setdefault("staged", {})
+    for uploaded in files:
+        data = uploaded.getvalue()
+        name = safe_upload_name(getattr(uploaded, "name", "uploaded_report.xlsx"))
+        try:
+            result = parse_report_bytes(name, data)
+            issues = validate_parse(engine, name, result)
+        except Exception as exc:  # noqa: BLE001 - surface parse failures in the gate
+            staged[name] = {"error": str(exc)}
+            continue
+        staged[name] = {
+            "result": result,
+            "issues": issues,
+            "content_hash": hashlib.sha256(data).hexdigest(),
+            "data": data,
+        }
+
+
+# Map an Issue level to the Streamlit callout that renders it.
+ISSUE_RENDERERS = {"ERROR": st.error, "WARN": st.warning, "INFO": st.info}
+
+
+def render_staged_reports(engine: Engine) -> None:
+    """Render the pending-review queue: per-file stats + quality issues + a
+    Confirm/Discard pair. Confirm commits to the live tables; nothing is written
+    until then."""
+    staged = st.session_state.get("staged", {})
+    if not staged:
+        return
+    st.markdown("**Pending review**")
+    for name in list(staged):
+        entry = staged[name]
+        with st.container(border=True):
+            st.markdown(f"**{name}**")
+            if "error" in entry:
+                st.error(f"Could not parse: {entry['error']}")
+                if st.button("Discard", key=f"discard_{name}"):
+                    staged.pop(name, None)
+                    rerun_app()
+                continue
+
+            result: ParseResult = entry["result"]
+            issues: list[Issue] = entry["issues"]
+            readings = result.readings
+            bypass = int((readings["status"] == "bypass").sum()) if "status" in readings else 0
+            dates = readings["report_date"].dropna()
+            span = ""
+            if not dates.empty:
+                lo, hi = dates.min(), dates.max()
+                span = f" · {lo:%b %Y}" + (f"–{hi:%b %Y}" if hi != lo else "")
+            st.caption(
+                f"{result.meta.plant_group} · {result.meta.report_date:%d %b %Y} · "
+                f"{readings['plant'].nunique()} plants · {len(readings)} readings · "
+                f"{bypass} bypass{span}"
+            )
+            for issue in issues:
+                ISSUE_RENDERERS.get(issue.level, st.info)(issue.message)
+
+            blocked = any(i.level == "ERROR" for i in issues)
+            ok_col, no_col = st.columns(2)
+            if ok_col.button(
+                "Confirm & commit", key=f"commit_{name}", type="primary", disabled=blocked
+            ):
+                commit_parse_result(engine, name, entry["content_hash"], result)
+                store_report_bytes(engine, name, entry["content_hash"], entry["data"])
+                load_readings.clear()
+                load_parameters.clear()
+                load_mis.clear()
+                compute_fleet_status.clear()
+                staged.pop(name, None)
+                st.success(f"Committed {name}.")
+                rerun_app()
+            if no_col.button("Discard", key=f"discard_{name}"):
+                staged.pop(name, None)
+                rerun_app()
 
 
 def module_series_map(
@@ -2094,7 +2401,6 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
 
 def render_dashboard(df: pd.DataFrame, params: pd.DataFrame) -> None:
     filtered, selected_group, selected_plant, selected_module, metric_name = sidebar_filters(df)
-    render_add_data_controls()
     metric_config = METRICS[metric_name]
     metric_col = str(metric_config["column"])
     series = aggregate_series(filtered, metric_col)
@@ -2175,12 +2481,55 @@ def render_dashboard(df: pd.DataFrame, params: pd.DataFrame) -> None:
 
 
 def render_data_manager(engine: Engine) -> None:
-    """Sidebar admin panel: list ingested reports and let the user permanently
-    remove a bad one. Shown on every page so data can be fixed from anywhere."""
+    """Sidebar admin panel: upload reports through a validation gate, review the
+    pending queue, and permanently remove a bad report. Shown on every page."""
     with st.sidebar.expander("🗂 Manage Data"):
+        # --- Upload + validate (no commit until Confirm) ---
+        uploaded_files = st.file_uploader(
+            "Upload monthly Excel report",
+            type=["xlsx", "xls"],
+            accept_multiple_files=True,
+            help="Files are parsed and checked; nothing is saved until you Confirm.",
+            key="data_uploader",
+        )
+        if st.button("Validate & preview", disabled=not uploaded_files):
+            stage_uploaded_files(engine, uploaded_files or [])
+            rerun_app()
+
+        render_staged_reports(engine)
+
+        # --- Re-parse a stored report through the same gate ---
+        stored = report_files_index(engine)
+        if stored:
+            st.markdown("---")
+            reparse_choice = st.selectbox(
+                "Re-parse a stored report",
+                stored,
+                index=None,
+                placeholder="Pick a file to re-parse…",
+                help="Re-runs the current parser on the stored bytes, back into the review queue.",
+                key="reparse_choice",
+            )
+            if reparse_choice and st.button("Re-parse", key="reparse_btn"):
+                data = load_report_bytes(engine, reparse_choice)
+                if data is None:
+                    st.warning("No stored bytes for that file.")
+                else:
+                    result = parse_report_bytes(reparse_choice, data)
+                    st.session_state.setdefault("staged", {})[reparse_choice] = {
+                        "result": result,
+                        "issues": validate_parse(engine, reparse_choice, result),
+                        "content_hash": hashlib.sha256(data).hexdigest(),
+                        "data": data,
+                    }
+                    rerun_app()
+
+        st.markdown("---")
+
+        # --- Remove an already-committed report ---
         reports = ingested_report_summary(engine)
         if reports.empty:
-            st.caption("No reports have been ingested yet.")
+            st.caption("No reports have been committed yet.")
             return
 
         st.caption(f"{len(reports)} report(s) in the database.")
@@ -2300,6 +2649,11 @@ def main() -> None:
     try:
         init_db(engine)
         summary = ingest_reports(engine, str(APP_DIR))
+        # Rebuild from durable bytes anything whose derived rows went missing
+        # (e.g. Cloud restart wiped disk but report_files survived). Usually a no-op.
+        recovered = ingest_report_files(engine)
+        summary["ingested"].extend(recovered["ingested"])
+        summary["failed"].extend(recovered["failed"])
     except Exception as exc:  # noqa: BLE001
         st.error(f"Could not reach the database: {exc}")
         return
