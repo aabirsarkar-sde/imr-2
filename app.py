@@ -1007,6 +1007,51 @@ def ingest_reports(engine: Engine, data_dir: str) -> dict[str, list[str]]:
     return summary
 
 
+def ingested_report_summary(engine: Engine) -> pd.DataFrame:
+    """List every ingested report with its stored row counts, for the
+    manage-data UI. One row per file in `ingested_files`."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT filename, n_readings, n_parameters, n_mis, ingested_at "
+                "FROM ingested_files ORDER BY filename"
+            )
+        ).all()
+    return pd.DataFrame(
+        rows,
+        columns=["filename", "n_readings", "n_parameters", "n_mis", "ingested_at"],
+    )
+
+
+def remove_report(engine: Engine, root: Path, filename: str) -> dict[str, int]:
+    """Completely remove one report from the system.
+
+    Deletes its rows from `readings`/`parameters`/`mis`, drops its `ingested_files`
+    record, and deletes the file on disk. The on-disk delete is essential: if the
+    file survived, the next `ingest_reports()` run would re-parse it (its hash is
+    no longer known) and restore everything we just deleted. Returns per-table
+    delete counts.
+    """
+    counts: dict[str, int] = {}
+    with engine.begin() as conn:
+        for table in ("readings", "parameters", "mis"):
+            result = conn.execute(
+                text(f"DELETE FROM {table} WHERE source_file = :f"), {"f": filename}
+            )
+            counts[table] = result.rowcount or 0
+        conn.execute(
+            text("DELETE FROM ingested_files WHERE filename = :f"), {"f": filename}
+        )
+
+    # Delete the source file wherever it lives so it is not re-ingested on refresh.
+    for source_root in (root, root / UPLOAD_DIR_NAME):
+        candidate = source_root / filename
+        if candidate.exists():
+            candidate.unlink()
+
+    return counts
+
+
 @st.cache_data(show_spinner="Loading readings from the database...")
 def load_readings() -> pd.DataFrame:
     engine = get_engine()
@@ -2129,6 +2174,51 @@ def render_dashboard(df: pd.DataFrame, params: pd.DataFrame) -> None:
     )
 
 
+def render_data_manager(engine: Engine) -> None:
+    """Sidebar admin panel: list ingested reports and let the user permanently
+    remove a bad one. Shown on every page so data can be fixed from anywhere."""
+    with st.sidebar.expander("🗂 Manage Data"):
+        reports = ingested_report_summary(engine)
+        if reports.empty:
+            st.caption("No reports have been ingested yet.")
+            return
+
+        st.caption(f"{len(reports)} report(s) in the database.")
+        choice = st.selectbox(
+            "Remove a report",
+            reports["filename"].tolist(),
+            index=None,
+            placeholder="Select a file to remove…",
+            key="remove_report_choice",
+        )
+        if not choice:
+            return
+
+        row = reports[reports["filename"] == choice].iloc[0]
+        st.caption(
+            f"{int(row['n_readings'] or 0)} readings · "
+            f"{int(row['n_parameters'] or 0)} parameters · "
+            f"{int(row['n_mis'] or 0)} MIS rows"
+        )
+        confirm = st.checkbox(
+            f"Confirm permanent removal of **{choice}**",
+            key="remove_report_confirm",
+        )
+        if st.button(
+            "Delete report data", type="primary", disabled=not confirm
+        ):
+            counts = remove_report(engine, APP_DIR, choice)
+            load_readings.clear()
+            load_parameters.clear()
+            load_mis.clear()
+            compute_fleet_status.clear()
+            st.success(
+                f"Removed {choice}: {counts['readings']} readings, "
+                f"{counts['parameters']} parameters, {counts['mis']} MIS rows."
+            )
+            rerun_app()
+
+
 def main() -> None:
     st.set_page_config(
         page_title="RO Membrane Health Dashboard",
@@ -2236,6 +2326,8 @@ def main() -> None:
 
     params = load_parameters()
     mis = load_mis()
+
+    render_data_manager(engine)
 
     pages = st.navigation(
         [
