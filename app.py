@@ -556,10 +556,6 @@ def read_report(path: Path) -> list[dict[str, object]]:
     return records
 
 
-def display_tag(normalized_tag: str) -> str:
-    return normalized_tag.upper()
-
-
 def extract_operating_parameters(
     raw: pd.DataFrame,
     *,
@@ -596,7 +592,7 @@ def extract_operating_parameters(
                 "plant_group": metadata.plant_group,
                 "plant": plant,
                 "report_date": metadata.report_date,
-                "tag": display_tag(tag),
+                "tag": tag.upper(),
                 "kind": kind,
                 "value": float(value),
                 "unit": unit,

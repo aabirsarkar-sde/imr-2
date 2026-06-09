@@ -105,8 +105,9 @@ runs on Postgres (prod) and SQLite (tests).
 
 ## Verifying changes
 
-No test suite. For data/extraction/schema changes, write a throwaway script that builds a
-**SQLite** engine, ingests the two `.xlsx` files in the repo, and asserts on the result —
-then delete the script (don't commit it). This exercises the real ingest pipeline without
-touching production. Boot the app (`DATABASE_URL=sqlite:////tmp/x.db streamlit run app.py`)
-to confirm pages render (HTTP 200).
+No test suite, and no sample workbooks are committed (they get auto-ingested into prod, so
+they're kept out of the repo). For data/extraction/schema changes, drop a real IMR workbook
+somewhere temporary, then write a throwaway script that builds a **SQLite** engine, ingests
+that file via `ingest_reports()`, and asserts on the result — then delete the script (don't
+commit it). This exercises the real ingest pipeline without touching production. Boot the app
+(`DATABASE_URL=sqlite:////tmp/x.db streamlit run app.py`) to confirm pages render (HTTP 200).
