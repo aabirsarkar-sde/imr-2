@@ -1758,19 +1758,14 @@ ABSOLUTE_METHOD = "Absolute limit (uS/cm)"
 OUTLIER_METHODS = (PEER_METHOD, ABSOLUTE_METHOD)
 DEFAULT_ABSOLUTE_LIMIT = 500.0
 
-# Fleet-wide degradation cutoffs rise per RO stage: the reject side naturally
-# runs at higher TDS, so a higher bar avoids false positives. Used by the
-# Portfolio page via evaluate_stage_readings (absolute-limit method).
-STAGE_CONDUCTIVITY_CUTOFFS = {"i": 1000.0, "ii": 1500.0, "iii": 2000.0}
-DEFAULT_STAGE_CUTOFF = 1000.0
-
-
-def stage_cutoff(stage_label: str) -> float:
-    normalized = normalize_text(stage_label)
-    for roman in ("iii", "ii", "i"):
-        if re.search(rf"\b{roman}\b", normalized):
-            return STAGE_CONDUCTIVITY_CUTOFFS[roman]
-    return DEFAULT_STAGE_CUTOFF
+# Month-over-month escape hatch (Portfolio degraded flag). The IQR peer test is
+# blind to a stage that degrades in lockstep — when every module rises together,
+# none stands out as an outlier. So a module the IQR clears is ALSO flagged if
+# its conductivity jumps unusually versus its OWN prior-month reading: at least
+# +MOM_JUMP_RATIO relative AND +MOM_MIN_DELTA absolute (the floor stops trivial
+# rises on near-zero permeate readings, e.g. 60 -> 100 uS/cm, from tripping it).
+MOM_JUMP_RATIO = 1.5
+MOM_MIN_DELTA = 150.0
 
 
 def iqr_outlier_stats(values: pd.Series, sensitivity: float) -> dict[str, object]:
@@ -2088,16 +2083,25 @@ def render_replacement_page(df: pd.DataFrame) -> None:
 def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFrame:
     """Annotate every reading with bypass / degraded / need, for all months.
 
-    Degradation reuses evaluate_stage_readings (absolute-limit method) once per
-    (plant, stage, month) with a stage-aware cutoff, so the definition matches
-    the Replacement page. A module "needs attention" if it is bypassed or
-    degraded. Returns one row per (plant, stage, module, month).
+    A module is degraded if EITHER signal fires:
+    - **Peer outlier (IQR):** its conductivity exceeds the stage's Tukey upper
+      fence (Q3 + 1.5·IQR), computed against peers in the same stage that month
+      via evaluate_stage_readings (k=1.5). Robust down to ~4 modules per stage.
+    - **Month-over-month jump:** its conductivity rose unusually versus the SAME
+      module's prior reading (>= MOM_JUMP_RATIO and >= MOM_MIN_DELTA). This is a
+      per-module time-series test, so it catches a stage degrading in lockstep —
+      the case the within-month IQR peer test is structurally blind to.
+
+    A module "needs attention" if it is bypassed or degraded. Returns one row per
+    (plant, stage, module, month), with degraded_iqr / degraded_mom kept split so
+    callers can show *why* a module was flagged.
     """
     col = str(METRICS["Conductivity"]["column"])
     columns = [
         "plant_group", "plant", "plant_sr_no", "zone", "stage_label",
-        "module_label", "report_date", "conductivity", "install_date",
-        "status", "degraded", "need", "cutoff",
+        "module_label", "report_date", "conductivity", "prev_conductivity",
+        "install_date", "status", "degraded_iqr", "degraded_mom",
+        "degraded", "need", "cutoff",
     ]
     if readings.empty:
         return pd.DataFrame(columns=columns)
@@ -2133,18 +2137,18 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
             is_bypass=("status", lambda s: bool((s == "bypass").any())),
         )
         active = agg[~agg["is_bypass"]]
-        cutoff = stage_cutoff(stage_label)
-        degraded_map: dict[object, bool] = {}
+        cutoff = float("nan")
+        iqr_map: dict[object, bool] = {}
         if not active.empty:
-            evaluated, _, _, _ = evaluate_stage_readings(
-                active, method=ABSOLUTE_METHOD, sensitivity=1.5, limit=cutoff
+            evaluated, _, cutoff, _ = evaluate_stage_readings(
+                active, method=PEER_METHOD, sensitivity=1.5, limit=0.0
             )
-            degraded_map = dict(zip(evaluated["module_label"], evaluated["flag"]))
+            iqr_map = dict(zip(evaluated["module_label"], evaluated["flag"]))
 
         plant_group, plant_sr, zone = plant_meta[plant]
         for _, row in agg.iterrows():
             bypass = bool(row["is_bypass"])
-            degraded = (not bypass) and bool(degraded_map.get(row["module_label"], False))
+            degraded_iqr = (not bypass) and bool(iqr_map.get(row["module_label"], False))
             records.append(
                 {
                     "plant_group": plant_group,
@@ -2157,13 +2161,33 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
                     "conductivity": row["conductivity"],
                     "install_date": row["install_date"],
                     "status": "bypass" if bypass else "active",
-                    "degraded": degraded,
-                    "need": bypass or degraded,
+                    "degraded_iqr": degraded_iqr,
                     "cutoff": cutoff,
                 }
             )
 
-    return pd.DataFrame(records, columns=columns)
+    result = pd.DataFrame(records)
+    if result.empty:
+        return pd.DataFrame(columns=columns)
+
+    # Second signal: an unusually high month-over-month jump vs the SAME module's
+    # prior reading. Computed per (plant, stage, module) time series — blind to
+    # within-stage peers, so it catches a stage that degrades in lockstep, the
+    # case IQR misses. shift() compares each reading to that module's previous
+    # available report (no flag on a module's first-ever month).
+    result = result.sort_values(["plant", "stage_label", "module_label", "report_date"])
+    prev = result.groupby(["plant", "stage_label", "module_label"])["conductivity"].shift()
+    result["prev_conductivity"] = prev
+    result["degraded_mom"] = (
+        (result["status"] == "active")
+        & prev.notna()
+        & (result["conductivity"] >= prev * MOM_JUMP_RATIO)
+        & (result["conductivity"] - prev >= MOM_MIN_DELTA)
+    )
+    result["degraded"] = result["degraded_iqr"] | result["degraded_mom"]
+    result["need"] = (result["status"] == "bypass") | result["degraded"]
+
+    return result.reindex(columns=columns).reset_index(drop=True)
 
 
 def build_plant_ranking(snapshot: pd.DataFrame, latest: pd.Timestamp) -> pd.DataFrame:
@@ -2292,12 +2316,81 @@ def make_age_profile_chart(snapshot: pd.DataFrame, latest: pd.Timestamp) -> go.F
     return fig
 
 
+def render_plant_flagged_modules(
+    snapshot: pd.DataFrame, plant: str, month_text: str
+) -> None:
+    """List every module flagged (degraded or bypassed) for one plant this month.
+
+    `snapshot` is the already-zone/month-filtered fleet status, so degraded/need
+    and the per-stage IQR cutoff are read straight off it — no recomputation.
+    """
+    plant_rows = snapshot[snapshot["plant"] == plant]
+    flagged = plant_rows[plant_rows["need"]].copy()
+
+    st.markdown(f"#### {plant} — flagged modules · {month_text}")
+    if flagged.empty:
+        st.success(f"No modules flagged for {plant} in {month_text}.")
+        return
+
+    n_degraded = int(flagged["degraded"].sum())
+    n_bypass = int((flagged["status"] == "bypass").sum())
+    n_iqr = int(flagged["degraded_iqr"].sum())
+    n_mom = int(flagged["degraded_mom"].sum())
+    st.caption(
+        f"{len(flagged):,} module(s) need attention — {n_degraded:,} degraded "
+        f"({n_iqr:,} peer outlier · {n_mom:,} month-over-month jump) "
+        f"+ {n_bypass:,} bypassed."
+    )
+
+    def _reason(row: pd.Series) -> str:
+        if row["status"] == "bypass":
+            return "Bypassed"
+        tags = []
+        if row["degraded_iqr"]:
+            tags.append("Peer outlier (IQR)")
+        if row["degraded_mom"]:
+            tags.append("MoM jump")
+        return " + ".join(tags) if tags else "Degraded"
+
+    flagged = flagged.sort_values(
+        ["status", "conductivity"], ascending=[True, False]
+    )
+    detail = pd.DataFrame(
+        {
+            "Stage": flagged["stage_label"],
+            "Module": flagged["module_label"],
+            "Reason": flagged.apply(_reason, axis=1),
+            "Conductivity (uS/cm)": flagged["conductivity"].map(
+                lambda v: f"{v:,.0f}" if pd.notna(v) else "—"
+            ),
+            "Prev Month (uS/cm)": flagged["prev_conductivity"].map(
+                lambda v: f"{v:,.0f}" if pd.notna(v) else "—"
+            ),
+            "Stage Fence (uS/cm)": flagged["cutoff"].map(
+                lambda v: f"{v:,.0f}" if pd.notna(v) else "—"
+            ),
+            "Install Date": flagged["install_date"].map(
+                lambda v: pd.Timestamp(v).strftime("%d %b %Y") if pd.notna(v) else "Unknown"
+            ),
+        }
+    )
+    st.dataframe(detail, width="stretch", hide_index=True)
+    st.download_button(
+        "Download flagged modules (CSV)",
+        detail.to_csv(index=False).encode("utf-8"),
+        file_name=f"{plant.replace(' ', '_')}_flagged_{month_text.replace(' ', '_')}.csv",
+        mime="text/csv",
+        key="portfolio_plant_flagged_csv",
+    )
+
+
 def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
     st.title("Fleet Portfolio")
     st.caption(
         "Fleet-wide membrane health across every plant — no plant selection needed. "
-        "A module needs attention if it is bypassed, or degraded (active and over its "
-        "stage's conductivity limit: Stage I > 1,000, II > 1,500, III > 2,000 uS/cm)."
+        "A module needs attention if it is bypassed, or degraded — an active module "
+        "that is a peer outlier in its stage (Q3 + 1.5·IQR around the stage median) "
+        "or shows an unusually high month-over-month jump in conductivity."
     )
 
     status = compute_fleet_status(df, mis)
@@ -2305,16 +2398,27 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
         st.info("No readings are available to build the fleet view.")
         return
 
-    # Month picker — the whole page renders for the chosen month, defaulting to
-    # the most recent one. Every downstream section keys off `snapshot`/`selected`.
+    # Month + zone slicers — the whole page renders for the chosen month and the
+    # chosen zones, defaulting to the most recent month and all zones. Every
+    # downstream section keys off `snapshot`/`selected`/`status_zoned`.
     months = sorted(status["report_date"].dropna().unique(), reverse=True)
     month_labels = [pd.Timestamp(m).strftime("%b %Y") for m in months]
-    picker_col, _ = st.columns([1, 3])
+    zones = sorted(status["zone"].dropna().astype(str).unique().tolist())
+    picker_col, zone_col = st.columns([1, 2])
     with picker_col:
         picked = st.selectbox("Report month", month_labels, index=0)
+    with zone_col:
+        selected_zones = st.multiselect(
+            "Zones",
+            zones,
+            default=zones,
+            help="Filter the whole page to one or more zones. Clear the box to show all zones.",
+        )
     selected = months[month_labels.index(picked)]
     month_text = picked
-    snapshot = status[status["report_date"] == selected]
+    active_zones = selected_zones or zones  # empty selection = all zones
+    status_zoned = status[status["zone"].isin(active_zones)]
+    snapshot = status_zoned[status_zoned["report_date"] == selected]
 
     total_plants = int(snapshot["plant"].nunique())
     total_modules = len(snapshot)
@@ -2324,9 +2428,9 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
     need = int(snapshot["need"].sum())
     need_pct = need / total_modules * 100 if total_modules else 0.0
 
-    # ----- 1. Headline KPI: membranes to replace -----
+    # ----- 1. Headline KPI: modules to replace -----
     hero_card(
-        "Membranes to Replace",
+        "Modules to Replace",
         f"{need:,}",
         f"{month_text} — {degraded:,} degraded + {bypassed:,} bypassed "
         f"across {total_plants:,} plants ({need_pct:.1f}% of {total_modules:,} modules)",
@@ -2340,16 +2444,26 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
     with kpis[1]:
         metric_card("Active Modules", f"{active_modules:,}", f"{total_modules:,} total this month")
     with kpis[2]:
-        metric_card("Degraded", f"{degraded:,}", "active, over stage limit", "#d97706")
+        metric_card("Degraded", f"{degraded:,}", "active, IQR or MoM jump", "#d97706")
     with kpis[3]:
-        metric_card("Bypassed", f"{bypassed:,}", "offline membranes", "#dc2626")
+        metric_card("Bypassed", f"{bypassed:,}", "offline modules", "#dc2626")
 
     # ----- 2. Plant ranking (centerpiece) -----
     st.markdown("---")
     st.subheader("Plant ranking")
-    st.caption("One row per plant, sorted by modules needing attention. Click a column header to re-sort.")
+    st.caption(
+        "One row per plant, sorted by modules needing attention. Click a column header "
+        "to re-sort, or select a row to see that plant's flagged modules below."
+    )
     ranking = build_plant_ranking(snapshot, selected)
-    st.dataframe(ranking, width="stretch", hide_index=True)
+    ranking_event = st.dataframe(
+        ranking,
+        width="stretch",
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="portfolio_ranking",
+    )
     st.download_button(
         "Download plant ranking (CSV)",
         ranking.to_csv(index=False).encode("utf-8"),
@@ -2357,11 +2471,17 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
         mime="text/csv",
     )
 
+    # Drill-down: clicking a plant row lists every module flagged for it this month.
+    selected_rows = ranking_event.selection.get("rows", []) if ranking_event else []
+    if selected_rows and not ranking.empty:
+        chosen_plant = str(ranking.iloc[selected_rows[0]]["Plant"])
+        render_plant_flagged_modules(snapshot, chosen_plant, month_text)
+
     # ----- 3. Fleet trend -----
     st.markdown("---")
     st.subheader("Fleet trend")
-    st.caption("Month-over-month deterioration across the whole fleet.")
-    st.plotly_chart(make_fleet_trend_chart(status), width="stretch")
+    st.caption("Month-over-month deterioration across the selected zones.")
+    st.plotly_chart(make_fleet_trend_chart(status_zoned), width="stretch")
 
     # ----- 4 & 5. Zone rollup + worst modules -----
     left, right = st.columns(2)
@@ -2369,9 +2489,9 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
         st.subheader("By zone")
         st.plotly_chart(make_zone_rollup_chart(snapshot), width="stretch")
     with right:
-        st.subheader(f"Worst 25 modules — {month_text}")
+        st.subheader(f"Worst 50 modules — {month_text}")
         active_snap = snapshot[snapshot["status"] == "active"].dropna(subset=["conductivity"])
-        worst = active_snap.sort_values("conductivity", ascending=False).head(25)
+        worst = active_snap.sort_values("conductivity", ascending=False).head(50)
         worst_table = pd.DataFrame(
             {
                 "Plant": worst["plant"],
@@ -2383,7 +2503,42 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
                 ),
             }
         )
-        st.dataframe(worst_table, width="stretch", hide_index=True, height=380)
+        st.dataframe(worst_table, width="stretch", hide_index=True, height=600)
+
+    # ----- 5b. Biggest month-over-month conductivity jumps -----
+    st.markdown("---")
+    st.subheader(f"Top 50 month-over-month jumps — {month_text}")
+    st.caption(
+        "Active modules whose conductivity rose the most versus their own prior "
+        "reading. A jump shared across a whole plant/stage usually points to a feed "
+        "or cleaning issue rather than individual membranes."
+    )
+    jumps = active_snap.dropna(subset=["prev_conductivity"]).copy()
+    jumps["delta"] = jumps["conductivity"] - jumps["prev_conductivity"]
+    jumps = jumps[jumps["delta"] > 0].sort_values("delta", ascending=False).head(50)
+    if jumps.empty:
+        st.info("No month-over-month increases to show (no prior-month readings yet).")
+    else:
+        jump_table = pd.DataFrame(
+            {
+                "Plant": jumps["plant"],
+                "Stage": jumps["stage_label"],
+                "Module": jumps["module_label"],
+                "Prev (uS/cm)": jumps["prev_conductivity"].map(lambda v: f"{v:,.0f}"),
+                "Now (uS/cm)": jumps["conductivity"].map(lambda v: f"{v:,.0f}"),
+                "Change (uS/cm)": jumps["delta"].map(lambda v: f"+{v:,.0f}"),
+                "Change (x)": (jumps["conductivity"] / jumps["prev_conductivity"]).map(
+                    lambda v: f"{v:,.1f}x"
+                ),
+            }
+        )
+        st.dataframe(jump_table, width="stretch", hide_index=True, height=600)
+        st.download_button(
+            "Download month-over-month jumps (CSV)",
+            jump_table.to_csv(index=False).encode("utf-8"),
+            file_name=f"mom_jumps_{month_text.replace(' ', '_')}.csv",
+            mime="text/csv",
+        )
 
     # ----- 6. Membrane age profile -----
     st.markdown("---")
