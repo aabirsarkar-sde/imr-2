@@ -584,6 +584,15 @@ def extract_operating_parameters(
 
             value = pd.to_numeric(raw.iat[row_index, col_index - 1], errors="coerce")
             tag = normalize_text(raw.iat[row_index, col_index - 2])
+            # Some sheets leave a blank spacer column between the tag and its
+            # value, e.g. the feed/permeate conductivity block reads
+            # "CIS 151" | <blank> | 8200 | "us/cm". When the immediate left cell
+            # is empty, look one cell further left for the tag (requiring a
+            # letter so a stray number doesn't masquerade as an instrument tag).
+            if not tag and col_index >= 3:
+                candidate = normalize_text(raw.iat[row_index, col_index - 3])
+                if re.search(r"[a-z]", candidate):
+                    tag = candidate
             if not tag or pd.isna(value):
                 continue
 
@@ -1493,6 +1502,21 @@ def hero_card(title: str, value: str, subtitle: str = "", color: str = "#dc2626"
     )
 
 
+def jump_nav(items: list[tuple[str, str, str]]) -> None:
+    """Render a row of clickable cards that scroll to in-page section anchors.
+
+    Each item is (label, anchor, subtitle); `anchor` must match the `anchor=`
+    set on the target section's subheader. Pure anchor links — no rerun.
+    """
+    cards = "".join(
+        f'<a class="nav-card" href="#{anchor}">'
+        f'<span class="nav-label">{label}</span>'
+        f'<span class="nav-sub">{subtitle}</span></a>'
+        for label, anchor, subtitle in items
+    )
+    st.markdown(f'<div class="nav-grid">{cards}</div>', unsafe_allow_html=True)
+
+
 def rerun_app() -> None:
     if hasattr(st, "rerun"):
         st.rerun()
@@ -1766,6 +1790,23 @@ DEFAULT_ABSOLUTE_LIMIT = 500.0
 # rises on near-zero permeate readings, e.g. 60 -> 100 uS/cm, from tripping it).
 MOM_JUMP_RATIO = 1.5
 MOM_MIN_DELTA = 150.0
+
+# Whole-plant conductivity salt passage. The plant-level instrument block records
+# feed conductivity as CIS 151 and combined permeate conductivity as CIS 180
+# (us/cm), once per plant sheet. Salt passage % = permeate / feed * 100 — the
+# share of feed salinity that leaks through the entire RO train. A healthy train
+# passes only a few percent, so a plant above this fraction is surfaced for review.
+FEED_COND_TAG = "151"
+PERMEATE_COND_TAG = "180"
+SALT_PASSAGE_FLAG_PCT = 10.0
+
+# Whole-plant permeate (product) flow, logged once per plant sheet as FIS 180 in
+# either m3/hr or litres/hr. A sustained month-over-month fall in permeate flow is
+# a classic fouling/membrane-loss signal, so the Portfolio surfaces the biggest
+# drops. PERMEATE_FLOW_M3HR_PER_LPH converts litres/hr -> m3/hr so plants logged
+# in either unit rank on one scale.
+PERMEATE_FLOW_TAG = "180"
+PERMEATE_FLOW_M3HR_PER_LPH = 0.001
 
 
 def iqr_outlier_stats(values: pd.Series, sensitivity: float) -> dict[str, object]:
@@ -2097,11 +2138,12 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
     callers can show *why* a module was flagged.
     """
     col = str(METRICS["Conductivity"]["column"])
+    flow_col = str(METRICS["Flow Rate"]["column"])
     columns = [
         "plant_group", "plant", "plant_sr_no", "zone", "stage_label",
         "module_label", "report_date", "conductivity", "prev_conductivity",
-        "install_date", "status", "degraded_iqr", "degraded_mom",
-        "degraded", "need", "cutoff",
+        "flow", "prev_flow", "install_date", "status", "degraded_iqr",
+        "degraded_mom", "degraded", "need", "cutoff",
     ]
     if readings.empty:
         return pd.DataFrame(columns=columns)
@@ -2133,6 +2175,7 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
     ):
         agg = group.groupby("module_label", as_index=False).agg(
             conductivity=(col, "mean"),
+            flow=(flow_col, "mean"),
             install_date=("install_date", "first"),
             is_bypass=("status", lambda s: bool((s == "bypass").any())),
         )
@@ -2159,6 +2202,7 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
                     "module_label": row["module_label"],
                     "report_date": report_date,
                     "conductivity": row["conductivity"],
+                    "flow": row["flow"],
                     "install_date": row["install_date"],
                     "status": "bypass" if bypass else "active",
                     "degraded_iqr": degraded_iqr,
@@ -2176,8 +2220,10 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
     # case IQR misses. shift() compares each reading to that module's previous
     # available report (no flag on a module's first-ever month).
     result = result.sort_values(["plant", "stage_label", "module_label", "report_date"])
-    prev = result.groupby(["plant", "stage_label", "module_label"])["conductivity"].shift()
+    grouped = result.groupby(["plant", "stage_label", "module_label"])
+    prev = grouped["conductivity"].shift()
     result["prev_conductivity"] = prev
+    result["prev_flow"] = grouped["flow"].shift()
     result["degraded_mom"] = (
         (result["status"] == "active")
         & prev.notna()
@@ -2188,6 +2234,161 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
     result["need"] = (result["status"] == "bypass") | result["degraded"]
 
     return result.reindex(columns=columns).reset_index(drop=True)
+
+
+def build_zone_by_sr(mis: pd.DataFrame) -> dict[object, object]:
+    """plant_sr_no -> zone, from the most recent MIS row for each plant."""
+    zone_by_sr: dict[object, object] = {}
+    if mis is not None and not mis.empty:
+        latest_mis = mis.sort_values("report_date").drop_duplicates("plant_sr_no", keep="last")
+        for _, row in latest_mis.iterrows():
+            zone = row.get("zone")
+            zone_by_sr[row["plant_sr_no"]] = zone if (pd.notna(zone) and str(zone).strip()) else None
+    return zone_by_sr
+
+
+def compute_salt_passage(parameters: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFrame:
+    """Per-plant per-month conductivity salt passage from the CIS feed/permeate tags.
+
+    Feed conductivity (CIS 151) and combined permeate conductivity (CIS 180) are
+    recorded once per plant sheet. Salt passage % = permeate / feed * 100 — the
+    share of feed salinity that leaks through the whole RO train. Returns one row
+    per (plant, month) that carries BOTH readings, with the plant's zone joined in
+    (via plant_sr_no -> latest MIS row, mirroring compute_fleet_status), sorted by
+    passage descending.
+    """
+    columns = [
+        "plant_group", "plant", "plant_sr_no", "zone",
+        "report_date", "feed", "permeate", "passage_pct",
+    ]
+    if parameters is None or parameters.empty:
+        return pd.DataFrame(columns=columns)
+
+    cond = parameters[parameters["kind"] == "conductivity"].copy()
+    if cond.empty:
+        return pd.DataFrame(columns=columns)
+
+    tag = cond["tag"].astype(str)
+    cond["role"] = pd.NA
+    cond.loc[tag.str.contains(rf"\b{FEED_COND_TAG}\b"), "role"] = "feed"
+    cond.loc[tag.str.contains(rf"\b{PERMEATE_COND_TAG}\b"), "role"] = "permeate"
+    cond = cond.dropna(subset=["role"])
+    if cond.empty:
+        return pd.DataFrame(columns=columns)
+
+    # One value per (plant, month, role); last write wins on any duplicate.
+    cond = cond.drop_duplicates(["plant", "report_date", "role"], keep="last")
+    wide = cond.pivot_table(
+        index=["plant_group", "plant", "report_date"],
+        columns="role", values="value", aggfunc="last",
+    ).reset_index()
+    if "feed" not in wide.columns or "permeate" not in wide.columns:
+        return pd.DataFrame(columns=columns)
+    wide = wide.dropna(subset=["feed", "permeate"])
+    wide = wide[wide["feed"] > 0]
+    if wide.empty:
+        return pd.DataFrame(columns=columns)
+    wide["passage_pct"] = wide["permeate"] / wide["feed"] * 100.0
+
+    zone_by_sr = build_zone_by_sr(mis)
+    wide["plant_sr_no"] = wide["plant"].map(plant_sr_no_from_name)
+    wide["zone"] = wide["plant_sr_no"].map(lambda sr: zone_by_sr.get(sr) or "Unknown")
+
+    return (
+        wide.reindex(columns=columns)
+        .sort_values("passage_pct", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+def compute_permeate_flow(parameters: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFrame:
+    """Per-plant per-month permeate (product) flow from the FIS 180 tag, in m3/hr.
+
+    Permeate flow is logged once per plant sheet as FIS 180, in either m3/hr or
+    litres/hr; litres/hr is converted to m3/hr so every plant ranks on one scale.
+    Returns one row per (plant, month) with the month-over-month change vs the
+    plant's OWN prior reading (`fall_m3hr` positive = a drop), zone joined in.
+    """
+    columns = [
+        "plant_group", "plant", "plant_sr_no", "zone", "report_date",
+        "flow_m3hr", "prev_flow_m3hr", "fall_m3hr", "change_pct",
+    ]
+    if parameters is None or parameters.empty:
+        return pd.DataFrame(columns=columns)
+
+    flow = parameters[parameters["kind"] == "flow"].copy()
+    if flow.empty:
+        return pd.DataFrame(columns=columns)
+    flow = flow[flow["tag"].astype(str).str.contains(rf"\b{PERMEATE_FLOW_TAG}\b")]
+    if flow.empty:
+        return pd.DataFrame(columns=columns)
+
+    # Normalize litres/hr -> m3/hr (m3/hr passes through unchanged).
+    unit = flow["unit"].astype(str)
+    factor = pd.Series(1.0, index=flow.index)
+    factor[unit.str.contains("lit")] = PERMEATE_FLOW_M3HR_PER_LPH
+    flow["flow_m3hr"] = pd.to_numeric(flow["value"], errors="coerce") * factor
+    flow = flow.dropna(subset=["flow_m3hr"])
+    flow = flow[flow["flow_m3hr"] > 0]
+    if flow.empty:
+        return pd.DataFrame(columns=columns)
+
+    # One value per (plant, month); last write wins, then a per-plant time series.
+    flow = flow.drop_duplicates(["plant", "report_date"], keep="last")
+    flow = flow.sort_values(["plant", "report_date"])
+    prev = flow.groupby("plant")["flow_m3hr"].shift()
+    flow["prev_flow_m3hr"] = prev
+    flow["fall_m3hr"] = prev - flow["flow_m3hr"]
+    flow["change_pct"] = (flow["flow_m3hr"] / prev - 1.0) * 100.0
+
+    zone_by_sr = build_zone_by_sr(mis)
+    flow["plant_sr_no"] = flow["plant"].map(plant_sr_no_from_name)
+    flow["zone"] = flow["plant_sr_no"].map(lambda sr: zone_by_sr.get(sr) or "Unknown")
+
+    return flow.reindex(columns=columns).reset_index(drop=True)
+
+
+def compute_permeate_conductivity(parameters: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFrame:
+    """Per-plant per-month permeate conductivity (CIS 180) with its MoM rise.
+
+    Permeate (product) conductivity is logged once per plant sheet as CIS 180.
+    Returns one row per (plant, month) with the month-over-month change vs the
+    plant's OWN prior reading (`rise` positive = product water got saltier — a
+    plant-wide membrane / feed signal), zone joined in.
+    """
+    columns = [
+        "plant_group", "plant", "plant_sr_no", "zone", "report_date",
+        "permeate", "prev_permeate", "rise", "change_pct",
+    ]
+    if parameters is None or parameters.empty:
+        return pd.DataFrame(columns=columns)
+
+    cond = parameters[parameters["kind"] == "conductivity"].copy()
+    if cond.empty:
+        return pd.DataFrame(columns=columns)
+    cond = cond[cond["tag"].astype(str).str.contains(rf"\b{PERMEATE_COND_TAG}\b")]
+    if cond.empty:
+        return pd.DataFrame(columns=columns)
+
+    cond["permeate"] = pd.to_numeric(cond["value"], errors="coerce")
+    cond = cond.dropna(subset=["permeate"])
+    cond = cond[cond["permeate"] > 0]
+    if cond.empty:
+        return pd.DataFrame(columns=columns)
+
+    # One value per (plant, month); last write wins, then a per-plant time series.
+    cond = cond.drop_duplicates(["plant", "report_date"], keep="last")
+    cond = cond.sort_values(["plant", "report_date"])
+    prev = cond.groupby("plant")["permeate"].shift()
+    cond["prev_permeate"] = prev
+    cond["rise"] = cond["permeate"] - prev
+    cond["change_pct"] = (cond["permeate"] / prev - 1.0) * 100.0
+
+    zone_by_sr = build_zone_by_sr(mis)
+    cond["plant_sr_no"] = cond["plant"].map(plant_sr_no_from_name)
+    cond["zone"] = cond["plant_sr_no"].map(lambda sr: zone_by_sr.get(sr) or "Unknown")
+
+    return cond.reindex(columns=columns).reset_index(drop=True)
 
 
 def build_plant_ranking(snapshot: pd.DataFrame, latest: pd.Timestamp) -> pd.DataFrame:
@@ -2384,7 +2585,7 @@ def render_plant_flagged_modules(
     )
 
 
-def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
+def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFrame) -> None:
     st.title("Fleet Portfolio")
     st.caption(
         "Fleet-wide membrane health across every plant — no plant selection needed. "
@@ -2428,6 +2629,21 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
     need = int(snapshot["need"].sum())
     need_pct = need / total_modules * 100 if total_modules else 0.0
 
+    # Last month's demand (modules to replace) for the same zones, and the delta.
+    # The previous month is the next entry in `months` (sorted newest-first).
+    picked_index = month_labels.index(picked)
+    prev_month = months[picked_index + 1] if picked_index + 1 < len(months) else None
+    if prev_month is not None:
+        prev_need = int(
+            status_zoned.loc[status_zoned["report_date"] == prev_month, "need"].sum()
+        )
+        prev_month_text = pd.Timestamp(prev_month).strftime("%b %Y")
+        demand_delta = need - prev_need
+    else:
+        prev_need = None
+        prev_month_text = "—"
+        demand_delta = None
+
     # ----- 1. Headline KPI: modules to replace -----
     hero_card(
         "Modules to Replace",
@@ -2438,7 +2654,7 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
 
     # ----- 2. Supporting KPI cards -----
     st.markdown("")
-    kpis = st.columns(4)
+    kpis = st.columns(6)
     with kpis[0]:
         metric_card("Plants", f"{total_plants:,}", "in fleet")
     with kpis[1]:
@@ -2447,10 +2663,45 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
         metric_card("Degraded", f"{degraded:,}", "active, IQR or MoM jump", "#d97706")
     with kpis[3]:
         metric_card("Bypassed", f"{bypassed:,}", "offline modules", "#dc2626")
+    with kpis[4]:
+        metric_card(
+            "Last Month Demand",
+            f"{prev_need:,}" if prev_need is not None else "—",
+            f"modules to replace · {prev_month_text}",
+        )
+    with kpis[5]:
+        if demand_delta is None:
+            metric_card("Δ vs Last Month", "—", "no prior month")
+        else:
+            # More modules to replace than last month is bad (red); fewer is good (green).
+            delta_color = (
+                "#dc2626" if demand_delta > 0 else "#16a34a" if demand_delta < 0 else "#0f172a"
+            )
+            metric_card(
+                "Δ vs Last Month",
+                f"{demand_delta:+,}",
+                f"vs {prev_need:,} in {prev_month_text}",
+                delta_color,
+            )
+
+    # ----- Jump navigation: clickable cards that scroll to each section -----
+    st.markdown("")
+    jump_nav(
+        [
+            ("Plant ranking", "plant-ranking", "per-plant attention"),
+            ("Worst 50 modules", "worst-modules", "highest conductivity"),
+            ("Conductivity rises", "cond-rises", "module MoM"),
+            ("Flow drops", "flow-drops", "module MoM"),
+            ("Salt passage", "salt-passage", "sites > 10%"),
+            ("Permeate cond. rises", "permeate-cond-rises", "site MoM"),
+            ("Permeate flow drops", "permeate-flow-drops", "site MoM"),
+            ("Age profile", "age-profile", "install years"),
+        ]
+    )
 
     # ----- 2. Plant ranking (centerpiece) -----
     st.markdown("---")
-    st.subheader("Plant ranking")
+    st.subheader("Plant ranking", anchor="plant-ranking")
     st.caption(
         "One row per plant, sorted by modules needing attention. Click a column header "
         "to re-sort, or select a row to see that plant's flagged modules below."
@@ -2489,7 +2740,7 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
         st.subheader("By zone")
         st.plotly_chart(make_zone_rollup_chart(snapshot), width="stretch")
     with right:
-        st.subheader(f"Worst 50 modules — {month_text}")
+        st.subheader(f"Worst 50 modules — {month_text}", anchor="worst-modules")
         active_snap = snapshot[snapshot["status"] == "active"].dropna(subset=["conductivity"])
         worst = active_snap.sort_values("conductivity", ascending=False).head(50)
         worst_table = pd.DataFrame(
@@ -2505,9 +2756,9 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
         )
         st.dataframe(worst_table, width="stretch", hide_index=True, height=600)
 
-    # ----- 5b. Biggest month-over-month conductivity jumps -----
+    # ----- 5b. Biggest month-over-month conductivity rises -----
     st.markdown("---")
-    st.subheader(f"Top 50 month-over-month jumps — {month_text}")
+    st.subheader(f"Top 50 conductivity rises — {month_text}", anchor="cond-rises")
     st.caption(
         "Active modules whose conductivity rose the most versus their own prior "
         "reading. A jump shared across a whole plant/stage usually points to a feed "
@@ -2534,20 +2785,211 @@ def render_portfolio_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
         )
         st.dataframe(jump_table, width="stretch", hide_index=True, height=600)
         st.download_button(
-            "Download month-over-month jumps (CSV)",
+            "Download conductivity rises (CSV)",
             jump_table.to_csv(index=False).encode("utf-8"),
-            file_name=f"mom_jumps_{month_text.replace(' ', '_')}.csv",
+            file_name=f"mom_cond_rises_{month_text.replace(' ', '_')}.csv",
             mime="text/csv",
         )
 
-    # ----- 6. Membrane age profile -----
+    # ----- 5c. Biggest month-over-month flow drops -----
     st.markdown("---")
-    st.subheader("Membrane age profile")
+    st.subheader(f"Top 50 flow drops — {month_text}", anchor="flow-drops")
+    st.caption(
+        "Active modules whose flow fell the most versus their own prior reading. "
+        "A falling permeate flow is a classic fouling / membrane-loss signal."
+    )
+    drops = active_snap.dropna(subset=["flow", "prev_flow"]).copy()
+    drops["delta"] = drops["prev_flow"] - drops["flow"]
+    drops = drops[drops["delta"] > 0].sort_values("delta", ascending=False).head(50)
+    if drops.empty:
+        st.info("No month-over-month flow drops to show (no prior-month readings yet).")
+    else:
+        drop_table = pd.DataFrame(
+            {
+                "Plant": drops["plant"],
+                "Stage": drops["stage_label"],
+                "Module": drops["module_label"],
+                "Prev (L/hr)": drops["prev_flow"].map(lambda v: f"{v:,.0f}"),
+                "Now (L/hr)": drops["flow"].map(lambda v: f"{v:,.0f}"),
+                "Change (L/hr)": drops["delta"].map(lambda v: f"-{v:,.0f}"),
+                "Change (%)": (drops["flow"] / drops["prev_flow"] - 1.0).map(
+                    lambda v: f"{v * 100:,.0f}%"
+                ),
+            }
+        )
+        st.dataframe(drop_table, width="stretch", hide_index=True, height=600)
+        st.download_button(
+            "Download flow drops (CSV)",
+            drop_table.to_csv(index=False).encode("utf-8"),
+            file_name=f"mom_flow_drops_{month_text.replace(' ', '_')}.csv",
+            mime="text/csv",
+        )
+
+    # ----- 5d. Highest conductivity salt passage (feed vs permeate) -----
+    st.markdown("---")
+    st.subheader(
+        f"Top 10 sites — salt passage > {SALT_PASSAGE_FLAG_PCT:.0f}% — {month_text}",
+        anchor="salt-passage",
+    )
+    st.caption(
+        "Conductivity salt passage = permeate conductivity (CIS 180) ÷ feed "
+        "conductivity (CIS 151) × 100 — the share of feed salinity leaking through "
+        "the whole RO train. A healthy train passes only a few percent; a high "
+        "figure means the membranes are letting salts through plant-wide."
+    )
+    passage = compute_salt_passage(params, mis)
+    passage = passage[passage["zone"].isin(active_zones)]
+    passage = passage[passage["report_date"] == selected]
+    passage = passage[passage["passage_pct"] > SALT_PASSAGE_FLAG_PCT]
+    passage = passage.sort_values("passage_pct", ascending=False).head(10)
+    if passage.empty:
+        st.info(
+            f"No site exceeds {SALT_PASSAGE_FLAG_PCT:.0f}% salt passage this month "
+            "(or feed/permeate conductivity wasn't recorded in these workbooks)."
+        )
+    else:
+        passage_table = pd.DataFrame(
+            {
+                "Plant": passage["plant"],
+                "Zone": passage["zone"],
+                "Feed (uS/cm)": passage["feed"].map(lambda v: f"{v:,.0f}"),
+                "Permeate (uS/cm)": passage["permeate"].map(lambda v: f"{v:,.0f}"),
+                "Salt passage": passage["passage_pct"].map(lambda v: f"{v:.1f}%"),
+            }
+        )
+        st.dataframe(passage_table, width="stretch", hide_index=True)
+        st.download_button(
+            "Download salt passage (CSV)",
+            passage_table.to_csv(index=False).encode("utf-8"),
+            file_name=f"salt_passage_{month_text.replace(' ', '_')}.csv",
+            mime="text/csv",
+        )
+
+    # ----- 5e. Highest month-over-month rise in permeate conductivity -----
+    st.markdown("---")
+    st.subheader(
+        f"Top 10 sites — permeate conductivity rise — {month_text}",
+        anchor="permeate-cond-rises",
+    )
+    st.caption(
+        "Whole-plant permeate (product) conductivity from CIS 180, versus the "
+        "plant's own prior month. A site-wide rise means the product water got "
+        "saltier across the train — a feed, cleaning, or membrane-integrity signal."
+    )
+    perm_rise = compute_permeate_conductivity(params, mis)
+    perm_rise = perm_rise[perm_rise["zone"].isin(active_zones)]
+    perm_rise = perm_rise[perm_rise["report_date"] == selected]
+    perm_rise = perm_rise.dropna(subset=["prev_permeate"])
+    perm_rise = perm_rise[perm_rise["rise"] > 0]
+    perm_rise = perm_rise.sort_values("rise", ascending=False).head(10)
+    if perm_rise.empty:
+        st.info(
+            "No site shows a permeate-conductivity rise this month "
+            "(or CIS 180 wasn't recorded with a prior month to compare)."
+        )
+    else:
+        perm_table = pd.DataFrame(
+            {
+                "Plant": perm_rise["plant"],
+                "Zone": perm_rise["zone"],
+                "Prev (uS/cm)": perm_rise["prev_permeate"].map(lambda v: f"{v:,.0f}"),
+                "Now (uS/cm)": perm_rise["permeate"].map(lambda v: f"{v:,.0f}"),
+                "Rise (uS/cm)": perm_rise["rise"].map(lambda v: f"+{v:,.0f}"),
+                "Change": perm_rise["change_pct"].map(lambda v: f"{v:,.0f}%"),
+            }
+        )
+        st.dataframe(perm_table, width="stretch", hide_index=True)
+        st.download_button(
+            "Download permeate conductivity rises (CSV)",
+            perm_table.to_csv(index=False).encode("utf-8"),
+            file_name=f"permeate_cond_rises_{month_text.replace(' ', '_')}.csv",
+            mime="text/csv",
+        )
+
+    # ----- 5f. Biggest fall in permeate flow (month over month) -----
+    st.markdown("---")
+    st.subheader(
+        f"Top 10 sites — biggest permeate-flow drop — {month_text}",
+        anchor="permeate-flow-drops",
+    )
+    st.caption(
+        "Whole-plant permeate (product) flow from FIS 180, normalized to m3/hr, "
+        "versus the plant's own prior month. A sustained fall in permeate flow is "
+        "a classic fouling / membrane-loss signal."
+    )
+    flow_mom = compute_permeate_flow(params, mis)
+    flow_mom = flow_mom[flow_mom["zone"].isin(active_zones)]
+    flow_mom = flow_mom[flow_mom["report_date"] == selected]
+    flow_mom = flow_mom.dropna(subset=["prev_flow_m3hr"])
+    flow_mom = flow_mom[flow_mom["fall_m3hr"] > 0]
+    flow_mom = flow_mom.sort_values("fall_m3hr", ascending=False).head(10)
+    if flow_mom.empty:
+        st.info(
+            "No site shows a permeate-flow drop this month "
+            "(or FIS 180 flow wasn't recorded with a prior month to compare)."
+        )
+    else:
+        flow_table = pd.DataFrame(
+            {
+                "Plant": flow_mom["plant"],
+                "Zone": flow_mom["zone"],
+                "Prev (m3/hr)": flow_mom["prev_flow_m3hr"].map(lambda v: f"{v:,.2f}"),
+                "Now (m3/hr)": flow_mom["flow_m3hr"].map(lambda v: f"{v:,.2f}"),
+                "Fall (m3/hr)": flow_mom["fall_m3hr"].map(lambda v: f"-{v:,.2f}"),
+                "Change": flow_mom["change_pct"].map(lambda v: f"{v:,.1f}%"),
+            }
+        )
+        st.dataframe(flow_table, width="stretch", hide_index=True)
+        st.download_button(
+            "Download permeate-flow drops (CSV)",
+            flow_table.to_csv(index=False).encode("utf-8"),
+            file_name=f"permeate_flow_drops_{month_text.replace(' ', '_')}.csv",
+            mime="text/csv",
+        )
+
+    # ----- 6. Membrane age profile (click a bar to list its modules) -----
+    st.markdown("---")
+    st.subheader("Membrane age profile", anchor="age-profile")
     age_chart = make_age_profile_chart(snapshot, selected)
     if age_chart is None:
         st.info("No install dates available to build the age profile.")
     else:
-        st.plotly_chart(age_chart, width="stretch")
+        st.caption("Click a bar to list the modules installed that year.")
+        age_event = st.plotly_chart(
+            age_chart,
+            width="stretch",
+            on_select="rerun",
+            selection_mode="points",
+            key="portfolio_age_profile",
+        )
+        picked_points = age_event.selection.get("points", []) if age_event else []
+        picked_years = {str(p.get("x")) for p in picked_points if p.get("x") is not None}
+        if picked_years:
+            install_year = pd.to_datetime(
+                snapshot["install_date"], errors="coerce"
+            ).dt.year
+            cohort = snapshot[install_year.astype("Int64").astype(str).isin(picked_years)]
+            year_text = ", ".join(sorted(picked_years))
+            st.markdown(f"**Modules installed in {year_text}** — {len(cohort):,} fitted")
+            cohort_table = pd.DataFrame(
+                {
+                    "Plant": cohort["plant"],
+                    "Zone": cohort["zone"],
+                    "Stage": cohort["stage_label"],
+                    "Module": cohort["module_label"],
+                    "Install Date": pd.to_datetime(
+                        cohort["install_date"], errors="coerce"
+                    ).dt.strftime("%d %b %Y"),
+                    "Status": cohort["status"],
+                }
+            ).sort_values(["Plant", "Stage", "Module"])
+            st.dataframe(cohort_table, width="stretch", hide_index=True, height=360)
+            st.download_button(
+                "Download these modules (CSV)",
+                cohort_table.to_csv(index=False).encode("utf-8"),
+                file_name=f"modules_installed_{year_text.replace(', ', '_')}.csv",
+                mime="text/csv",
+            )
 
 
 def render_dashboard(df: pd.DataFrame, params: pd.DataFrame) -> None:
@@ -2783,6 +3225,38 @@ def main() -> None:
             font-size: 1rem;
             margin-top: 0.35rem;
         }
+        .nav-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 6px 0 2px;
+        }
+        .nav-card {
+            flex: 1 1 150px;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            background: #f8fafc;
+            padding: 10px 14px;
+            text-decoration: none;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            transition: background .12s ease, border-color .12s ease, box-shadow .12s ease;
+        }
+        .nav-card:hover {
+            background: #eff6ff;
+            border-color: #bfdbfe;
+            box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+        }
+        .nav-card .nav-label {
+            color: #0f172a;
+            font-weight: 700;
+            font-size: 0.9rem;
+        }
+        .nav-card .nav-sub {
+            color: #64748b;
+            font-size: 0.78rem;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -2837,7 +3311,7 @@ def main() -> None:
     pages = st.navigation(
         [
             st.Page(
-                lambda: render_portfolio_page(df, mis),
+                lambda: render_portfolio_page(df, params, mis),
                 title="Portfolio",
                 icon="🌐",
                 url_path="portfolio",
