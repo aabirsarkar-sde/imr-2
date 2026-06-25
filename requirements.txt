@@ -5,3 +5,6 @@ openpyxl
 numpy
 sqlalchemy
 psycopg2-binary
+google-genai
+groq
+pymupdf

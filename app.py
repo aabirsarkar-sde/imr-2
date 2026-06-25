@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import calendar
 import hashlib
+import io
+import json
 import os
 import re
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -201,6 +204,101 @@ def parse_report_metadata(path: Path) -> ReportMeta:
     )
 
 
+# A hardened per-plant report carries its own identity in a COVER block at the top
+# of each sheet, so plant id / date / zone come from the sheet itself instead of
+# the filename + MIS join. The label text (normalized) maps to a field; the value
+# is the first non-empty cell to its right. Old master workbooks have no COVER, so
+# read_cover_block() returns {} for them and every caller falls back to the
+# filename-derived metadata + sheet-name id — i.e. unchanged behavior.
+COVER_LABELS = {
+    "plant_sr_no": "plant sr no",
+    "report_date": "report date",
+    "zone": "zone",
+    "site_name": "site name",
+    "plant_name": "plant name",
+    "plant_capacity": "plant capacity",
+}
+
+
+def _value_right(raw: pd.DataFrame, row: int, col: int, span: int = 8) -> object:
+    """First non-empty cell to the right of (row, col), within `span` columns.
+    Skips the blanks that merged label/value cells leave behind."""
+    last = min(col + 1 + span, raw.shape[1])
+    for c in range(col + 1, last):
+        value = raw.iat[row, c]
+        if not pd.isna(value) and str(value).strip() != "":
+            return value
+    return None
+
+
+def read_cover_block(raw: pd.DataFrame) -> dict[str, object]:
+    """Read a sheet's COVER identity block, if present. Returns {} when none of the
+    labels are found (old-format sheets), so callers can fall back cleanly."""
+    raw_hits: dict[str, object] = {}
+    max_row = min(len(raw), 14)
+    max_col = min(raw.shape[1], 12)
+    for r in range(max_row):
+        for c in range(max_col):
+            label = normalize_text(raw.iat[r, c])
+            if not label:
+                continue
+            for field, key in COVER_LABELS.items():
+                if field not in raw_hits and key in label:
+                    value = _value_right(raw, r, c)
+                    if value is not None:
+                        raw_hits[field] = value
+
+    cover: dict[str, object] = {}
+    if "plant_sr_no" in raw_hits:
+        sr = pd.to_numeric(raw_hits["plant_sr_no"], errors="coerce")
+        if pd.notna(sr):
+            cover["plant_sr_no"] = int(sr)
+    if "report_date" in raw_hits:
+        value = raw_hits["report_date"]
+        try:
+            # Real Excel dates arrive as datetime — unambiguous, no warning.
+            date = pd.Timestamp(value)
+        except (ValueError, TypeError):
+            # Free-typed text: assume dd-mm (the Indian convention on these forms).
+            date = pd.to_datetime(str(value), errors="coerce", dayfirst=True)
+        if pd.notna(date):
+            cover["report_date"] = date
+    for field in ("zone", "site_name", "plant_name", "plant_capacity"):
+        if field in raw_hits:
+            text = str(raw_hits[field]).strip()
+            if text:
+                cover[field] = text
+    return cover
+
+
+def sheet_context(
+    raw: pd.DataFrame, sheet_name: str, metadata: ReportMeta
+) -> tuple[str, int | None, ReportMeta, dict[str, object]]:
+    """Resolve a sheet's plant id, sr-no and effective metadata, preferring the
+    COVER block and falling back to the sheet name + filename metadata."""
+    cover = read_cover_block(raw)
+    # A real COVER block is marked by an identity/date cell (sr-no, zone or date).
+    # Only then do we take the plant's display name from the sheet's name cell
+    # (site_name); old-format sheets fall back to the tab name, even if they
+    # happen to carry a stray "SITE NAME" label.
+    has_cover = bool(
+        cover.get("plant_sr_no") or cover.get("zone") or cover.get("report_date")
+    )
+    identity = cover.get("plant_name") or cover.get("site_name")
+    plant = str(identity) if (has_cover and identity) else clean_sheet_name(sheet_name)
+    sr_value = cover.get("plant_sr_no")
+    plant_sr_no = int(sr_value) if sr_value is not None else plant_sr_no_from_name(sheet_name)
+    report_date = cover.get("report_date") or metadata.report_date
+    zone = cover.get("zone")
+    plant_group = canonicalize_plant_group(str(zone)) if zone else metadata.plant_group
+    effective = ReportMeta(
+        plant_group=plant_group,
+        report_date=report_date,
+        date_from_filename=metadata.date_from_filename if not cover.get("report_date") else True,
+    )
+    return plant, plant_sr_no, effective, cover
+
+
 def report_paths(root: Path) -> list[Path]:
     source_roots = [root, root / UPLOAD_DIR_NAME]
     paths: list[Path] = []
@@ -352,6 +450,8 @@ def extract_rows_from_sheet(
     report_path: Path,
     sheet_name: str,
     metadata: ReportMeta,
+    plant_override: str | None = None,
+    plant_sr_no_override: int | None = None,
 ) -> list[dict[str, object]]:
     header_row = find_header_row(raw)
     if header_row is None:
@@ -362,8 +462,12 @@ def extract_rows_from_sheet(
         return []
 
     records: list[dict[str, object]] = []
-    plant = clean_sheet_name(sheet_name)
-    plant_sr_no = plant_sr_no_from_name(sheet_name)
+    plant = plant_override or clean_sheet_name(sheet_name)
+    plant_sr_no = (
+        plant_sr_no_override
+        if plant_sr_no_override is not None
+        else plant_sr_no_from_name(sheet_name)
+    )
 
     for row_index in range(header_row + 1, len(raw)):
         for block in blocks:
@@ -537,11 +641,14 @@ def read_report(path: Path) -> list[dict[str, object]]:
         if clean_sheet_name(sheet_name).lower() == "mis":
             continue
         raw = pd.read_excel(path, sheet_name=sheet_name, header=None)
+        plant, plant_sr_no, eff_meta, _cover = sheet_context(raw, sheet_name, metadata)
         sheet_records = extract_rows_from_sheet(
             raw,
             report_path=path,
             sheet_name=sheet_name,
-            metadata=metadata,
+            metadata=eff_meta,
+            plant_override=plant,
+            plant_sr_no_override=plant_sr_no,
         )
         if not sheet_records:
             structured = pd.read_excel(path, sheet_name=sheet_name)
@@ -549,7 +656,7 @@ def read_report(path: Path) -> list[dict[str, object]]:
                 structured,
                 report_path=path,
                 sheet_name=sheet_name,
-                metadata=metadata,
+                metadata=eff_meta,
             )
         records.extend(sheet_records)
 
@@ -562,6 +669,7 @@ def extract_operating_parameters(
     report_path: Path,
     sheet_name: str,
     metadata: ReportMeta,
+    plant_override: str | None = None,
 ) -> list[dict[str, object]]:
     """Scan a raw sheet for (tag, value, unit) instrument readings.
 
@@ -571,7 +679,7 @@ def extract_operating_parameters(
     left, so a single scan keyed on the unit cell handles both. The last
     occurrence of a tag wins.
     """
-    plant = clean_sheet_name(sheet_name)
+    plant = plant_override or clean_sheet_name(sheet_name)
     found: dict[str, dict[str, object]] = {}
     rows, cols = raw.shape
 
@@ -621,12 +729,14 @@ def read_report_parameters(path: Path) -> list[dict[str, object]]:
         if clean_sheet_name(sheet_name).lower() == "mis":
             continue
         raw = pd.read_excel(path, sheet_name=sheet_name, header=None)
+        plant, _sr, eff_meta, _cover = sheet_context(raw, sheet_name, metadata)
         records.extend(
             extract_operating_parameters(
                 raw,
+                plant_override=plant,
                 report_path=path,
                 sheet_name=sheet_name,
-                metadata=metadata,
+                metadata=eff_meta,
             )
         )
     return records
@@ -730,10 +840,30 @@ def read_report_mis(path: Path) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     workbook = pd.ExcelFile(path)
     for sheet_name in workbook.sheet_names:
-        if clean_sheet_name(sheet_name).lower() != "mis":
-            continue
         raw = pd.read_excel(path, sheet_name=sheet_name, header=None)
-        records.extend(extract_mis_rows(raw, report_path=path, metadata=metadata))
+        if clean_sheet_name(sheet_name).lower() == "mis":
+            records.extend(extract_mis_rows(raw, report_path=path, metadata=metadata))
+            continue
+        # Per-plant template: no MIS sheet, but each sheet's COVER block carries
+        # its zone/site/sr-no. Synthesize an MIS row so zone resolution (which
+        # joins readings.plant_sr_no -> mis.zone) works without a register sheet.
+        cover = read_cover_block(raw)
+        sr_value = cover.get("plant_sr_no")
+        zone = cover.get("zone")
+        if sr_value is not None and zone:
+            records.append(
+                {
+                    "source_file": path.name,
+                    "report_date": cover.get("report_date") or metadata.report_date,
+                    "zone": str(zone),
+                    "zm_name": None,
+                    "plant_sr_no": int(sr_value),
+                    "site_name": cover.get("site_name"),
+                    "status": None,
+                    "membrane_required": None,
+                    "remarks": None,
+                }
+            )
     return records
 
 
@@ -3161,6 +3291,663 @@ def render_data_manager(engine: Engine) -> None:
             rerun_app()
 
 
+# --------------------------------------------------------------------------- #
+# Scan IMR: handwritten printout photo -> Gemini Vision -> filled template.
+# Zero-cost path: a free Google AI Studio key + gemini-2.5-flash. The rate limit
+# (~a handful per minute) is fine for one-IMR-at-a-time entry.
+# --------------------------------------------------------------------------- #
+SCAN_ZONES = ["Ahmedabad", "Vadodara", "Ankleshwar", "Panoli", "Jhagadia", "Dahej", "Vapi"]
+SCAN_MODEL = "gemini-2.5-flash"
+TEMPLATE_PATH = APP_DIR / "templates" / "IMR_template.xlsx"
+
+# Where each value lands in templates/IMR_template.xlsx (verified cell map).
+SCAN_STAGE_BLOCKS = {  # leading roman numeral -> (mo, inst, flow, cond) columns
+    "I": (1, 2, 5, 6),       # A B E F
+    "II": (8, 9, 12, 13),    # H I L M
+    "III": (15, 16, 19, 20), # O P S T
+}
+SCAN_DATA_TOP, SCAN_DATA_BOTTOM = 10, 32
+
+EXTRACTION_PROMPT = """You are reading a handwritten "Individual Module Report (IMR)" for a
+reverse-osmosis plant. Return ONLY JSON matching exactly this shape:
+
+{
+  "plant_sr_no": <integer or null>,
+  "report_date": "<YYYY-MM-DD or null>",
+  "zone": "<one of: Ahmedabad, Vadodara, Ankleshwar, Panoli, Jhagadia, Dahej, Vapi, or null>",
+  "site_name": "<string or null>",
+  "plant_capacity": "<string or null>",
+  "stages": [
+    {"stage_label": "<e.g. I STAGE, II STAGE, III STAGE>",
+     "modules": [
+       {"mo_no": <int>, "inst_date": "<YYYY-MM-DD or null>",
+        "flow": <number or null>, "cond": <number or null>,
+        "remark": "<string or null, e.g. BY PASS>"}
+     ]}
+  ],
+  "parameters": [ {"tag": "<e.g. CIS - 151 -, FIS - 180 -, PI - 1601 ->", "value": <number>} ]
+}
+
+Rules:
+- Transcribe digits exactly as written; do not invent or 'correct' values.
+- If a cell is blank or unreadable, use null (do not guess).
+- 'flow' is the Total flow (liter/hr) column; 'cond' is the Cond. us/cm column.
+- Keep stage labels and parameter tags verbatim as printed on the form.
+Return only the JSON object, no prose."""
+
+
+def _secret_key(env_var: str, section: str) -> str | None:
+    key = os.environ.get(env_var)
+    if not key:
+        try:
+            key = st.secrets[section]["api_key"]
+        except Exception:  # noqa: BLE001 - secrets file / section may be absent
+            key = None
+    return key or None
+
+
+def get_gemini_key() -> str | None:
+    return _secret_key("GEMINI_API_KEY", "gemini")
+
+
+def get_groq_key() -> str | None:
+    return _secret_key("GROQ_API_KEY", "groq")
+
+
+class GeminiRateLimited(Exception):
+    """Free-tier quota / rate limit hit (429) — retrying soon won't help."""
+
+
+class GeminiUnavailable(Exception):
+    """Model is transiently overloaded (503/500/UNAVAILABLE) after retries."""
+
+
+# When the primary model is overloaded, fall back to a second model alias whose
+# pool is usually separate. Same family, still free.
+SCAN_FALLBACK_MODEL = "gemini-flash-latest"
+
+
+def _coerce_extracted(obj: object) -> dict:
+    """Models sometimes wrap the JSON object in an array (e.g. `[{...}]`) despite
+    the prompt. Normalize any list to the first dict element so callers always get
+    the single object they expect."""
+    if isinstance(obj, dict):
+        return obj
+    if isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, dict):
+                return item
+    return {}
+
+
+def extract_imr_from_images(
+    images: list[tuple[bytes, str]], model: str, api_key: str
+) -> dict:
+    """Send one or more form photos/PDFs to Gemini and return the parsed JSON dict.
+
+    Resilient to the transient overloads (503 UNAVAILABLE) Gemini throws under load:
+    retries the primary model with backoff, then tries a fallback model. Raises
+    GeminiRateLimited on a 429 (wait for quota) and GeminiUnavailable if every
+    attempt is overloaded."""
+    from google import genai  # lazy: only needed on this page
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key)
+    parts: list[object] = [
+        types.Part.from_bytes(data=data, mime_type=mime) for data, mime in images
+    ]
+    parts.append(EXTRACTION_PROMPT)
+    config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
+
+    # (model, seconds-to-wait-before-this-attempt): try primary, retry primary
+    # after a pause, then fall back to a second model.
+    attempts = [(model, 0.0), (model, 2.0), (SCAN_FALLBACK_MODEL, 3.0)]
+    last_error: Exception | None = None
+    for mdl, wait in attempts:
+        if wait:
+            time.sleep(wait)
+        try:
+            response = client.models.generate_content(model=mdl, contents=parts, config=config)
+            return _coerce_extracted(json.loads(response.text or "{}"))
+        except Exception as exc:  # noqa: BLE001
+            text = str(exc).lower()
+            if "429" in text or "resource_exhausted" in text or "quota" in text:
+                raise GeminiRateLimited(str(exc)) from exc
+            if any(s in text for s in ("503", "500", "unavailable", "overload", "internal")):
+                last_error = exc
+                continue  # transient — try again / fall back
+            raise  # a real error (bad request, auth, etc.) — surface it
+    raise GeminiUnavailable(str(last_error) if last_error else "Gemini unavailable")
+
+
+# Groq backup: separate infrastructure, so it survives a Gemini overload. Llama 4
+# Scout is multimodal; its vision input is IMAGES ONLY, so PDFs are rasterized to
+# page images first. A notch below Gemini on handwriting — fine for a backup.
+GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+
+def _to_images(files: list[tuple[bytes, str]]) -> list[tuple[bytes, str]]:
+    """Expand any PDFs into per-page PNG images; pass real images through. Used
+    for providers (Groq) whose vision input does not accept PDF directly."""
+    out: list[tuple[bytes, str]] = []
+    for data, mime in files:
+        if "pdf" in (mime or "").lower():
+            import fitz  # PyMuPDF, lazy
+
+            doc = fitz.open(stream=data, filetype="pdf")
+            try:
+                for page in doc:
+                    pix = page.get_pixmap(dpi=150)
+                    out.append((pix.tobytes("png"), "image/png"))
+            finally:
+                doc.close()
+        else:
+            out.append((data, mime or "image/jpeg"))
+    return out
+
+
+def extract_imr_via_groq(files: list[tuple[bytes, str]], api_key: str) -> dict:
+    """Backup extractor: Groq Llama 4 Scout vision -> parsed JSON dict."""
+    import base64
+
+    from groq import Groq  # lazy: only needed on fallback
+
+    images = _to_images(files)
+    content: list[dict] = [{"type": "text", "text": EXTRACTION_PROMPT}]
+    for data, mime in images:
+        b64 = base64.b64encode(data).decode("ascii")
+        content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": content}],
+        response_format={"type": "json_object"},
+        temperature=0,
+    )
+    return _coerce_extracted(json.loads(response.choices[0].message.content or "{}"))
+
+
+class ExtractionFailed(Exception):
+    """Every configured provider failed; message lists what happened."""
+
+
+def extract_imr(
+    files: list[tuple[bytes, str]], gemini_key: str | None, groq_key: str | None
+) -> tuple[dict, str]:
+    """Extract with Gemini (primary); fall back to Groq on any Gemini failure.
+    Returns (data, provider_label). Raises ExtractionFailed if all providers fail."""
+    notes: list[str] = []
+    if gemini_key:
+        try:
+            return extract_imr_from_images(files, SCAN_MODEL, gemini_key), "Gemini (2.5-flash)"
+        except GeminiRateLimited:
+            notes.append("Gemini hit its free-tier limit (429)")
+        except GeminiUnavailable:
+            notes.append("Gemini was overloaded (503)")
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"Gemini error: {str(exc)[:120]}")
+    if groq_key:
+        try:
+            return extract_imr_via_groq(files, groq_key), "Groq (Llama 4 Scout)"
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"Groq error: {str(exc)[:120]}")
+    if not gemini_key and not groq_key:
+        notes.append("no API key configured")
+    raise ExtractionFailed(" → ".join(notes))
+
+
+def _stage_block(stage_label: str) -> tuple[int, int, int, int] | None:
+    """Map a stage label (e.g. 'III STAGE (PT)') to its block columns by the
+    leading roman numeral."""
+    token = str(stage_label).strip().upper().split()[0] if str(stage_label).strip() else ""
+    return SCAN_STAGE_BLOCKS.get(token)
+
+
+def fill_imr_template(extracted: dict) -> bytes:
+    """Write an extracted/corrected IMR dict into a copy of the finalized template
+    and return the workbook bytes."""
+    import openpyxl
+
+    def clean(v: object) -> object:
+        """Blank cells from the editor arrive as NaN/''; keep them empty so the
+        sheet never shows a literal 'nan'."""
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+    wb = openpyxl.load_workbook(TEMPLATE_PATH)
+    ws = wb["IMR"]
+
+    # cover
+    ws["C4"] = clean(extracted.get("plant_sr_no"))
+    ws["J4"] = clean(extracted.get("report_date"))
+    ws["C5"] = clean(extracted.get("site_name"))
+    ws["J5"] = clean(extracted.get("zone"))
+    ws["C6"] = clean(extracted.get("plant_capacity"))
+
+    # stage grids
+    for stage in extracted.get("stages") or []:
+        cols = _stage_block(stage.get("stage_label", ""))
+        if not cols:
+            continue
+        mo_c, inst_c, flow_c, cond_c = cols
+        # keep the printed stage label verbatim on the band (row 8 = block start)
+        ws.cell(row=8, column=mo_c, value=stage.get("stage_label"))
+        modules = (stage.get("modules") or [])[: SCAN_DATA_BOTTOM - SCAN_DATA_TOP + 1]
+        for i, m in enumerate(modules):
+            mo = clean(m.get("mo_no"))
+            if mo is None:
+                continue  # skip blank editor rows
+            r = SCAN_DATA_TOP + i
+            ws.cell(row=r, column=mo_c, value=mo)
+            ws.cell(row=r, column=inst_c, value=clean(m.get("inst_date")))
+            remark = str(clean(m.get("remark")) or "")
+            if "by pass" in remark.lower() or "bypass" in remark.lower():
+                ws.cell(row=r, column=cond_c, value="BY PASS")
+            else:
+                ws.cell(row=r, column=flow_c, value=clean(m.get("flow")))
+                ws.cell(row=r, column=cond_c, value=clean(m.get("cond")))
+
+    # operating parameters: match each printed tag label to its value cell (the
+    # cell immediately right of the label) by normalized text.
+    value_cell_by_tag: dict[str, object] = {}
+    for row in ws.iter_rows(min_row=35, max_row=46, min_col=1, max_col=10):
+        for cell in row:
+            norm = normalize_text(cell.value)
+            if norm and re.search(r"\b\d{2,4}\b", norm) and any(
+                k in norm for k in ("pi", "cis", "fis", "fi", "ph", "ti", "reject", "feed", "permeat")
+            ):
+                value_cell_by_tag[norm] = ws.cell(row=cell.row, column=cell.column + 1)
+    for p in extracted.get("parameters") or []:
+        norm = normalize_text(p.get("tag"))
+        target = value_cell_by_tag.get(norm)
+        val = clean(p.get("value"))
+        if target is not None and val is not None:
+            target.value = val
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def render_scan_page(engine: Engine) -> None:
+    st.title("Scan IMR — photo to Excel")
+    st.caption(
+        "Photograph or scan (PDF) a handwritten IMR printout; it's read into the "
+        "finalized Excel format. Review and fix anything, then download it or commit "
+        "it straight to the database. Gemini is primary, Groq is the backup if Gemini "
+        "is overloaded. No more retyping."
+    )
+
+    gemini_key = get_gemini_key()
+    groq_key = get_groq_key()
+    if not gemini_key and not groq_key:
+        st.info(
+            "Add a **free** API key to enable scanning (`.streamlit/secrets.toml`):\n\n"
+            "```toml\n[gemini]\napi_key = \"YOUR_FREE_GEMINI_KEY\"   # primary\n\n"
+            "[groq]\napi_key = \"YOUR_FREE_GROQ_KEY\"       # backup\n```\n\n"
+            "Gemini: https://aistudio.google.com/apikey · Groq: https://console.groq.com/keys "
+            "(both free)."
+        )
+        return
+
+    # ----- capture -----
+    up_tab, cam_tab = st.tabs(["Upload photo(s)", "Use camera"])
+    images: list[tuple[bytes, str]] = []
+    with up_tab:
+        files = st.file_uploader(
+            "Photo(s) or a scanned PDF of the same form",
+            type=["jpg", "jpeg", "png", "webp", "pdf"],
+            accept_multiple_files=True,
+        )
+        for f in files or []:
+            mime = f.type or (
+                "application/pdf" if str(f.name).lower().endswith(".pdf") else "image/jpeg"
+            )
+            images.append((f.getvalue(), mime))
+    with cam_tab:
+        shot = st.camera_input("Snap the form")
+        if shot is not None:
+            images.append((shot.getvalue(), shot.type or "image/jpeg"))
+
+    if st.button("Extract data", type="primary", disabled=not images):
+        with st.spinner(f"Reading {len(images)} file(s)…"):
+            try:
+                extracted, provider = extract_imr(images, gemini_key, groq_key)
+            except ExtractionFailed as exc:
+                st.error(
+                    f"Couldn't extract — every provider failed: {exc}. "
+                    "If both are overloaded, wait a minute and retry."
+                )
+                return
+        st.session_state["scan_extracted"] = extracted
+        st.session_state["scan_provider"] = provider
+
+    extracted = st.session_state.get("scan_extracted")
+    if not extracted:
+        return
+    provider = st.session_state.get("scan_provider", "")
+    if provider:
+        st.success(f"Extracted via {provider}. Review and fix below.")
+
+    # ----- review & correct -----
+    st.markdown("---")
+    st.subheader("Review & fix")
+    st.caption("Correct anything the OCR misread before you download or commit.")
+
+    c = st.columns(5)
+    with c[0]:
+        sr = st.number_input("Plant SR No", value=int(extracted.get("plant_sr_no") or 0), step=1, min_value=0)
+    with c[1]:
+        date_str = st.text_input("Report date (YYYY-MM-DD)", value=str(extracted.get("report_date") or ""))
+    with c[2]:
+        zone_val = extracted.get("zone") if extracted.get("zone") in SCAN_ZONES else None
+        zone = st.selectbox("Zone", SCAN_ZONES, index=SCAN_ZONES.index(zone_val) if zone_val else 0)
+    with c[3]:
+        site = st.text_input("Site name", value=str(extracted.get("site_name") or ""))
+    with c[4]:
+        cap = st.text_input("Plant capacity", value=str(extracted.get("plant_capacity") or ""))
+
+    corrected_stages = []
+    for idx, stage in enumerate(extracted.get("stages") or []):
+        st.markdown(f"**{stage.get('stage_label', f'Stage {idx+1}')}**")
+        mod_df = pd.DataFrame(stage.get("modules") or [],
+                              columns=["mo_no", "inst_date", "flow", "cond", "remark"])
+        edited = st.data_editor(
+            mod_df, num_rows="dynamic", width="stretch", key=f"scan_stage_{idx}",
+            column_config={
+                "mo_no": "Mo no.", "inst_date": "Inst date",
+                "flow": "Flow (L/hr)", "cond": "Cond (uS/cm)", "remark": "Remark",
+            },
+        )
+        corrected_stages.append({
+            "stage_label": stage.get("stage_label"),
+            "modules": edited.to_dict("records"),
+        })
+
+    params = extracted.get("parameters") or []
+    if params:
+        st.markdown("**Operating parameters**")
+        par_df = pd.DataFrame(params, columns=["tag", "value"])
+        par_edit = st.data_editor(par_df, num_rows="dynamic", width="stretch", key="scan_params")
+        corrected_params = par_edit.to_dict("records")
+    else:
+        corrected_params = []
+
+    corrected = {
+        "plant_sr_no": int(sr) or None,
+        "report_date": date_str.strip() or None,
+        "zone": zone,
+        "site_name": site.strip() or None,
+        "plant_capacity": cap.strip() or None,
+        "stages": corrected_stages,
+        "parameters": corrected_params,
+    }
+
+    xlsx_bytes = fill_imr_template(corrected)
+    base = f"{corrected['plant_sr_no'] or 'imr'}_{corrected['report_date'] or 'report'}"
+    filename = safe_upload_name(f"{base}.xlsx")
+
+    # ----- download / commit -----
+    st.markdown("---")
+    dl, cm = st.columns(2)
+    with dl:
+        st.download_button(
+            "⬇ Download Excel", xlsx_bytes, file_name=filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+        )
+    with cm:
+        commit = st.button("✓ Commit to database", type="primary", width="stretch")
+
+    if commit:
+        content_hash = hashlib.sha256(xlsx_bytes).hexdigest()
+        result = parse_report_bytes(filename, xlsx_bytes)
+        issues = validate_parse(engine, filename, result)
+        blockers = [i for i in issues if i.level == "ERROR"]
+        for issue in issues:
+            ISSUE_RENDERERS.get(issue.level, st.info)(issue.message)
+        if blockers:
+            st.error("Fix the blocking issues above (or correct the data) before committing.")
+        elif result.readings.empty:
+            st.error("No readings were parsed from the filled form — check the module rows.")
+        else:
+            store_report_bytes(engine, filename, content_hash, xlsx_bytes, status="committed")
+            counts = commit_parse_result(engine, filename, content_hash, result)
+            load_readings.clear()
+            load_parameters.clear()
+            load_mis.clear()
+            st.success(
+                f"Committed {filename}: {counts['readings']} readings, "
+                f"{counts['parameters']} parameters, {counts['mis']} MIS rows."
+            )
+            st.session_state.pop("scan_extracted", None)
+
+
+def build_submission_roster(mis: pd.DataFrame) -> pd.DataFrame:
+    """The roster of plants expected to report: the latest MIS row per
+    plant_sr_no, with its zone and site name. This is 'who should send an IMR'."""
+    cols = ["plant_sr_no", "zone", "site_name"]
+    if mis is None or mis.empty:
+        return pd.DataFrame(columns=cols)
+    latest = (
+        mis.dropna(subset=["plant_sr_no"])
+        .sort_values("report_date")
+        .drop_duplicates("plant_sr_no", keep="last")
+        .copy()
+    )
+    latest["plant_sr_no"] = latest["plant_sr_no"].astype(int)
+    latest["zone"] = latest["zone"].fillna("").astype(str).str.strip().replace("", "Unknown")
+    latest["site_name"] = latest["site_name"].fillna("").astype(str).str.strip()
+    return latest[cols].reset_index(drop=True)
+
+
+def submission_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    """Boolean grid (index plant_sr_no x columns 'YYYY-MM'): True if that plant
+    had at least one reading that month."""
+    sub = df.dropna(subset=["plant_sr_no"]).copy()
+    if sub.empty:
+        return pd.DataFrame()
+    sub["plant_sr_no"] = sub["plant_sr_no"].astype(int)
+    sub["month"] = sub["report_date"].dt.to_period("M").astype(str)
+    return sub.groupby(["plant_sr_no", "month"]).size().unstack(fill_value=0) > 0
+
+
+def render_input_tracker(df: pd.DataFrame, mis: pd.DataFrame) -> None:
+    st.title("IMR Input Tracker")
+    st.caption(
+        "Who has sent their IMR each month, by zone — the plant register (MIS) "
+        "checked against the readings actually received. Use it to chase the sites "
+        "that haven't reported yet."
+    )
+
+    roster = build_submission_roster(mis)
+    grid = submission_matrix(df)
+    if roster.empty or grid.empty:
+        st.info(
+            "Need both a plant register (MIS) and some received readings to track "
+            "submissions. Ingest at least one report with plant SR numbers."
+        )
+        return
+
+    months = sorted(grid.columns.tolist(), reverse=True)
+    month_labels = [pd.Period(m).strftime("%b %Y") for m in months]
+    picked_label = st.selectbox("Month", month_labels, index=0)
+    picked = months[month_labels.index(picked_label)]
+
+    received_sr = set(grid.index[grid[picked]]) if picked in grid.columns else set()
+    roster = roster.copy()
+    roster["received"] = roster["plant_sr_no"].isin(received_sr)
+
+    # Display name: prefer the readings sheet name, else the MIS site name.
+    name_by_sr = (
+        df.dropna(subset=["plant_sr_no"])
+        .assign(plant_sr_no=lambda d: d["plant_sr_no"].astype(int))
+        .sort_values("report_date")
+        .drop_duplicates("plant_sr_no", keep="last")
+        .set_index("plant_sr_no")["plant"]
+        .to_dict()
+    )
+    roster["site"] = roster.apply(
+        lambda r: str(name_by_sr.get(r["plant_sr_no"]) or r["site_name"] or f"SR {r['plant_sr_no']}"),
+        axis=1,
+    )
+
+    # Last month each plant submitted (for chasing the chronic non-reporters).
+    def last_submitted(sr: int) -> str:
+        if sr in grid.index:
+            hits = [m for m in months if grid.loc[sr, m]]
+            if hits:
+                return pd.Period(max(hits)).strftime("%b %Y")
+        return "Never"
+    roster["last_submitted"] = roster["plant_sr_no"].map(last_submitted)
+
+    expected = len(roster)
+    got = int(roster["received"].sum())
+    missing = expected - got
+    pct = got / expected * 100 if expected else 0.0
+    zone_grp = roster.groupby("zone")
+    zones_total = roster["zone"].nunique()
+    zones_done = int((zone_grp["received"].mean() == 1).sum())
+
+    # ----- 1. Headline + KPIs -----
+    hero_card(
+        "Missing IMRs",
+        f"{missing:,}",
+        f"{picked_label} — {got}/{expected} sites received ({pct:.0f}%)",
+        color="#16a34a" if missing == 0 else "#dc2626",
+    )
+    st.markdown("")
+    k = st.columns(4)
+    with k[0]:
+        metric_card("Sites expected", f"{expected:,}", "in the register")
+    with k[1]:
+        metric_card("Received", f"{got:,}", f"{pct:.0f}% this month", "#16a34a")
+    with k[2]:
+        metric_card("Missing", f"{missing:,}", "not yet received", "#dc2626")
+    with k[3]:
+        metric_card("Zones complete", f"{zones_done}/{zones_total}", "all sites in")
+
+    # ----- 2. By zone -----
+    st.markdown("---")
+    st.subheader(f"By zone — {picked_label}")
+    zs = (
+        zone_grp.agg(expected=("plant_sr_no", "count"), received=("received", "sum"))
+        .reset_index()
+    )
+    zs["missing"] = zs["expected"] - zs["received"]
+    zs["completion"] = (zs["received"] / zs["expected"] * 100).round(0)
+    zs = zs.sort_values(["missing", "zone"], ascending=[False, True])
+    fig = go.Figure(
+        go.Bar(
+            x=zs["completion"],
+            y=zs["zone"],
+            orientation="h",
+            marker_color=[
+                "#16a34a" if c == 100 else "#f59e0b" if c >= 50 else "#dc2626"
+                for c in zs["completion"]
+            ],
+            text=[f"{r}/{e}" for r, e in zip(zs["received"], zs["expected"])],
+            textposition="auto",
+            hovertemplate="%{y}: %{x:.0f}% received (%{text})<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        template="plotly_white",
+        height=max(220, 42 * len(zs)),
+        xaxis_title="Completion %",
+        xaxis_range=[0, 100],
+        margin={"l": 10, "r": 10, "t": 10, "b": 10},
+    )
+    st.plotly_chart(fig, width="stretch")
+    ztab = pd.DataFrame(
+        {
+            "Zone": zs["zone"],
+            "Received": zs["received"],
+            "Expected": zs["expected"],
+            "Missing": zs["missing"],
+            "Completion": zs["completion"].map(lambda v: f"{v:.0f}%"),
+        }
+    )
+    st.dataframe(ztab, width="stretch", hide_index=True)
+
+    # ----- 3. Missing this month (the actionable list) -----
+    st.markdown("---")
+    st.subheader(f"Missing this month — {picked_label}")
+    miss = roster[~roster["received"]].sort_values(["zone", "site"])
+    if miss.empty:
+        st.success("Every registered site has submitted this month. 🎉")
+    else:
+        for zone, grp in miss.groupby("zone"):
+            with st.expander(f"{zone} — {len(grp)} missing", expanded=True):
+                st.dataframe(
+                    pd.DataFrame(
+                        {
+                            "Site": grp["site"],
+                            "SR No": grp["plant_sr_no"],
+                            "Last submitted": grp["last_submitted"],
+                        }
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+        miss_out = pd.DataFrame(
+            {
+                "Zone": miss["zone"],
+                "Site": miss["site"],
+                "SR No": miss["plant_sr_no"],
+                "Last submitted": miss["last_submitted"],
+            }
+        )
+        st.download_button(
+            "Download missing list (CSV)",
+            miss_out.to_csv(index=False).encode("utf-8"),
+            file_name=f"missing_imr_{picked}.csv",
+            mime="text/csv",
+        )
+
+    # ----- 4. Submission history matrix -----
+    st.markdown("---")
+    st.subheader("Submission history")
+    st.caption("✓ received · ✗ missing, by zone. Most recent 8 months.")
+    zones = sorted(roster["zone"].unique())
+    sel_zones = st.multiselect("Zones", zones, default=zones, key="tracker_zones")
+    recent = months[:8][::-1]  # oldest -> newest for left-to-right reading
+    month_cols = [pd.Period(m).strftime("%b %y") for m in recent]
+    view = roster[roster["zone"].isin(sel_zones or zones)].sort_values(["zone", "site"])
+    rows = []
+    for _, r in view.iterrows():
+        sr = r["plant_sr_no"]
+        row = {"Zone": r["zone"], "Site": r["site"]}
+        for m, label in zip(recent, month_cols):
+            received_here = bool(grid.loc[sr, m]) if (sr in grid.index and m in grid.columns) else False
+            row[label] = "✓" if received_here else "✗"
+        rows.append(row)
+    mat = pd.DataFrame(rows)
+    if mat.empty:
+        st.info("No sites in the selected zones.")
+    else:
+        def color_cell(v: str) -> str:
+            if v == "✓":
+                return "color:#16a34a;font-weight:700"
+            if v == "✗":
+                return "color:#dc2626;font-weight:700"
+            return ""
+        styler = mat.style
+        styler = (styler.map if hasattr(styler, "map") else styler.applymap)(
+            color_cell, subset=month_cols
+        )
+        st.dataframe(
+            styler,
+            width="stretch",
+            hide_index=True,
+            height=min(640, 60 + 28 * len(mat)),
+        )
+
+
 def main() -> None:
     st.set_page_config(
         page_title="RO Membrane Health Dashboard",
@@ -3316,6 +4103,18 @@ def main() -> None:
                 icon="🌐",
                 url_path="portfolio",
                 default=True,
+            ),
+            st.Page(
+                lambda: render_input_tracker(df, mis),
+                title="IMR Tracker",
+                icon="📥",
+                url_path="tracker",
+            ),
+            st.Page(
+                lambda: render_scan_page(engine),
+                title="Scan IMR",
+                icon="📷",
+                url_path="scan",
             ),
             st.Page(
                 lambda: render_dashboard(df, params),
