@@ -3551,19 +3551,18 @@ def fill_imr_template(extracted: dict) -> bytes:
                 ws.cell(row=r, column=flow_c, value=clean(m.get("flow")))
                 ws.cell(row=r, column=cond_c, value=clean(m.get("cond")))
 
-    # operating parameters: match each printed tag label to its value cell (the
-    # cell immediately right of the label) by normalized text.
-    value_cell_by_tag: dict[str, object] = {}
+    # operating parameters: map EVERY label cell in the param region to the value
+    # cell on its right, then write each extracted param to its matching label.
+    # Matching on normalized text means text-only tags ("Reject cond", "Feed Flow",
+    # "Permeat Flow") work too, and "CIS - 151 -" vs "CIS 151" both resolve.
+    value_cell_by_label: dict[str, object] = {}
     for row in ws.iter_rows(min_row=35, max_row=46, min_col=1, max_col=10):
         for cell in row:
             norm = normalize_text(cell.value)
-            if norm and re.search(r"\b\d{2,4}\b", norm) and any(
-                k in norm for k in ("pi", "cis", "fis", "fi", "ph", "ti", "reject", "feed", "permeat")
-            ):
-                value_cell_by_tag[norm] = ws.cell(row=cell.row, column=cell.column + 1)
+            if norm:
+                value_cell_by_label.setdefault(norm, ws.cell(row=cell.row, column=cell.column + 1))
     for p in extracted.get("parameters") or []:
-        norm = normalize_text(p.get("tag"))
-        target = value_cell_by_tag.get(norm)
+        target = value_cell_by_label.get(normalize_text(p.get("tag")))
         val = clean(p.get("value"))
         if target is not None and val is not None:
             target.value = val
