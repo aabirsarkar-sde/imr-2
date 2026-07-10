@@ -340,6 +340,25 @@ def is_conductivity_header(value: object) -> bool:
     return "cond" in text or "conductivity" in text or "us cm" in text
 
 
+def is_time_header(value: object) -> bool:
+    """The 'Time for ___ ml' column — the raw stopwatch reading (seconds) from
+    which flow is computed as (volume_ml / 1000) / (time / 3600) = volume*3.6/time."""
+    text = normalize_text(value)
+    return "time for" in text or ("time" in text and ("ml" in text or "ltr" in text))
+
+
+def parse_volume_ml(value: object) -> float | None:
+    """Millilitres named in a 'Time for X ml' header. Accepts '500 ml', '1000ml',
+    '1 ltr', '2 ltr', '1Ltr' (litres → ×1000). Returns None when no volume is
+    printed (the blank template header 'Time for ______ ml')."""
+    text = normalize_text(value)
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(ml|litre|liter|ltr|l)\b", text)
+    if not match:
+        return None
+    amount = float(match.group(1))
+    return amount if match.group(2) == "ml" else amount * 1000.0
+
+
 def is_plant_group_header(value: object) -> bool:
     text = normalize_text(value)
     return text in {"plant group", "site group", "area group"} or "plant group" in text
@@ -415,6 +434,11 @@ def find_module_blocks(raw: pd.DataFrame, header_row: int) -> list[dict[str, int
                 block["flow_col"] = col
             elif is_conductivity_header(header):
                 block["conductivity_col"] = col
+            elif is_time_header(header):
+                block["time_col"] = col
+                volume = parse_volume_ml(header)
+                if volume is not None:
+                    block["volume_ml"] = volume
 
         required = {"module_col", "install_date_col", "flow_col", "conductivity_col"}
         if required.issubset(block):
@@ -487,6 +511,13 @@ def extract_rows_from_sheet(
                 conductivity = np.nan
             else:
                 flow = pd.to_numeric(value_at(raw, row_index, block["flow_col"]), errors="coerce")
+                # A live '=<volume*3.6>/<time>' formula written by openpyxl carries
+                # no cached result, so pandas reads the flow cell as NaN. Recompute
+                # it from the timed reading exactly as the sheet's formula would.
+                if pd.isna(flow) and "time_col" in block and block.get("volume_ml"):
+                    seconds = pd.to_numeric(value_at(raw, row_index, block["time_col"]), errors="coerce")
+                    if pd.notna(seconds) and seconds != 0:
+                        flow = float(block["volume_ml"]) * 3.6 / float(seconds)
                 conductivity = pd.to_numeric(
                     value_at(raw, row_index, block["conductivity_col"]),
                     errors="coerce",
@@ -535,6 +566,8 @@ def extract_rows_from_structured_table(
     module_col = find_column(columns, is_module_header)
     flow_col = find_column(columns, is_flow_header)
     conductivity_col = find_column(columns, is_conductivity_header)
+    time_col = find_column(columns, is_time_header)
+    time_volume_ml = parse_volume_ml(time_col) if time_col else None
     reading_date_col = find_column(columns, is_reading_date_header)
     install_date_col = find_column(columns, is_install_date_header)
     plant_group_col = find_column(columns, is_plant_group_header)
@@ -558,6 +591,10 @@ def extract_rows_from_structured_table(
             conductivity = np.nan
         else:
             flow = pd.to_numeric(row.get(flow_col), errors="coerce")
+            if pd.isna(flow) and time_col is not None and time_volume_ml:
+                seconds = pd.to_numeric(row.get(time_col), errors="coerce")
+                if pd.notna(seconds) and seconds != 0:
+                    flow = time_volume_ml * 3.6 / float(seconds)
             conductivity = pd.to_numeric(row.get(conductivity_col), errors="coerce")
             if pd.isna(flow) and pd.isna(conductivity):
                 continue
@@ -3319,8 +3356,10 @@ reverse-osmosis plant. Return ONLY JSON matching exactly this shape:
   "plant_capacity": "<string or null>",
   "stages": [
     {"stage_label": "<e.g. I STAGE, II STAGE, III STAGE>",
+     "volume_ml": <number or null, the volume printed in the "Time for ___ ml" header, in millilitres; 1 ltr = 1000>,
      "modules": [
        {"mo_no": <int>, "inst_date": "<YYYY-MM-DD or null>",
+        "time_sec": <number or null>,
         "flow": <number or null>, "cond": <number or null>,
         "remark": "<string or null, e.g. BY PASS>"}
      ]}
@@ -3331,7 +3370,11 @@ reverse-osmosis plant. Return ONLY JSON matching exactly this shape:
 Rules:
 - Transcribe digits exactly as written; do not invent or 'correct' values.
 - If a cell is blank or unreadable, use null (do not guess).
-- 'flow' is the Total flow (liter/hr) column; 'cond' is the Cond. us/cm column.
+- 'time_sec' is the "Time for ___ ml" column (the stopwatch reading in seconds);
+  'volume_ml' is the millilitre volume named in that column's header (e.g. 500, 1000).
+- 'flow' is the Total flow (liter/hr) column; it is often blank because the form
+  computes it from the time — read it only if a number is actually written.
+- 'cond' is the Cond. us/cm column.
 - Keep stage labels and parameter tags verbatim as printed on the form.
 Return only the JSON object, no prose."""
 
@@ -3508,6 +3551,7 @@ def fill_imr_template(extracted: dict) -> bytes:
     """Write an extracted/corrected IMR dict into a copy of the finalized template
     and return the workbook bytes."""
     import openpyxl
+    from openpyxl.utils import get_column_letter
 
     def clean(v: object) -> object:
         """Blank cells from the editor arrive as NaN/''; keep them empty so the
@@ -3534,8 +3578,17 @@ def fill_imr_template(extracted: dict) -> bytes:
         if not cols:
             continue
         mo_c, inst_c, flow_c, cond_c = cols
+        time_c = mo_c + 2  # the "Time for ___ ml" column sits two right of Mo no.
+        time_letter = get_column_letter(time_c)
         # keep the printed stage label verbatim on the band (row 8 = block start)
         ws.cell(row=8, column=mo_c, value=stage.get("stage_label"))
+        # Fill the timed volume into the header so the live flow formula is
+        # self-documenting; numerator = volume_ml / 1000 * 3600 = volume_ml * 3.6.
+        volume_ml = pd.to_numeric(stage.get("volume_ml"), errors="coerce")
+        numerator = None
+        if pd.notna(volume_ml) and volume_ml > 0:
+            ws.cell(row=9, column=time_c, value=f"Time for {volume_ml:g} ml")
+            numerator = volume_ml * 3.6
         modules = (stage.get("modules") or [])[: SCAN_DATA_BOTTOM - SCAN_DATA_TOP + 1]
         for i, m in enumerate(modules):
             mo = clean(m.get("mo_no"))
@@ -3548,7 +3601,15 @@ def fill_imr_template(extracted: dict) -> bytes:
             if "by pass" in remark.lower() or "bypass" in remark.lower():
                 ws.cell(row=r, column=cond_c, value="BY PASS")
             else:
-                ws.cell(row=r, column=flow_c, value=clean(m.get("flow")))
+                seconds = pd.to_numeric(m.get("time_sec"), errors="coerce")
+                ws.cell(row=r, column=time_c, value=float(seconds) if pd.notna(seconds) else None)
+                # With both the timed volume and the reading, write the same live
+                # formula the paper form uses so editing the time updates the flow;
+                # otherwise fall back to the transcribed flow number.
+                if numerator is not None and pd.notna(seconds) and seconds != 0:
+                    ws.cell(row=r, column=flow_c, value=f"={numerator:g}/{time_letter}{r}")
+                else:
+                    ws.cell(row=r, column=flow_c, value=clean(m.get("flow")))
                 ws.cell(row=r, column=cond_c, value=clean(m.get("cond")))
 
     # operating parameters: map EVERY label cell in the param region to the value
@@ -3653,17 +3714,26 @@ def render_scan_page(engine: Engine) -> None:
     corrected_stages = []
     for idx, stage in enumerate(extracted.get("stages") or []):
         st.markdown(f"**{stage.get('stage_label', f'Stage {idx+1}')}**")
+        vol_default = pd.to_numeric(stage.get("volume_ml"), errors="coerce")
+        volume_ml = st.number_input(
+            "Time for ___ ml (volume timed per reading)",
+            value=float(vol_default) if pd.notna(vol_default) else 0.0,
+            step=100.0, min_value=0.0, key=f"scan_vol_{idx}",
+            help="Flow is computed as volume × 3.6 ÷ time. Leave 0 if the form has "
+                 "no timed volume — flow is then taken from the Flow column as-is.",
+        )
         mod_df = pd.DataFrame(stage.get("modules") or [],
-                              columns=["mo_no", "inst_date", "flow", "cond", "remark"])
+                              columns=["mo_no", "inst_date", "time_sec", "flow", "cond", "remark"])
         edited = st.data_editor(
             mod_df, num_rows="dynamic", width="stretch", key=f"scan_stage_{idx}",
             column_config={
-                "mo_no": "Mo no.", "inst_date": "Inst date",
+                "mo_no": "Mo no.", "inst_date": "Inst date", "time_sec": "Time (sec)",
                 "flow": "Flow (L/hr)", "cond": "Cond (uS/cm)", "remark": "Remark",
             },
         )
         corrected_stages.append({
             "stage_label": stage.get("stage_label"),
+            "volume_ml": volume_ml or None,
             "modules": edited.to_dict("records"),
         })
 
