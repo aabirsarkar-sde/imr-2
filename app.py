@@ -45,6 +45,19 @@ for _month_index in range(1, 13):
     MONTHS[calendar.month_abbr[_month_index].lower()] = _month_index
 MONTHS["sept"] = 9
 
+
+def normalize_date_to_month_end(date: pd.Timestamp) -> pd.Timestamp:
+    """Snap a date to the last day of its month. Every report represents ONE
+    calendar month, but cover-sheet dates can carry an arbitrary day (e.g. July 5)
+    while the filename parser uses month-end. Normalizing all report_dates to
+    month-end prevents the Portfolio picker from showing duplicate "Jul 2026"
+    entries for dates that differ only in day-of-month."""
+    if pd.isna(date):
+        return date
+    day = calendar.monthrange(date.year, date.month)[1]
+    return pd.Timestamp(year=date.year, month=date.month, day=day)
+
+
 METRICS = {
     "Flow Rate": {
         "column": "flow_lph",
@@ -262,7 +275,9 @@ def read_cover_block(raw: pd.DataFrame) -> dict[str, object]:
             # Free-typed text: assume dd-mm (the Indian convention on these forms).
             date = pd.to_datetime(str(value), errors="coerce", dayfirst=True)
         if pd.notna(date):
-            cover["report_date"] = date
+            # Snap to month-end so all dates for the same month collapse to one
+            # timestamp — prevents duplicate "Jul 2026" entries in pickers.
+            cover["report_date"] = normalize_date_to_month_end(date)
     for field in ("zone", "site_name", "plant_name", "plant_capacity"):
         if field in raw_hits:
             text = str(raw_hits[field]).strip()
@@ -1487,6 +1502,10 @@ def load_readings() -> pd.DataFrame:
     # rows ingested before canonicalize_plant_group() existed are merged without a
     # forced re-parse.
     df["plant_group"] = df["plant_group"].map(canonicalize_plant_group)
+    # Snap report_date to month-end: cover-sheet dates may carry an exact day
+    # (e.g. July 5) while filename dates use month-end. Without this, the
+    # Portfolio picker shows duplicate "Jul 2026" entries for the same month.
+    df["report_date"] = df["report_date"].map(normalize_date_to_month_end)
     return df.sort_values(["plant_group", "plant", "module_number", "report_date"]).reset_index(
         drop=True
     )
@@ -1501,6 +1520,9 @@ def load_parameters() -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=PARAM_COLUMNS)
     df["plant_group"] = df["plant_group"].map(canonicalize_plant_group)
+    # Same month-end normalization as readings — keeps salt passage, permeate
+    # conductivity, and permeate flow sections aligned with the fleet status.
+    df["report_date"] = df["report_date"].map(normalize_date_to_month_end)
     return df.sort_values(["plant_group", "plant", "tag", "report_date"]).reset_index(drop=True)
 
 
@@ -1512,6 +1534,8 @@ def load_mis() -> pd.DataFrame:
     df = pd.read_sql("SELECT * FROM mis", engine, parse_dates=["report_date"])
     if df.empty:
         return pd.DataFrame(columns=MIS_COLUMNS)
+    # Month-end normalization, same as readings/parameters.
+    df["report_date"] = df["report_date"].map(normalize_date_to_month_end)
     return df.sort_values(["zone", "plant_sr_no", "report_date"]).reset_index(drop=True)
 
 
@@ -4017,6 +4041,394 @@ def render_input_tracker(df: pd.DataFrame, mis: pd.DataFrame) -> None:
         )
 
 
+def _col_letter(col_idx: int) -> str:
+    """Convert a 1-based column index to an Excel column letter (1->A, 27->AA)."""
+    result = ""
+    while col_idx > 0:
+        col_idx, remainder = divmod(col_idx - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def _render_sheet_as_excel_html(
+    ws, *, max_rows: int = 200, max_cols: int | None = None
+) -> str:
+    """Render an openpyxl worksheet as an HTML table that looks like MS Excel.
+
+    Handles merged cells, number formatting, and preserves the raw layout. The
+    output table has column-letter headers and row-number gutters, exactly like
+    a real spreadsheet.
+    """
+    from openpyxl.utils import get_column_letter  # noqa: F811
+
+    # Determine the extent of the sheet (clip to max_rows/max_cols for speed).
+    n_rows = min(ws.max_row or 1, max_rows)
+    n_cols = min(ws.max_column or 1, max_cols) if max_cols else (ws.max_column or 1)
+    if n_cols > 50:
+        n_cols = 50  # safety cap
+
+    # Build a set of merged-cell ranges for quick lookup.
+    # merged_top_left: (row, col) -> (row_span, col_span)
+    # merged_hidden: set of (row, col) that are swallowed by a merge
+    merged_top_left: dict[tuple[int, int], tuple[int, int]] = {}
+    merged_hidden: set[tuple[int, int]] = set()
+    for merge_range in ws.merged_cells.ranges:
+        min_r, min_c = merge_range.min_row, merge_range.min_col
+        max_r, max_c = merge_range.max_row, merge_range.max_col
+        row_span = max_r - min_r + 1
+        col_span = max_c - min_c + 1
+        merged_top_left[(min_r, min_c)] = (row_span, col_span)
+        for r in range(min_r, max_r + 1):
+            for c in range(min_c, max_c + 1):
+                if (r, c) != (min_r, min_c):
+                    merged_hidden.add((r, c))
+
+    # Build HTML rows.
+    rows_html: list[str] = []
+
+    # Column header row (A, B, C, …)
+    header = ['<th class="xl-corner"></th>']  # empty top-left corner
+    for c in range(1, n_cols + 1):
+        header.append(f'<th class="xl-col-hdr">{get_column_letter(c)}</th>')
+    rows_html.append("<tr>" + "".join(header) + "</tr>")
+
+    for r in range(1, n_rows + 1):
+        cells = [f'<td class="xl-row-hdr">{r}</td>']
+        for c in range(1, n_cols + 1):
+            if (r, c) in merged_hidden:
+                continue  # swallowed by a merge — no <td>
+
+            cell = ws.cell(row=r, column=c)
+            value = cell.value
+            if value is None:
+                display = ""
+            elif isinstance(value, float):
+                display = f"{value:g}"
+            elif isinstance(value, (int, np.integer)):
+                display = str(int(value))
+            else:
+                display = str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+            # Alignment: numbers right, text left.
+            align = "right" if isinstance(value, (int, float, np.integer, np.floating)) else "left"
+
+            # Bold detection.
+            bold = ""
+            try:
+                if cell.font and cell.font.bold:
+                    bold = "font-weight:700;"
+            except Exception:  # noqa: BLE001
+                pass
+
+            # Build cell background from fill.
+            bg = ""
+            try:
+                if cell.fill and cell.fill.fgColor and cell.fill.fgColor.rgb and cell.fill.fgColor.rgb not in ("00000000", "0",):
+                    rgb = str(cell.fill.fgColor.rgb)
+                    if len(rgb) == 8:
+                        rgb = rgb[2:]  # strip alpha
+                    if len(rgb) == 6 and rgb != "000000":
+                        bg = f"background:#{rgb};"
+            except Exception:  # noqa: BLE001
+                pass
+
+            style = f'style="text-align:{align};{bold}{bg}"'
+
+            span = merged_top_left.get((r, c))
+            if span:
+                rs, cs = span
+                span_attr = ""
+                if rs > 1:
+                    span_attr += f' rowspan="{rs}"'
+                if cs > 1:
+                    span_attr += f' colspan="{cs}"'
+                cells.append(f"<td {style}{span_attr}>{display}</td>")
+            else:
+                cells.append(f"<td {style}>{display}</td>")
+
+        rows_html.append("<tr>" + "".join(cells) + "</tr>")
+
+    clipped_note = ""
+    if (ws.max_row or 0) > max_rows:
+        clipped_note = (
+            f'<tr><td colspan="{n_cols + 1}" style="text-align:center;color:#64748b;'
+            f'font-style:italic;padding:8px;">Showing first {max_rows} of '
+            f'{ws.max_row} rows</td></tr>'
+        )
+
+    return (
+        '<div class="xl-sheet-wrap"><table class="xl-sheet">'
+        + "\n".join(rows_html)
+        + clipped_note
+        + "</table></div>"
+    )
+
+
+# CSS that makes the HTML table look like an Excel spreadsheet.
+EXCEL_PREVIEW_CSS = """
+<style>
+.xl-sheet-wrap {
+    overflow: auto;
+    max-height: 70vh;
+    border: 1px solid #8eaaaa;
+    border-radius: 2px;
+    margin-bottom: 1rem;
+}
+table.xl-sheet {
+    border-collapse: collapse;
+    font-family: Calibri, "Segoe UI", Arial, sans-serif;
+    font-size: 12px;
+    white-space: nowrap;
+    width: max-content;
+    min-width: 100%;
+}
+table.xl-sheet th, table.xl-sheet td {
+    border: 1px solid #c6d0d0;
+    padding: 2px 6px;
+    height: 22px;
+    min-width: 64px;
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: middle;
+}
+/* Column header row (A, B, C …) */
+table.xl-sheet th.xl-col-hdr {
+    background: linear-gradient(180deg, #f0f5f0 0%, #dce4dc 100%);
+    color: #333;
+    font-weight: 600;
+    text-align: center;
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    border-bottom: 2px solid #8eaaaa;
+    font-size: 11px;
+    letter-spacing: 0.02em;
+}
+/* Top-left corner cell */
+table.xl-sheet th.xl-corner {
+    background: linear-gradient(135deg, #e0e8e0 0%, #c8d4c8 100%);
+    position: sticky;
+    top: 0;
+    left: 0;
+    z-index: 4;
+    min-width: 40px;
+    width: 40px;
+    border-bottom: 2px solid #8eaaaa;
+    border-right: 2px solid #8eaaaa;
+}
+/* Row-number gutter */
+table.xl-sheet td.xl-row-hdr {
+    background: linear-gradient(90deg, #f0f5f0 0%, #dce4dc 100%);
+    color: #555;
+    font-weight: 600;
+    text-align: center;
+    position: sticky;
+    left: 0;
+    z-index: 2;
+    min-width: 40px;
+    width: 40px;
+    border-right: 2px solid #8eaaaa;
+    font-size: 11px;
+}
+/* Data cells — white default */
+table.xl-sheet td {
+    background: #ffffff;
+}
+/* Sheet tab bar */
+.xl-tab-bar {
+    display: flex;
+    gap: 0;
+    border-bottom: 2px solid #8eaaaa;
+    margin-bottom: 0;
+    padding-left: 40px;
+    background: #e8ece8;
+    overflow-x: auto;
+}
+.xl-tab {
+    padding: 5px 16px;
+    font-size: 11.5px;
+    font-family: Calibri, "Segoe UI", Arial, sans-serif;
+    color: #333;
+    border: 1px solid #a8b8a8;
+    border-bottom: none;
+    border-radius: 4px 4px 0 0;
+    background: linear-gradient(180deg, #f6faf6 0%, #e0e8e0 100%);
+    cursor: pointer;
+    margin-right: -1px;
+    white-space: nowrap;
+}
+.xl-tab.active {
+    background: #ffffff;
+    font-weight: 700;
+    border-bottom: 2px solid #ffffff;
+    position: relative;
+    top: 1px;
+    color: #1a5c1a;
+}
+/* Formula bar */
+.xl-formula-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    background: #f8faf8;
+    border: 1px solid #c6d0d0;
+    border-top: none;
+    margin-bottom: 0;
+    font-family: Calibri, "Segoe UI", Arial, sans-serif;
+    font-size: 12px;
+    color: #555;
+}
+.xl-formula-bar .xl-cell-ref {
+    background: #fff;
+    border: 1px solid #c6d0d0;
+    padding: 1px 8px;
+    min-width: 60px;
+    font-weight: 600;
+    text-align: center;
+}
+.xl-toolbar {
+    display: flex;
+    align-items: center;
+    background: linear-gradient(180deg, #e8f0e8 0%, #d0dcd0 100%);
+    border: 1px solid #a0b0a0;
+    border-bottom: none;
+    padding: 3px 8px;
+    gap: 6px;
+    font-family: Calibri, "Segoe UI", Arial, sans-serif;
+    font-size: 11px;
+    color: #444;
+}
+.xl-toolbar span {
+    padding: 2px 6px;
+    background: #f6faf6;
+    border: 1px solid #c0ccc0;
+    border-radius: 2px;
+    font-weight: 600;
+    font-size: 10.5px;
+}
+</style>
+"""
+
+
+def render_imr_preview(engine: Engine) -> None:
+    """Render a stored IMR workbook exactly as it appears in Excel — with sheet
+    tabs, column headers, row numbers, merged cells, and the classic spreadsheet
+    grid. The raw bytes are loaded from the database and read with openpyxl."""
+    st.title("📗 IMR Preview")
+    st.caption(
+        "Select a previously uploaded IMR to view the raw Excel workbook exactly as stored — "
+        "each sheet rendered with its original layout, merged cells, and values."
+    )
+
+    stored = report_files_index(engine)
+    if not stored:
+        st.info(
+            "No reports have been stored yet. Upload reports through the "
+            "**Manage Data** panel in the sidebar."
+        )
+        return
+
+    # Also get ingested_files summary for the landing table.
+    reports = ingested_report_summary(engine)
+
+    choice = st.selectbox(
+        "Select a report to preview",
+        stored,
+        index=None,
+        placeholder="Pick a committed report…",
+        key="preview_report_choice",
+    )
+
+    if not choice:
+        if not reports.empty:
+            st.markdown("---")
+            st.subheader("Committed reports")
+            summary_table = pd.DataFrame(
+                {
+                    "Report": reports["filename"],
+                    "Readings": reports["n_readings"].fillna(0).astype(int),
+                    "Parameters": reports["n_parameters"].fillna(0).astype(int),
+                    "MIS rows": reports["n_mis"].fillna(0).astype(int),
+                    "Ingested at": reports["ingested_at"].map(
+                        lambda v: pd.Timestamp(v).strftime("%d %b %Y %H:%M") if pd.notna(v) else "—"
+                    ),
+                }
+            )
+            st.dataframe(summary_table, width="stretch", hide_index=True)
+        return
+
+    # Load the raw Excel bytes.
+    data = load_report_bytes(engine, choice)
+    if data is None:
+        st.error(f"No stored bytes found for **{choice}**. The report may have been removed.")
+        return
+
+    # Download button for the original file.
+    ext = ".xlsx" if choice.lower().endswith(".xlsx") else ".xls"
+    st.download_button(
+        f"⬇ Download original file",
+        data,
+        file_name=choice,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if ext == ".xlsx" else "application/vnd.ms-excel",
+        key="preview_download_original",
+    )
+
+    # Open with openpyxl (data_only=True shows cached values, not formulas).
+    from openpyxl import load_workbook as _load_wb
+    try:
+        wb = _load_wb(io.BytesIO(data), read_only=False, data_only=True)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Could not open **{choice}** as an Excel workbook: {exc}")
+        return
+
+    sheet_names = wb.sheetnames
+    if not sheet_names:
+        st.warning("The workbook has no sheets.")
+        return
+
+    # Inject the Excel-look CSS.
+    st.markdown(EXCEL_PREVIEW_CSS, unsafe_allow_html=True)
+
+    # Toolbar mock (read-only indicator).
+    st.markdown(
+        f'<div class="xl-toolbar">'
+        f'<span>📗 {choice}</span>'
+        f'<span>{len(sheet_names)} sheet{"s" if len(sheet_names) != 1 else ""}</span>'
+        f'<span>Read-only preview</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Sheet tab selector.
+    picked_sheet = st.radio(
+        "Sheet",
+        sheet_names,
+        horizontal=True,
+        key="preview_sheet_tab",
+        label_visibility="collapsed",
+    )
+
+    ws = wb[picked_sheet]
+
+    # Formula bar.
+    dims = f"{ws.max_row or 0} rows × {ws.max_column or 0} cols"
+    st.markdown(
+        f'<div class="xl-formula-bar">'
+        f'<div class="xl-cell-ref">A1</div>'
+        f'<div style="flex:1;color:#888;">{picked_sheet} — {dims}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Render the sheet.
+    html = _render_sheet_as_excel_html(ws, max_rows=200, max_cols=None)
+    st.markdown(html, unsafe_allow_html=True)
+
+    wb.close()
+
+
 def main() -> None:
     st.set_page_config(
         page_title="RO Membrane Health Dashboard",
@@ -4178,6 +4590,12 @@ def main() -> None:
                 title="IMR Tracker",
                 icon="📥",
                 url_path="tracker",
+            ),
+            st.Page(
+                lambda: render_imr_preview(engine),
+                title="IMR Preview",
+                icon="🔍",
+                url_path="preview",
             ),
             st.Page(
                 lambda: render_scan_page(engine),
