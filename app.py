@@ -693,6 +693,10 @@ def read_report(path: Path) -> list[dict[str, object]]:
         if clean_sheet_name(sheet_name).lower() == "mis":
             continue
         raw = pd.read_excel(path, sheet_name=sheet_name, header=None)
+        # The fleet-wide 'All plant O & M' register carries no readings — it is
+        # the plant register only (parsed into MIS by read_report_mis).
+        if is_master_om_list(raw):
+            return []
         plant, plant_sr_no, eff_meta, _cover = sheet_context(raw, sheet_name, metadata)
         sheet_records = extract_rows_from_sheet(
             raw,
@@ -781,6 +785,8 @@ def read_report_parameters(path: Path) -> list[dict[str, object]]:
         if clean_sheet_name(sheet_name).lower() == "mis":
             continue
         raw = pd.read_excel(path, sheet_name=sheet_name, header=None)
+        if is_master_om_list(raw):
+            return []
         plant, _sr, eff_meta, _cover = sheet_context(raw, sheet_name, metadata)
         records.extend(
             extract_operating_parameters(
@@ -825,6 +831,77 @@ def map_mis_columns(header_cells: list[object]) -> dict[str, int]:
         elif "remark" in normalized:
             mapping["remarks"] = col
     return mapping
+
+
+def find_master_om_header_row(raw: pd.DataFrame) -> int | None:
+    """Row index of the fleet-wide 'All plant O & M' register header (Site Name /
+    Plant Sr No / Installed Capacity). The 'installed capacity' column is what
+    distinguishes this authoritative fleet register from a per-workbook MIS sheet,
+    which instead carries ZONE / ZM NAME / STATUS columns."""
+    for row_index in range(min(len(raw), 8)):
+        joined = " ".join(normalize_text(v) for v in raw.iloc[row_index].tolist())
+        if "site name" in joined and "plant sr no" in joined and "installed capacity" in joined:
+            return row_index
+    return None
+
+
+def is_master_om_list(raw: pd.DataFrame) -> bool:
+    return find_master_om_header_row(raw) is not None
+
+
+def extract_master_om_rows(
+    raw: pd.DataFrame, *, report_path: Path, report_date: object
+) -> list[dict[str, object]]:
+    """Parse the fleet-wide 'All plant O & M' register into MIS rows.
+
+    Layout: a Site Name / Plant Sr No / Installed Capacity table whose rows are
+    grouped by zone — each zone begins with a lone '<Zone> Zone' banner row (only
+    the site-name cell filled, no Plant Sr No), and zone is forward-filled down its
+    group. This is the authoritative plant register (every zone and plant), so its
+    rows are stamped with report_date such that the latest MIS row per plant — the
+    one build_zone_by_sr() and the submission roster use — resolves to this file
+    over any older per-workbook MIS.
+    """
+    header_row = find_master_om_header_row(raw)
+    if header_row is None:
+        return []
+
+    mapping = map_mis_columns(raw.iloc[header_row].tolist())
+    site_col = mapping.get("site_name")
+    sr_col = mapping.get("plant_sr_no")
+    if site_col is None or sr_col is None:
+        return []
+
+    records: list[dict[str, object]] = []
+    current_zone: str | None = None
+    for row_index in range(header_row + 1, len(raw)):
+        site = value_at(raw, row_index, site_col)
+        site_text = "" if pd.isna(site) else str(site).strip()
+        plant_sr_no = pd.to_numeric(value_at(raw, row_index, sr_col), errors="coerce")
+
+        if pd.isna(plant_sr_no):
+            # A lone '<Zone> Zone' banner row (no Plant Sr No) opens a new group.
+            if re.search(r"\bzone\b", site_text, re.IGNORECASE):
+                current_zone = re.sub(
+                    r"\s*zone\s*$", "", site_text, flags=re.IGNORECASE
+                ).strip() or None
+            continue
+
+        records.append(
+            {
+                "source_file": report_path.name,
+                "report_date": report_date,
+                "zone": current_zone,
+                "zm_name": None,
+                "plant_sr_no": int(plant_sr_no),
+                "site_name": site_text or None,
+                "status": None,
+                "membrane_required": None,
+                "remarks": None,
+            }
+        )
+
+    return records
 
 
 def extract_mis_rows(
@@ -893,6 +970,13 @@ def read_report_mis(path: Path) -> list[dict[str, object]]:
     workbook = pd.ExcelFile(path)
     for sheet_name in workbook.sheet_names:
         raw = pd.read_excel(path, sheet_name=sheet_name, header=None)
+        # The fleet-wide 'All plant O & M' register IS the plant register — the
+        # whole file maps to MIS rows. Stamp today so it wins as the latest MIS
+        # row per plant over any older per-workbook MIS/COVER zone.
+        if is_master_om_list(raw):
+            return extract_master_om_rows(
+                raw, report_path=path, report_date=datetime.now(timezone.utc).date()
+            )
         if clean_sheet_name(sheet_name).lower() == "mis":
             records.extend(extract_mis_rows(raw, report_path=path, metadata=metadata))
             continue
