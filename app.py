@@ -162,6 +162,19 @@ def canonicalize_plant_group(value: object) -> str:
     return PLANT_GROUP_ALIASES.get(key, text)
 
 
+def canonicalize_zone(value: object) -> str | None:
+    """Normalize a zone label to one canonical spelling so casing/spacing/`Zone`
+    slips don't fracture one zone into several (e.g. "VADODARA", "vadodara",
+    "Vadodara Zone" all -> "Vadodara"). Blank/whitespace -> None so a missing zone
+    is never mistaken for a real one. Applied both at ingest and at read time, so
+    already-stored mixed-case rows collapse without a re-ingest."""
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return None
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    text = re.sub(r"\s*zone\s*$", "", text, flags=re.IGNORECASE).strip()
+    return text.title() if text else None
+
+
 def plant_sr_no_from_name(name: object) -> int | None:
     """Pull the plant id from a sheet name. Prefer the last "(NNNN)" group, e.g.
     "Lupin Ank RO1 (1639)" -> 1639 and "Bharat rasayan RO 6 (3523) ." -> 3523
@@ -367,6 +380,12 @@ def read_cover_block(raw: pd.DataFrame) -> dict[str, object]:
             # which would silently read the string month-first (US) and land on
             # the wrong month.
             date = pd.to_datetime(str(value), errors="coerce", dayfirst=True)
+        # A report can't be from a future month — a cover date whose month is
+        # ahead of today is a data-entry slip (e.g. "07/09/2026" typed for a July
+        # report). Drop it so the caller falls back to the filename-derived month
+        # instead of inventing a future month in the trend/pickers.
+        if pd.notna(date) and date.to_period("M") > pd.Timestamp.now().to_period("M"):
+            date = pd.NaT
         if pd.notna(date):
             # Snap to month-end so all dates for the same month collapse to one
             # timestamp — prevents duplicate "Jul 2026" entries in pickers.
@@ -975,9 +994,7 @@ def extract_master_om_rows(
         if pd.isna(plant_sr_no):
             # A lone '<Zone> Zone' banner row (no Plant Sr No) opens a new group.
             if re.search(r"\bzone\b", site_text, re.IGNORECASE):
-                current_zone = re.sub(
-                    r"\s*zone\s*$", "", site_text, flags=re.IGNORECASE
-                ).strip() or None
+                current_zone = canonicalize_zone(site_text)
             continue
 
         records.append(
@@ -1078,13 +1095,16 @@ def read_report_mis(path: Path) -> list[dict[str, object]]:
         # joins readings.plant_sr_no -> mis.zone) works without a register sheet.
         cover = read_cover_block(raw)
         sr_value = cover.get("plant_sr_no")
-        zone = cover.get("zone")
+        # Canonicalize so casing slips don't fork one zone; a blank/whitespace
+        # cover zone becomes None (skip) rather than a phantom "" zone that would
+        # later clobber the register's real zone for this plant.
+        zone = canonicalize_zone(cover.get("zone"))
         if sr_value is not None and zone:
             records.append(
                 {
                     "source_file": path.name,
                     "report_date": cover.get("report_date") or metadata.report_date,
-                    "zone": str(zone),
+                    "zone": zone,
                     "zm_name": None,
                     "plant_sr_no": int(sr_value),
                     "site_name": cover.get("site_name"),
@@ -1484,8 +1504,11 @@ def ingest_reports(engine: Engine, data_dir: str) -> dict[str, list[str]]:
             summary["failed"].append(f"{path.name}: {exc}")
             continue
 
-        if result.readings.empty:
-            summary["failed"].append(f"{path.name}: no module table found")
+        # A readings workbook must yield a module table, but a register-only file
+        # (the 'All plant O & M' list) has no readings by design — reject only when
+        # there is NOTHING to store, else its MIS/parameter rows get silently lost.
+        if result.readings.empty and result.mis.empty and result.parameters.empty:
+            summary["failed"].append(f"{path.name}: no data found")
             continue
 
         commit_parse_result(engine, path.name, fingerprint, result)
@@ -1520,8 +1543,8 @@ def ingest_report_files(engine: Engine) -> dict[str, list[str]]:
         except Exception as exc:  # noqa: BLE001
             summary["failed"].append(f"{filename}: {exc}")
             continue
-        if result.readings.empty:
-            summary["failed"].append(f"{filename}: no module table found")
+        if result.readings.empty and result.mis.empty and result.parameters.empty:
+            summary["failed"].append(f"{filename}: no data found")
             continue
         commit_parse_result(engine, filename, content_hash, result)
         summary["ingested"].append(filename)
@@ -1556,8 +1579,16 @@ def validate_parse(engine: Engine, filename: str, result: ParseResult) -> list[I
     readings = result.readings
 
     if readings.empty:
-        issues.append(Issue("ERROR", "no_readings",
-            "No module table found — there is nothing to commit."))
+        # A register-only file (the 'All plant O & M' list) legitimately has no
+        # module table — commit its MIS rows instead of rejecting it. Only a file
+        # with nothing at all to store is a real error.
+        if not result.mis.empty:
+            issues.append(Issue("INFO", "register_only",
+                f"Plant register — no module readings; {len(result.mis)} register "
+                f"row(s) (zones/plants) will be committed."))
+            return issues
+        issues.append(Issue("ERROR", "no_data",
+            "No module table or register rows found — there is nothing to commit."))
         return issues
 
     if not result.meta.date_from_filename:
@@ -2521,13 +2552,10 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
         lambda value: str(value).strip() if str(value).strip() else "Unspecified"
     )
 
-    # plant_sr_no -> zone, from the most recent MIS row for that plant.
-    zone_by_sr: dict[object, object] = {}
-    if not mis.empty:
-        latest_mis = mis.sort_values("report_date").drop_duplicates("plant_sr_no", keep="last")
-        for _, row in latest_mis.iterrows():
-            zone = row.get("zone")
-            zone_by_sr[row["plant_sr_no"]] = zone if (pd.notna(zone) and str(zone).strip()) else None
+    # plant_sr_no -> zone via the shared resolver (canonicalized, latest MIS row
+    # that names a zone) so the dashboard's zones match the rest of the app and a
+    # blank later report can't blank a plant's known zone.
+    zone_by_sr = build_zone_by_sr(mis)
 
     plant_meta: dict[str, tuple[object, object, str]] = {}
     for plant, pdf in data.groupby("plant"):
@@ -2605,13 +2633,22 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
 
 
 def build_zone_by_sr(mis: pd.DataFrame) -> dict[object, object]:
-    """plant_sr_no -> zone, from the most recent MIS row for each plant."""
+    """plant_sr_no -> zone, from the most recent MIS row for each plant that
+    actually names a zone. Rows with a blank/missing zone are dropped BEFORE
+    picking the latest, so a later report that omits the zone can't overwrite the
+    register's known zone with "Unknown". Zones are canonicalized so casing slips
+    ("VADODARA" vs "Vadodara") collapse to one."""
     zone_by_sr: dict[object, object] = {}
-    if mis is not None and not mis.empty:
-        latest_mis = mis.sort_values("report_date").drop_duplicates("plant_sr_no", keep="last")
-        for _, row in latest_mis.iterrows():
-            zone = row.get("zone")
-            zone_by_sr[row["plant_sr_no"]] = zone if (pd.notna(zone) and str(zone).strip()) else None
+    if mis is None or mis.empty:
+        return zone_by_sr
+    zoned = mis.copy()
+    zoned["zone"] = zoned["zone"].map(canonicalize_zone)
+    zoned = zoned[zoned["zone"].notna()]
+    if zoned.empty:
+        return zone_by_sr
+    latest_mis = zoned.sort_values("report_date").drop_duplicates("plant_sr_no", keep="last")
+    for _, row in latest_mis.iterrows():
+        zone_by_sr[row["plant_sr_no"]] = row["zone"]
     return zone_by_sr
 
 
@@ -4010,7 +4047,10 @@ def build_submission_roster(mis: pd.DataFrame) -> pd.DataFrame:
         .copy()
     )
     latest["plant_sr_no"] = latest["plant_sr_no"].astype(int)
-    latest["zone"] = latest["zone"].fillna("").astype(str).str.strip().replace("", "Unknown")
+    # Zone via the shared resolver (canonicalized, latest row that names a zone)
+    # so it matches the reading-side zone and a blank later row can't blank it.
+    zone_by_sr = build_zone_by_sr(mis)
+    latest["zone"] = latest["plant_sr_no"].map(lambda s: zone_by_sr.get(s) or "Unknown")
     latest["site_name"] = latest["site_name"].fillna("").astype(str).str.strip()
     return latest[cols].reset_index(drop=True)
 
