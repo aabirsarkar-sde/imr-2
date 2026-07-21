@@ -244,6 +244,88 @@ def _value_right(raw: pd.DataFrame, row: int, col: int, span: int = 8) -> object
     return None
 
 
+# Some hand-filled workbooks don't use the template's separate label/value cells;
+# they pack the identity into single cells as "LABEL :- VALUE" text, often two
+# labels per cell, e.g. "SITE NAME :- <site>   Date :- <dd/mm/yyyy>" and
+# "PLANT CAPACITY/PLANT SR.NO. :- <cap>/<sr>   Time :- <hh.mm>". Parse those inline
+# pairs so the plant id and date come from the sheet instead of being lost (which
+# left readings with no sr-no -> zone "Unknown"). Labels are matched longest/most-
+# specific first; the site name is intentionally NOT trusted from this layout — a
+# site's several RO units share one SITE NAME here, so the unique per-unit sheet
+# name stays the display name.
+_INLINE_COVER_PATTERNS = [
+    ("plant_capacity_sr", r"plant\s*capacity\s*/\s*plant\s*sr\.?\s*no\.?"),
+    ("site_name", r"site\s*name"),
+    ("plant_name", r"plant\s*name"),
+    ("plant_sr_no", r"plant\s*sr\.?\s*no\.?"),
+    ("plant_capacity", r"plant\s*capacity"),
+    ("report_date", r"date"),
+    ("zone", r"zone"),
+    ("time", r"time"),
+    ("location", r"location"),
+]
+_INLINE_COVER_EMIT = {"plant_sr_no", "plant_capacity", "report_date", "zone"}
+
+
+def _split_capacity_sr(value: str) -> tuple[int | None, str | None]:
+    """From a combined 'PLANT CAPACITY/PLANT SR.NO.' value like '100W /2977' or
+    '2402/150w', pull the SR (the bare 3-4 digit token) and the capacity (the
+    token carrying a unit letter). The two orders both occur, so key off shape,
+    not position."""
+    sr: int | None = None
+    cap: str | None = None
+    for token in re.split(r"[/\s]+", value.strip()):
+        if not token:
+            continue
+        if re.fullmatch(r"\d{3,4}", token):
+            sr = int(token)
+        elif re.search(r"[a-zA-Z]", token) and re.search(r"\d", token):
+            cap = token
+    return sr, cap
+
+
+def _parse_inline_cover(cell_text: str) -> dict[str, object]:
+    """Extract the trusted 'LABEL :- VALUE' pairs packed into one COVER cell. Each
+    value runs from its label's ':-' to the start of the next label, so adjacent
+    labels in the same cell (Date, Time) act as value terminators."""
+    if ":-" not in cell_text:
+        return {}
+
+    hits: list[tuple[int, int, str]] = []
+    for field, pattern in _INLINE_COVER_PATTERNS:
+        for match in re.finditer(pattern + r"\s*:-", cell_text, flags=re.IGNORECASE):
+            hits.append((match.start(), match.end(), field))
+    if not hits:
+        return {}
+    hits.sort()
+
+    # The combined 'plant capacity/plant sr no' label contains the standalone
+    # 'plant sr no'/'plant capacity' labels; drop those inner overlaps.
+    pruned: list[tuple[int, int, str]] = []
+    last_value_start = -1
+    for start, value_start, field in hits:
+        if start < last_value_start:
+            continue
+        pruned.append((start, value_start, field))
+        last_value_start = value_start
+
+    out: dict[str, object] = {}
+    for i, (_start, value_start, field) in enumerate(pruned):
+        value_end = pruned[i + 1][0] if i + 1 < len(pruned) else len(cell_text)
+        value = cell_text[value_start:value_end].strip()
+        if not value:
+            continue
+        if field == "plant_capacity_sr":
+            sr, cap = _split_capacity_sr(value)
+            if sr is not None:
+                out.setdefault("plant_sr_no", sr)
+            if cap:
+                out.setdefault("plant_capacity", cap)
+        elif field in _INLINE_COVER_EMIT:
+            out.setdefault(field, value)
+    return out
+
+
 def read_cover_block(raw: pd.DataFrame) -> dict[str, object]:
     """Read a sheet's COVER identity block, if present. Returns {} when none of the
     labels are found (old-format sheets), so callers can fall back cleanly."""
@@ -252,7 +334,15 @@ def read_cover_block(raw: pd.DataFrame) -> dict[str, object]:
     max_col = min(raw.shape[1], 12)
     for r in range(max_row):
         for c in range(max_col):
-            label = normalize_text(raw.iat[r, c])
+            cell = raw.iat[r, c]
+            if pd.isna(cell):
+                continue
+            cell_text = str(cell)
+            # Inline "LABEL :- VALUE" layout (value packed in the same cell).
+            for field, value in _parse_inline_cover(cell_text).items():
+                raw_hits.setdefault(field, value)
+            # Template layout: a label cell with its value in the cell to the right.
+            label = normalize_text(cell_text)
             if not label:
                 continue
             for field, key in COVER_LABELS.items():
@@ -268,11 +358,14 @@ def read_cover_block(raw: pd.DataFrame) -> dict[str, object]:
             cover["plant_sr_no"] = int(sr)
     if "report_date" in raw_hits:
         value = raw_hits["report_date"]
-        try:
-            # Real Excel dates arrive as datetime — unambiguous, no warning.
+        if isinstance(value, (pd.Timestamp, datetime)):
+            # Real Excel date cells arrive as datetime — unambiguous.
             date = pd.Timestamp(value)
-        except (ValueError, TypeError):
-            # Free-typed text: assume dd-mm (the Indian convention on these forms).
+        else:
+            # Free-typed text like "11/07/2026": assume dd-mm (the Indian
+            # convention on these forms). Parse dayfirst — NOT via pd.Timestamp,
+            # which would silently read the string month-first (US) and land on
+            # the wrong month.
             date = pd.to_datetime(str(value), errors="coerce", dayfirst=True)
         if pd.notna(date):
             # Snap to month-end so all dates for the same month collapse to one
