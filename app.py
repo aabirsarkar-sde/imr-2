@@ -426,6 +426,18 @@ def sheet_context(
     return plant, plant_sr_no, effective, cover
 
 
+def is_master_om_file(path: Path) -> bool:
+    """True if `path` is the fleet-wide 'All plant O & M' register. Reads only the
+    first sheet's top rows, so it's cheap enough to screen files at scan time."""
+    if path.suffix.lower() not in (".xlsx", ".xls"):
+        return False
+    try:
+        head = pd.read_excel(path, sheet_name=0, header=None, nrows=8)
+    except Exception:  # noqa: BLE001
+        return False
+    return is_master_om_list(head)
+
+
 def report_paths(root: Path) -> list[Path]:
     source_roots = [root, root / UPLOAD_DIR_NAME]
     paths: list[Path] = []
@@ -440,7 +452,22 @@ def report_paths(root: Path) -> list[Path]:
             if path.name != MANUAL_DATA_FILE and not path.name.startswith("~$")
         )
 
-    return sorted(paths)
+    # The O&M register is not a monthly report — it seeds the editable `plants`
+    # table (seed_plants_if_empty), so keep it out of the readings/mis ingest.
+    return sorted(p for p in paths if not is_master_om_file(p))
+
+
+def master_om_paths(root: Path) -> list[Path]:
+    """The O&M register file(s) on disk — the seed source for the plant register."""
+    found: list[Path] = []
+    for source_root in (root, root / UPLOAD_DIR_NAME):
+        if not source_root.exists():
+            continue
+        for pattern in REPORT_GLOBS:
+            for path in source_root.glob(pattern):
+                if not path.name.startswith("~$") and is_master_om_file(path):
+                    found.append(path)
+    return sorted(found)
 
 
 def is_module_header(value: object) -> bool:
@@ -983,6 +1010,11 @@ def extract_master_om_rows(
     sr_col = mapping.get("plant_sr_no")
     if site_col is None or sr_col is None:
         return []
+    cap_col = next(
+        (c for c, cell in enumerate(raw.iloc[header_row].tolist())
+         if "capacity" in normalize_text(cell)),
+        None,
+    )
 
     records: list[dict[str, object]] = []
     current_zone: str | None = None
@@ -997,6 +1029,8 @@ def extract_master_om_rows(
                 current_zone = canonicalize_zone(site_text)
             continue
 
+        capacity = value_at(raw, row_index, cap_col) if cap_col is not None else None
+        cap_text = None if pd.isna(capacity) else str(capacity).strip() or None
         records.append(
             {
                 "source_file": report_path.name,
@@ -1005,6 +1039,7 @@ def extract_master_om_rows(
                 "zm_name": None,
                 "plant_sr_no": int(plant_sr_no),
                 "site_name": site_text or None,
+                "installed_capacity": cap_text,
                 "status": None,
                 "membrane_required": None,
                 "remarks": None,
@@ -1209,8 +1244,26 @@ REPORT_FILES_TABLE = Table(
     Column("status", Text),
 )
 
+# The authoritative, user-editable plant register: one row per plant, the single
+# source of truth for a plant's zone and whether it is still operating. Seeded
+# once from the 'All plant O & M' list, then maintained in-app on the Plant
+# Register page (add new clients, mark shut-down plants inactive, fix a zone).
+# Zone resolution treats this as authority over any per-workbook cover zone, so a
+# mis-typed cover ZONE can no longer invent a phantom zone.
+PLANTS_TABLE = Table(
+    "plants",
+    DB_METADATA,
+    Column("plant_sr_no", Integer, primary_key=True),
+    Column("site_name", Text),
+    Column("zone", Text),
+    Column("installed_capacity", Text),
+    Column("status", Text),  # "active" (expected to report) / "inactive" (shut down)
+    Column("updated_at", DateTime),
+)
+
 READINGS_COLUMNS = [c.name for c in READINGS_TABLE.columns]
 MIS_COLUMNS = [c.name for c in MIS_TABLE.columns]
+PLANTS_COLUMNS = [c.name for c in PLANTS_TABLE.columns]
 
 
 def database_url() -> str | None:
@@ -1552,6 +1605,100 @@ def ingest_report_files(engine: Engine) -> dict[str, list[str]]:
     return summary
 
 
+DEFAULT_ZONES = [
+    "Ahmedabad", "Ankleshwar", "Dahej", "Jhagadia", "Panoli", "Vadodara", "Vapi",
+]
+
+
+def known_zones(plants: pd.DataFrame) -> list[str]:
+    """The canonical zones the register defines (sorted). Falls back to the known
+    business zones only when the register is empty, so the editor always offers a
+    sensible zone list."""
+    if plants is None or plants.empty:
+        return list(DEFAULT_ZONES)
+    zs = {z for z in plants["zone"].map(canonicalize_zone).dropna().unique()}
+    return sorted(zs) if zs else list(DEFAULT_ZONES)
+
+
+def seed_plants_if_empty(engine: Engine, data_dir: str) -> int:
+    """Populate the editable plant register once, only if it's empty. Seeds from
+    the O&M list on disk; if that's not present, falls back to any zoned rows
+    already in `mis` (the register may have been ingested before this table
+    existed). Returns the number of rows seeded (0 if it already had rows)."""
+    with engine.connect() as conn:
+        if (conn.execute(text("SELECT COUNT(*) FROM plants")).scalar() or 0) > 0:
+            return 0
+
+    rows: list[dict[str, object]] = []
+    for path in master_om_paths(Path(data_dir)):
+        raw = pd.read_excel(path, sheet_name=0, header=None)
+        for rec in extract_master_om_rows(
+            raw, report_path=path, report_date=datetime.now(timezone.utc).date()
+        ):
+            rows.append({
+                "plant_sr_no": int(rec["plant_sr_no"]),
+                "site_name": rec.get("site_name"),
+                "zone": canonicalize_zone(rec.get("zone")),
+                "installed_capacity": rec.get("installed_capacity"),
+            })
+        if rows:
+            break
+
+    if not rows:  # fall back to zoned MIS rows already in the DB
+        mis = pd.read_sql("SELECT * FROM mis", engine, parse_dates=["report_date"])
+        if not mis.empty:
+            zoned = mis.copy()
+            zoned["zone"] = zoned["zone"].map(canonicalize_zone)
+            zoned = zoned[zoned["zone"].notna()].dropna(subset=["plant_sr_no"])
+            zoned = zoned.sort_values("report_date").drop_duplicates("plant_sr_no", keep="last")
+            for _, r in zoned.iterrows():
+                rows.append({
+                    "plant_sr_no": int(r["plant_sr_no"]),
+                    "site_name": r.get("site_name"),
+                    "zone": r["zone"],
+                    "installed_capacity": None,
+                })
+
+    if not rows:
+        return 0
+
+    frame = pd.DataFrame({r["plant_sr_no"]: r for r in rows}.values())  # de-dupe by SR
+    frame["status"] = "active"
+    frame["updated_at"] = datetime.now(timezone.utc)
+    frame = frame.reindex(columns=PLANTS_COLUMNS)
+    frame.to_sql("plants", engine, if_exists="append", index=False, method="multi", chunksize=500)
+    return len(frame)
+
+
+def save_plants(engine: Engine, edited: pd.DataFrame) -> int:
+    """Overwrite the whole register with `edited` (full replace, so row deletions
+    in the editor stick). Rows without an SR are dropped, duplicate SRs collapse to
+    the last, zones are canonicalized, status defaults to active. Returns the row
+    count written."""
+    clean = edited.copy()
+    clean["plant_sr_no"] = pd.to_numeric(clean.get("plant_sr_no"), errors="coerce")
+    clean = clean.dropna(subset=["plant_sr_no"])
+    clean["plant_sr_no"] = clean["plant_sr_no"].astype(int)
+    clean = clean.drop_duplicates("plant_sr_no", keep="last")
+    clean["zone"] = clean.get("zone").map(canonicalize_zone) if "zone" in clean else None
+    status = clean["status"] if "status" in clean else "active"
+    clean["status"] = (
+        pd.Series(status, index=clean.index).fillna("active").astype(str).str.lower()
+        .replace("", "active")
+    )
+    for col in ("site_name", "installed_capacity"):
+        if col in clean:
+            clean[col] = clean[col].map(lambda v: None if pd.isna(v) else (str(v).strip() or None))
+    clean["updated_at"] = datetime.now(timezone.utc)
+    clean = clean.reindex(columns=PLANTS_COLUMNS)
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM plants"))
+        if not clean.empty:
+            clean.to_sql("plants", conn, if_exists="append", index=False,
+                         method="multi", chunksize=500)
+    return len(clean)
+
+
 @dataclass
 class Issue:
     """One line in a report's data-quality report. level is ERROR (blocks the
@@ -1740,11 +1887,80 @@ def load_mis() -> pd.DataFrame:
     if engine is None:
         return pd.DataFrame(columns=MIS_COLUMNS)
     df = pd.read_sql("SELECT * FROM mis", engine, parse_dates=["report_date"])
+    # Fold in the authoritative plant register (register zones win; unrecognized
+    # cover zones dropped) so every zone consumer resolves zones the same way.
+    df = apply_register_authority(df, load_plants())
     if df.empty:
         return pd.DataFrame(columns=MIS_COLUMNS)
     # Month-end normalization, same as readings/parameters.
     df["report_date"] = df["report_date"].map(normalize_date_to_month_end)
     return df.sort_values(["zone", "plant_sr_no", "report_date"]).reset_index(drop=True)
+
+
+@st.cache_data(show_spinner="Loading the plant register...")
+def load_plants() -> pd.DataFrame:
+    engine = get_engine()
+    if engine is None:
+        return pd.DataFrame(columns=PLANTS_COLUMNS)
+    df = pd.read_sql("SELECT * FROM plants", engine)
+    if df.empty:
+        return pd.DataFrame(columns=PLANTS_COLUMNS)
+    df["zone"] = df["zone"].map(canonicalize_zone)
+    if "status" in df:
+        df["status"] = df["status"].fillna("active").astype(str).str.lower()
+    return df.sort_values(["zone", "plant_sr_no"], na_position="last").reset_index(drop=True)
+
+
+# Far-future sentinel (pandas max is 2262-04-11): register rows are stamped with
+# it so, in the "latest MIS row per plant" zone resolution, the register always
+# wins over any per-workbook cover zone.
+REGISTER_REPORT_DATE = pd.Timestamp("2262-01-01")
+REGISTER_SOURCE = "__register__"
+
+
+def apply_register_authority(mis: pd.DataFrame, plants: pd.DataFrame) -> pd.DataFrame:
+    """Make the plant register authoritative over the raw MIS rows for zones:
+
+    1. Drop any cover-derived MIS row whose zone the register doesn't recognize —
+       so a mis-typed cover ZONE (e.g. a site/town name) can't invent a phantom
+       zone. 2. Append every register plant as a MIS row stamped far in the future,
+       so build_zone_by_sr() picks the register's zone over any cover zone.
+
+    A no-op until the register is seeded, so the app still works pre-seed."""
+    base = mis.copy() if (mis is not None and not mis.empty) else pd.DataFrame(columns=MIS_COLUMNS)
+    if plants is None or plants.empty:
+        return base
+
+    reg = plants.dropna(subset=["plant_sr_no"]).copy()
+    reg["zone"] = reg["zone"].map(canonicalize_zone)
+    reg = reg[reg["zone"].notna()]
+    known = set(reg["zone"].unique())
+    if not known:
+        return base
+
+    if not base.empty:
+        cover_zone = base["zone"].map(canonicalize_zone)
+        base = base[cover_zone.isna() | cover_zone.isin(known)]
+
+    reg_rows = pd.DataFrame(
+        {
+            "source_file": REGISTER_SOURCE,
+            "report_date": REGISTER_REPORT_DATE,
+            "zone": reg["zone"].to_numpy(),
+            "zm_name": pd.Series([None] * len(reg), dtype=object),
+            "plant_sr_no": reg["plant_sr_no"].astype(int).to_numpy(),
+            "site_name": (
+                reg["site_name"].astype(object).to_numpy() if "site_name" in reg
+                else pd.Series([None] * len(reg), dtype=object)
+            ),
+            "status": pd.Series([None] * len(reg), dtype=object),
+            "membrane_required": pd.Series([np.nan] * len(reg), dtype=float),
+            "remarks": pd.Series([None] * len(reg), dtype=object),
+        }
+    ).reindex(columns=MIS_COLUMNS)
+    if base.empty:
+        return reg_rows
+    return pd.concat([base, reg_rows], ignore_index=True)
 
 
 def feed_pressure_series(
@@ -4116,25 +4332,22 @@ def render_scan_page(engine: Engine) -> None:
             st.session_state.pop("scan_extracted", None)
 
 
-def build_submission_roster(mis: pd.DataFrame) -> pd.DataFrame:
-    """The roster of plants expected to report: the latest MIS row per
-    plant_sr_no, with its zone and site name. This is 'who should send an IMR'."""
+def build_submission_roster(plants: pd.DataFrame) -> pd.DataFrame:
+    """The roster of plants expected to report: every ACTIVE plant in the register,
+    with its zone and site name. A shut-down (inactive) plant is not expected to
+    report, so it's excluded here (but kept in the register for history)."""
     cols = ["plant_sr_no", "zone", "site_name"]
-    if mis is None or mis.empty:
+    if plants is None or plants.empty:
         return pd.DataFrame(columns=cols)
-    latest = (
-        mis.dropna(subset=["plant_sr_no"])
-        .sort_values("report_date")
-        .drop_duplicates("plant_sr_no", keep="last")
-        .copy()
-    )
-    latest["plant_sr_no"] = latest["plant_sr_no"].astype(int)
-    # Zone via the shared resolver (canonicalized, latest row that names a zone)
-    # so it matches the reading-side zone and a blank later row can't blank it.
-    zone_by_sr = build_zone_by_sr(mis)
-    latest["zone"] = latest["plant_sr_no"].map(lambda s: zone_by_sr.get(s) or "Unknown")
-    latest["site_name"] = latest["site_name"].fillna("").astype(str).str.strip()
-    return latest[cols].reset_index(drop=True)
+    active = plants.dropna(subset=["plant_sr_no"]).copy()
+    if "status" in active:
+        active = active[active["status"].fillna("active").astype(str).str.lower() != "inactive"]
+    if active.empty:
+        return pd.DataFrame(columns=cols)
+    active["plant_sr_no"] = active["plant_sr_no"].astype(int)
+    active["zone"] = active["zone"].map(canonicalize_zone).fillna("Unknown")
+    active["site_name"] = active["site_name"].fillna("").astype(str).str.strip()
+    return active.drop_duplicates("plant_sr_no")[cols].reset_index(drop=True)
 
 
 def submission_matrix(df: pd.DataFrame) -> pd.DataFrame:
@@ -4148,20 +4361,109 @@ def submission_matrix(df: pd.DataFrame) -> pd.DataFrame:
     return sub.groupby(["plant_sr_no", "month"]).size().unstack(fill_value=0) > 0
 
 
-def render_input_tracker(df: pd.DataFrame, mis: pd.DataFrame) -> None:
-    st.title("IMR Input Tracker")
+def render_plant_register(engine: Engine) -> None:
+    st.title("Plant Register")
     st.caption(
-        "Who has sent their IMR each month, by zone — the plant register (MIS) "
-        "checked against the readings actually received. Use it to chase the sites "
-        "that haven't reported yet."
+        "The master list of plants — the single source of truth for each plant's "
+        "zone and whether it's still operating. Fix a zone, add a new client's "
+        "plant, or mark a shut-down plant Inactive. The IMR Tracker and every zone "
+        "view read from this; an Inactive plant drops out of the tracker's expected "
+        "list but keeps its history. Add rows with the ＋ at the bottom of the table; "
+        "delete a row by selecting it and pressing the trash icon."
+    )
+    plants = load_plants()
+
+    zones = sorted(set(known_zones(plants)) | set(st.session_state.get("extra_zones", [])))
+    with st.expander("➕ Add a new zone (onboarding a new region)"):
+        c1, c2 = st.columns([3, 1])
+        new_zone = c1.text_input(
+            "New zone name", key="new_zone_input",
+            label_visibility="collapsed", placeholder="e.g. Surat",
+        )
+        if c2.button("Add zone") and new_zone.strip():
+            z = canonicalize_zone(new_zone)
+            if z and z not in zones:
+                st.session_state.setdefault("extra_zones", []).append(z)
+            rerun_app()
+
+    grid = plants.reindex(
+        columns=["plant_sr_no", "site_name", "zone", "installed_capacity", "status"]
+    )
+    if grid.empty:
+        grid = pd.DataFrame(
+            columns=["plant_sr_no", "site_name", "zone", "installed_capacity", "status"]
+        )
+    grid["status"] = (
+        grid["status"].fillna("active").astype(str).str.capitalize().replace("", "Active")
     )
 
-    roster = build_submission_roster(mis)
+    edited = st.data_editor(
+        grid,
+        num_rows="dynamic",
+        width="stretch",
+        height=560,
+        key="plant_editor",
+        column_config={
+            "plant_sr_no": st.column_config.NumberColumn("SR No", format="%d", width="small"),
+            "site_name": st.column_config.TextColumn("Site name", width="large"),
+            "zone": st.column_config.SelectboxColumn("Zone", options=zones, width="medium"),
+            "installed_capacity": st.column_config.TextColumn("Capacity", width="small"),
+            "status": st.column_config.SelectboxColumn(
+                "Status", options=["Active", "Inactive"], width="small"
+            ),
+        },
+    )
+
+    left, _ = st.columns([1, 3])
+    if left.button("💾 Save changes", type="primary"):
+        srs = pd.to_numeric(edited.get("plant_sr_no"), errors="coerce")
+        valid = srs.dropna()
+        if valid.duplicated().any():
+            dups = sorted(valid[valid.duplicated(keep=False)].astype(int).unique())
+            st.error(
+                f"Duplicate SR No(s): {', '.join(map(str, dups))}. "
+                "Each plant needs a unique SR No — fix these before saving."
+            )
+        else:
+            n = save_plants(engine, edited)
+            load_plants.clear()
+            load_mis.clear()
+            compute_fleet_status.clear()
+            skipped = int(srs.isna().sum())
+            msg = f"Saved {n} plants."
+            if skipped:
+                msg += f" ({skipped} row(s) without an SR No were skipped.)"
+            st.success(msg)
+            rerun_app()
+
+    if not plants.empty:
+        active = (
+            int((plants["status"].fillna("active").str.lower() != "inactive").sum())
+            if "status" in plants else len(plants)
+        )
+        tally = " · ".join(
+            f"{z}: {n}" for z, n in
+            plants["zone"].map(canonicalize_zone).fillna("Unknown")
+            .value_counts().sort_index().items()
+        )
+        st.caption(f"{len(plants)} plants ({active} active) · {tally}")
+
+
+def render_input_tracker(df: pd.DataFrame, plants: pd.DataFrame) -> None:
+    st.title("IMR Input Tracker")
+    st.caption(
+        "Who has sent their IMR each month, by zone — the plant register checked "
+        "against the readings actually received. Use it to chase the sites that "
+        "haven't reported yet. Edit the roster on the Plant Register page."
+    )
+
+    roster = build_submission_roster(plants)
     grid = submission_matrix(df)
     if roster.empty or grid.empty:
         st.info(
-            "Need both a plant register (MIS) and some received readings to track "
-            "submissions. Ingest at least one report with plant SR numbers."
+            "Need both a plant register and some received readings to track "
+            "submissions. Add plants on the Plant Register page and ingest at least "
+            "one report with plant SR numbers."
         )
         return
 
@@ -4840,6 +5142,7 @@ def main() -> None:
 
     try:
         init_db(engine)
+        seeded = seed_plants_if_empty(engine, str(APP_DIR))
         summary = ingest_reports(engine, str(APP_DIR))
         # Rebuild from durable bytes anything whose derived rows went missing
         # (e.g. Cloud restart wiped disk but report_files survived). Usually a no-op.
@@ -4851,10 +5154,11 @@ def main() -> None:
         return
 
     # New/changed reports were parsed this run — drop the cached query results so
-    # the fresh rows show up.
-    if summary["ingested"]:
+    # the fresh rows show up. Seeding the register also affects the folded-in zones.
+    if summary["ingested"] or seeded:
         load_readings.clear()
         load_parameters.clear()
+        load_plants.clear()
         load_mis.clear()
         compute_fleet_status.clear()
 
@@ -4872,6 +5176,7 @@ def main() -> None:
 
     params = load_parameters()
     mis = load_mis()
+    plants = load_plants()
 
     render_data_manager(engine)
 
@@ -4885,10 +5190,16 @@ def main() -> None:
                 default=True,
             ),
             st.Page(
-                lambda: render_input_tracker(df, mis),
+                lambda: render_input_tracker(df, plants),
                 title="IMR Tracker",
                 icon="📥",
                 url_path="tracker",
+            ),
+            st.Page(
+                lambda: render_plant_register(engine),
+                title="Plant Register",
+                icon="🏭",
+                url_path="register",
             ),
             st.Page(
                 lambda: render_imr_preview(engine),
