@@ -1975,6 +1975,60 @@ def stage_uploaded_files(engine: Engine, files: list[object]) -> None:
 ISSUE_RENDERERS = {"ERROR": st.error, "WARN": st.warning, "INFO": st.info}
 
 
+def render_parse_preview(result: ParseResult) -> None:
+    """Show the actual rows a report parsed into — readings, the plant register
+    (MIS), and operating parameters — so an uploader can eyeball the extraction
+    (SR numbers, zones, flow/conductivity) BEFORE committing anything."""
+    readings = result.readings
+    mis = result.mis
+    parameters = result.parameters
+
+    if not readings.empty:
+        cols = [
+            "plant", "plant_sr_no", "stage", "module_label", "report_date",
+            "install_date", "flow_lph", "conductivity_us_cm", "status",
+        ]
+        preview = readings.reindex(columns=cols).rename(
+            columns={
+                "plant": "Plant", "plant_sr_no": "SR No", "stage": "Stage",
+                "module_label": "Module", "report_date": "Report",
+                "install_date": "Installed", "flow_lph": "Flow (LPH)",
+                "conductivity_us_cm": "Cond (µS/cm)", "status": "Status",
+            }
+        )
+        st.caption(f"Readings — {len(preview)} rows")
+        st.dataframe(preview, width="stretch", hide_index=True, height=240)
+
+    if not mis.empty:
+        # For a register file (the O&M list) this is the whole point of the
+        # preview — show the zone tally so 28-vs-4 style gaps are obvious here.
+        zone_counts = (
+            mis["zone"].map(canonicalize_zone).fillna("Unknown").value_counts().sort_index()
+        )
+        tally = " · ".join(f"{z}: {n}" for z, n in zone_counts.items())
+        st.caption(f"Plant register (MIS) — {len(mis)} rows · {tally}")
+        st.dataframe(
+            mis.reindex(columns=["zone", "plant_sr_no", "site_name", "status"]).rename(
+                columns={"zone": "Zone", "plant_sr_no": "SR No",
+                         "site_name": "Site", "status": "Status"}
+            ),
+            width="stretch", hide_index=True, height=240,
+        )
+
+    if not parameters.empty:
+        st.caption(f"Operating parameters — {len(parameters)} rows")
+        st.dataframe(
+            parameters.reindex(columns=["plant", "report_date", "tag", "kind", "value", "unit"]).rename(
+                columns={"plant": "Plant", "report_date": "Report", "tag": "Tag",
+                         "kind": "Kind", "value": "Value", "unit": "Unit"}
+            ),
+            width="stretch", hide_index=True, height=200,
+        )
+
+    if readings.empty and mis.empty and parameters.empty:
+        st.caption("Nothing was extracted from this file.")
+
+
 def render_staged_reports(engine: Engine) -> None:
     """Render the pending-review queue: per-file stats + quality issues + a
     Confirm/Discard pair. Confirm commits to the live tables; nothing is written
@@ -2010,6 +2064,9 @@ def render_staged_reports(engine: Engine) -> None:
             )
             for issue in issues:
                 ISSUE_RENDERERS.get(issue.level, st.info)(issue.message)
+
+            with st.expander("🔍 Preview extracted data"):
+                render_parse_preview(result)
 
             blocked = any(i.level == "ERROR" for i in issues)
             ok_col, no_col = st.columns(2)
@@ -2652,7 +2709,9 @@ def build_zone_by_sr(mis: pd.DataFrame) -> dict[object, object]:
     return zone_by_sr
 
 
-def compute_salt_passage(parameters: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFrame:
+def compute_salt_passage(
+    parameters: pd.DataFrame, mis: pd.DataFrame, readings: pd.DataFrame | None = None
+) -> pd.DataFrame:
     """Per-plant per-month conductivity salt passage from the CIS feed/permeate tags.
 
     Feed conductivity (CIS 151) and combined permeate conductivity (CIS 180) are
@@ -2661,7 +2720,13 @@ def compute_salt_passage(parameters: pd.DataFrame, mis: pd.DataFrame) -> pd.Data
     per (plant, month) that carries BOTH readings, with the plant's zone joined in
     (via plant_sr_no -> latest MIS row, mirroring compute_fleet_status), sorted by
     passage descending.
-    """
+
+    The `parameters` table carries no plant_sr_no, so the SR (needed for the zone
+    join) is taken from the resolved `readings` by plant name — the SAME SR the
+    rest of the app uses — and only falls back to parsing it out of the display
+    name for plants absent from readings. Parsing the name alone fails for the new
+    sheet-naming ("BHARAT 3523(200w)", "Cadila pharma. ANK"), which is what made
+    every row show zone "Unknown"."""
     columns = [
         "plant_group", "plant", "plant_sr_no", "zone",
         "report_date", "feed", "permeate", "passage_pct",
@@ -2695,8 +2760,19 @@ def compute_salt_passage(parameters: pd.DataFrame, mis: pd.DataFrame) -> pd.Data
         return pd.DataFrame(columns=columns)
     wide["passage_pct"] = wide["permeate"] / wide["feed"] * 100.0
 
+    sr_by_plant_name: dict[object, int] = {}
+    if readings is not None and not readings.empty:
+        resolved = readings.dropna(subset=["plant_sr_no"])
+        sr_by_plant_name = dict(
+            zip(resolved["plant"], resolved["plant_sr_no"].astype(int))
+        )
+
+    def resolve_sr(plant_name: object) -> int | None:
+        sr = sr_by_plant_name.get(plant_name)
+        return sr if sr is not None else plant_sr_no_from_name(plant_name)
+
     zone_by_sr = build_zone_by_sr(mis)
-    wide["plant_sr_no"] = wide["plant"].map(plant_sr_no_from_name)
+    wide["plant_sr_no"] = wide["plant"].map(resolve_sr)
     wide["zone"] = wide["plant_sr_no"].map(lambda sr: zone_by_sr.get(sr) or "Unknown")
 
     return (
@@ -3242,7 +3318,7 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
         "the whole RO train. A healthy train passes only a few percent; a high "
         "figure means the membranes are letting salts through plant-wide."
     )
-    passage = compute_salt_passage(params, mis)
+    passage = compute_salt_passage(params, mis, df)
     passage = passage[passage["zone"].isin(active_zones)]
     passage = passage[passage["report_date"] == selected]
     passage = passage[passage["passage_pct"] > SALT_PASSAGE_FLAG_PCT]
