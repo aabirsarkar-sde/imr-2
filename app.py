@@ -3701,10 +3701,16 @@ def extract_imr_from_images(
     raise GeminiUnavailable(str(last_error) if last_error else "Gemini unavailable")
 
 
-# Groq backup: separate infrastructure, so it survives a Gemini overload. Llama 4
-# Scout is multimodal; its vision input is IMAGES ONLY, so PDFs are rasterized to
-# page images first. A notch below Gemini on handwriting — fine for a backup.
-GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+# Groq backup: separate infrastructure, so it survives a Gemini overload. Qwen3.6
+# is multimodal; its vision input is IMAGES ONLY, so PDFs are rasterized to page
+# images first. A notch below Gemini on handwriting — fine for a backup.
+#
+# Groq rotates its catalog and RETIRES models without notice — the previous pick
+# (meta-llama/llama-4-scout-17b-16e-instruct) was decommissioned, which surfaces
+# as a "model does not exist" 404 at call time, NOT a bad key. If that recurs,
+# GET https://api.groq.com/openai/v1/models with the key and pick a current
+# vision model (one that accepts an image_url content part).
+GROQ_MODEL = "qwen/qwen3.6-27b"
 
 
 def _to_images(files: list[tuple[bytes, str]]) -> list[tuple[bytes, str]]:
@@ -3728,7 +3734,7 @@ def _to_images(files: list[tuple[bytes, str]]) -> list[tuple[bytes, str]]:
 
 
 def extract_imr_via_groq(files: list[tuple[bytes, str]], api_key: str) -> dict:
-    """Backup extractor: Groq Llama 4 Scout vision -> parsed JSON dict."""
+    """Backup extractor: Groq Qwen3.6 vision -> parsed JSON dict."""
     import base64
 
     from groq import Groq  # lazy: only needed on fallback
@@ -3770,7 +3776,7 @@ def extract_imr(
             notes.append(f"Gemini error: {str(exc)[:120]}")
     if groq_key:
         try:
-            return extract_imr_via_groq(files, groq_key), "Groq (Llama 4 Scout)"
+            return extract_imr_via_groq(files, groq_key), "Groq (Qwen3.6)"
         except Exception as exc:  # noqa: BLE001
             notes.append(f"Groq error: {str(exc)[:120]}")
     if not gemini_key and not groq_key:
