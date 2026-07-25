@@ -3900,10 +3900,20 @@ reverse-osmosis plant. Return ONLY JSON matching exactly this shape:
 Rules:
 - Transcribe digits exactly as written; do not invent or 'correct' values.
 - If a cell is blank or unreadable, use null (do not guess).
-- 'time_sec' is the "Time for ___ ml" column (the stopwatch reading in seconds);
-  'volume_ml' is the millilitre volume named in that column's header (e.g. 500, 1000).
-- 'flow' is the Total flow (liter/hr) column; it is often blank because the form
-  computes it from the time — read it only if a number is actually written.
+- DECIMAL POINTS ARE CRITICAL. Many numbers here are decimals — preserve the
+  decimal point exactly where written and NEVER drop it or merge the digits.
+  A stopwatch time written "11.47" is the number 11.47, NOT 1147; "8.53" is 8.53,
+  not 853. If you see a dot (or a small gap) between digits, keep it as a decimal.
+- 'time_sec' is the "Time for ___ ml" column (the stopwatch reading in seconds).
+  These are SMALL decimal numbers, almost always between about 3 and 90 seconds
+  (e.g. 11.47, 8.53, 21.4). A bare 3-4 digit integer like 1147 is a decimal whose
+  point was missed — write it as the decimal (11.47).
+- 'volume_ml' is the millilitre volume named in that column's header (e.g. 500, 1000).
+- 'flow' is the Total flow (liter/hr) column. It is DERIVED, not measured:
+  flow = volume_ml / 1000 / (time_sec / 3600) = volume_ml * 3.6 / time_sec. It is
+  usually left blank on the form because it's computed from the time — so return
+  null for 'flow' unless a number is actually handwritten in that column, and let
+  the app compute it from time_sec and volume_ml.
 - 'cond' is the Cond. us/cm column.
 - Keep stage labels and parameter tags verbatim as printed on the form.
 Return only the JSON object, no prose."""
@@ -4083,6 +4093,16 @@ def _stage_block(stage_label: str) -> tuple[int, int, int, int] | None:
     return SCAN_STAGE_BLOCKS.get(token)
 
 
+def compute_scan_flow(time_sec: object, volume_ml: object) -> float | None:
+    """Total flow (L/hr) from the timed-volume method the paper form uses:
+    flow = volume_ml * 3.6 / time_sec. None if either input is missing or zero."""
+    t = pd.to_numeric(time_sec, errors="coerce")
+    v = pd.to_numeric(volume_ml, errors="coerce")
+    if pd.notna(t) and t > 0 and pd.notna(v) and v > 0:
+        return round(float(v) * 3.6 / float(t), 1)
+    return None
+
+
 def fill_imr_template(extracted: dict) -> bytes:
     """Write an extracted/corrected IMR dict into a copy of the finalized template
     and return the workbook bytes."""
@@ -4260,13 +4280,32 @@ def render_scan_page(engine: Engine) -> None:
         )
         mod_df = pd.DataFrame(stage.get("modules") or [],
                               columns=["mo_no", "inst_date", "time_sec", "flow", "cond", "remark"])
+        # Flow is DERIVED (volume × 3.6 ÷ time), so compute and show it rather than
+        # relying on the usually-blank transcribed Flow column. Keep any handwritten
+        # flow only where there's no time to compute from.
+        if volume_ml and volume_ml > 0 and not mod_df.empty:
+            computed = mod_df["time_sec"].map(lambda t: compute_scan_flow(t, volume_ml))
+            mod_df["flow"] = computed.where(computed.notna(), mod_df["flow"])
         edited = st.data_editor(
             mod_df, num_rows="dynamic", width="stretch", key=f"scan_stage_{idx}",
             column_config={
                 "mo_no": "Mo no.", "inst_date": "Inst date", "time_sec": "Time (sec)",
-                "flow": "Flow (L/hr)", "cond": "Cond (uS/cm)", "remark": "Remark",
+                "flow": st.column_config.NumberColumn(
+                    "Flow (L/hr)", help="Auto-computed as volume × 3.6 ÷ time. Edit the time to change it."
+                ),
+                "cond": "Cond (uS/cm)", "remark": "Remark",
             },
         )
+        # A mis-read time (dropped decimal, e.g. 11.47 → 1147) shows up as an
+        # implausibly large time and an absurd flow — flag it for the reviewer.
+        secs = pd.to_numeric(edited["time_sec"], errors="coerce")
+        suspect = edited.loc[secs >= 200, "mo_no"].dropna().tolist()
+        if suspect:
+            st.warning(
+                f"Time looks too large for module(s) {', '.join(map(str, suspect))} "
+                "(≥ 200 s). Handwritten times are usually 3–90 s — check for a missed "
+                "decimal point (e.g. 1147 should be 11.47)."
+            )
         corrected_stages.append({
             "stage_label": stage.get("stage_label"),
             "volume_ml": volume_ml or None,
