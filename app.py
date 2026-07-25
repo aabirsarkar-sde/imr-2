@@ -3410,42 +3410,51 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
         prev_month_text = "—"
         demand_delta = None
 
-    # ----- 1. Headline KPI: modules to replace -----
-    hero_card(
-        "Modules to Replace",
-        f"{need:,}",
-        f"{month_text} — {degraded:,} degraded + {bypassed:,} bypassed "
-        f"across {total_plants:,} plants ({need_pct:.1f}% of {total_modules:,} modules)",
-    )
-
-    # ----- 2. Supporting KPI cards -----
+    # ----- 1. Headline KPI: modules to replace, paired with the membrane count -----
     # Each module houses a fixed number of membranes; the fleet membrane count is
     # that per-module figure times the module count.
     membranes = MEMBRANES_PER_MODULE * total_modules
+    hero_col, mem_col = st.columns([3, 1])
+    with hero_col:
+        hero_card(
+            "Modules to Replace",
+            f"{need:,}",
+            f"{month_text} — {degraded:,} degraded + {bypassed:,} bypassed "
+            f"across {total_plants:,} plants ({need_pct:.1f}% of {total_modules:,} modules)",
+        )
+    with mem_col:
+        # A calmer companion to the hero — same card, blue accent, smaller number.
+        st.markdown(
+            f"""
+            <div class="hero-card" style="border-color:#bfdbfe;
+                 background:linear-gradient(180deg,#eff6ff 0%,#ffffff 70%);height:100%;">
+                <div class="hero-title">Membranes</div>
+                <div class="hero-value" style="color:#2563eb;
+                     font-size:clamp(1.9rem,3.5vw,3rem);">{membranes:,}</div>
+                <div class="hero-subtitle">{MEMBRANES_PER_MODULE} × {total_modules:,} modules</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # ----- 2. Supporting KPI cards -----
     st.markdown("")
-    kpis = st.columns(7)
+    kpis = st.columns(6)
     with kpis[0]:
         metric_card("Plants", f"{total_plants:,}", "in fleet")
     with kpis[1]:
         metric_card("Active Modules", f"{active_modules:,}", f"{total_modules:,} total this month")
     with kpis[2]:
-        metric_card(
-            "Membranes",
-            f"{membranes:,}",
-            f"{MEMBRANES_PER_MODULE} × {total_modules:,} modules",
-            "#2563eb",
-        )
-    with kpis[3]:
         metric_card("Degraded", f"{degraded:,}", "active, IQR or MoM jump", "#d97706")
-    with kpis[4]:
+    with kpis[3]:
         metric_card("Bypassed", f"{bypassed:,}", "offline modules", "#dc2626")
-    with kpis[5]:
+    with kpis[4]:
         metric_card(
             "Last Month Demand",
             f"{prev_need:,}" if prev_need is not None else "—",
             f"modules to replace · {prev_month_text}",
         )
-    with kpis[6]:
+    with kpis[5]:
         if demand_delta is None:
             metric_card("Δ vs Last Month", "—", "no prior month")
         else:
