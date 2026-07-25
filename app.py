@@ -1308,6 +1308,10 @@ def file_fingerprint(path: Path) -> str:
 # values like 2,984,050 uS/cm); blank them rather than let them skew the analysis.
 MAX_PLAUSIBLE_CONDUCTIVITY_US_CM = 50000.0
 
+# Each RO module houses this many membrane elements; fleet membrane count is this
+# times the module count.
+MEMBRANES_PER_MODULE = 184
+
 
 def normalize_reading_records(records: list[dict[str, object]]) -> pd.DataFrame:
     if not records:
@@ -1620,39 +1624,44 @@ def known_zones(plants: pd.DataFrame) -> list[str]:
     return sorted(zs) if zs else list(DEFAULT_ZONES)
 
 
-# A plant's register status. A BLANK status = a normal RO plant expected to submit
-# a monthly IMR. Any of these flags marks an exception — a non-operating state or a
-# non-module RO type — that is NOT expected to report, so it's excluded from the
-# IMR Tracker's roster. (SPRO = spiral RO, UF RO = ultrafiltration RO: these report
-# differently, not as per-module IMRs.)
+# A plant's register status. "Active" (or a blank status) = a normal RO plant
+# expected to submit a monthly IMR. Every other value marks an exception — a
+# non-operating state or a non-module RO type — that is NOT expected to report, so
+# it's excluded from the IMR Tracker's roster. (SPRO = spiral RO, UF RO =
+# ultrafiltration RO: these report differently, not as per-module IMRs.)
 PLANT_STATUS_OPTIONS = [
-    "STRO", "SPRO", "UF RO", "Stand By RO", "Not in Rochem Scope", "Plant Shutdown",
+    "Active", "Inactive", "STRO", "SPRO", "UF RO",
+    "Stand By RO", "Not in Rochem Scope", "Plant Shutdown",
 ]
 _STATUS_ALIASES = {
+    "active": "Active",
+    "inactive": "Inactive",
     "stro": "STRO",
     "spro": "SPRO", "spiral ro": "SPRO", "sp ro": "SPRO",
     "uf ro": "UF RO", "ufro": "UF RO",
     "stand by ro": "Stand By RO", "standby ro": "Stand By RO", "standby": "Stand By RO",
     "not in rochem scope": "Not in Rochem Scope", "out of scope": "Not in Rochem Scope",
-    "plant shutdown": "Plant Shutdown", "shutdown": "Plant Shutdown", "inactive": "Plant Shutdown",
+    "plant shutdown": "Plant Shutdown", "shutdown": "Plant Shutdown",
 }
 
 
 def canonical_status(status: object) -> str | None:
     """Map a raw register status to one of PLANT_STATUS_OPTIONS, or None for a
-    normal reporting plant (blank / 'active' / unrecognized)."""
+    blank/unrecognized status (treated as a normal reporting plant)."""
     if status is None or (isinstance(status, float) and pd.isna(status)):
         return None
     key = re.sub(r"\s+", " ", str(status)).strip().lower()
-    if not key or key == "active":
+    if not key:
         return None
     return _STATUS_ALIASES.get(key)
 
 
 def status_is_reporting(status: object) -> bool:
-    """True if the plant is expected to submit a monthly IMR — i.e. it carries no
-    exception flag (shutdown / standby / out-of-scope / non-module RO type)."""
-    return canonical_status(status) is None
+    """True if the plant is expected to submit a monthly IMR — i.e. Active (or a
+    blank status). Every exception flag (Inactive, shutdown, standby, out-of-scope,
+    non-module RO type) is not expected to report."""
+    canon = canonical_status(status)
+    return canon is None or canon == "Active"
 
 
 def seed_plants_if_empty(engine: Engine, data_dir: str) -> int:
@@ -1705,30 +1714,42 @@ def seed_plants_if_empty(engine: Engine, data_dir: str) -> int:
     return len(frame)
 
 
-def save_plants(engine: Engine, edited: pd.DataFrame) -> int:
-    """Overwrite the whole register with `edited` (full replace, so row deletions
-    in the editor stick). Rows without an SR are dropped, duplicate SRs collapse to
-    the last, zones are canonicalized, status defaults to active. Returns the row
-    count written."""
+def save_plants(
+    engine: Engine, edited: pd.DataFrame, scope_srs: set[int] | None = None
+) -> int:
+    """Persist the edited register rows. Rows without an SR are dropped, duplicate
+    SRs collapse to the last, zones are canonicalized, status defaults to "Active".
+
+    `scope_srs` bounds what the save may delete: when the editor shows a FILTERED
+    view, pass the SR set that was on screen — only those (plus the ones being
+    written) are replaced, so plants hidden by the filter are left untouched. Pass
+    None to replace the whole table (row deletions in a full-table view stick).
+    Returns the number of rows written."""
     clean = edited.copy()
     clean["plant_sr_no"] = pd.to_numeric(clean.get("plant_sr_no"), errors="coerce")
     clean = clean.dropna(subset=["plant_sr_no"])
     clean["plant_sr_no"] = clean["plant_sr_no"].astype(int)
     clean = clean.drop_duplicates("plant_sr_no", keep="last")
     clean["zone"] = clean.get("zone").map(canonicalize_zone) if "zone" in clean else None
-    # Store a canonical exception flag (PLANT_STATUS_OPTIONS) or "active" for a
-    # blank/normal reporting plant.
+    # Store a canonical status (PLANT_STATUS_OPTIONS); blank -> "Active".
     status = clean["status"] if "status" in clean else None
     clean["status"] = pd.Series(status, index=clean.index).map(
-        lambda v: canonical_status(v) or "active"
+        lambda v: canonical_status(v) or "Active"
     )
     for col in ("site_name", "installed_capacity"):
         if col in clean:
             clean[col] = clean[col].map(lambda v: None if pd.isna(v) else (str(v).strip() or None))
     clean["updated_at"] = datetime.now(timezone.utc)
     clean = clean.reindex(columns=PLANTS_COLUMNS)
+
+    kept = set(clean["plant_sr_no"].tolist())
     with engine.begin() as conn:
-        conn.execute(text("DELETE FROM plants"))
+        if scope_srs is None:
+            conn.execute(text("DELETE FROM plants"))
+        else:
+            to_delete = scope_srs | kept  # in-view (removals) + rows being rewritten
+            for sr in to_delete:
+                conn.execute(text("DELETE FROM plants WHERE plant_sr_no = :s"), {"s": int(sr)})
         if not clean.empty:
             clean.to_sql("plants", conn, if_exists="append", index=False,
                          method="multi", chunksize=500)
@@ -3398,23 +3419,33 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
     )
 
     # ----- 2. Supporting KPI cards -----
+    # Each module houses a fixed number of membranes; the fleet membrane count is
+    # that per-module figure times the module count.
+    membranes = MEMBRANES_PER_MODULE * total_modules
     st.markdown("")
-    kpis = st.columns(6)
+    kpis = st.columns(7)
     with kpis[0]:
         metric_card("Plants", f"{total_plants:,}", "in fleet")
     with kpis[1]:
         metric_card("Active Modules", f"{active_modules:,}", f"{total_modules:,} total this month")
     with kpis[2]:
-        metric_card("Degraded", f"{degraded:,}", "active, IQR or MoM jump", "#d97706")
+        metric_card(
+            "Membranes",
+            f"{membranes:,}",
+            f"{MEMBRANES_PER_MODULE} × {total_modules:,} modules",
+            "#2563eb",
+        )
     with kpis[3]:
-        metric_card("Bypassed", f"{bypassed:,}", "offline modules", "#dc2626")
+        metric_card("Degraded", f"{degraded:,}", "active, IQR or MoM jump", "#d97706")
     with kpis[4]:
+        metric_card("Bypassed", f"{bypassed:,}", "offline modules", "#dc2626")
+    with kpis[5]:
         metric_card(
             "Last Month Demand",
             f"{prev_need:,}" if prev_need is not None else "—",
             f"modules to replace · {prev_month_text}",
         )
-    with kpis[5]:
+    with kpis[6]:
         if demand_delta is None:
             metric_card("Δ vs Last Month", "—", "no prior month")
         else:
@@ -4479,14 +4510,42 @@ def render_plant_register(engine: Engine) -> None:
                 st.session_state.setdefault("extra_zones", []).append(z)
             rerun_app()
 
-    grid = plants.reindex(
+    # ----- Status filter/slicer (top of page) -----
+    status_label = (
+        plants["status"].map(lambda v: canonical_status(v) or "Active")
+        if not plants.empty else pd.Series([], dtype=str)
+    )
+    counts = status_label.value_counts()
+    present = [s for s in PLANT_STATUS_OPTIONS if counts.get(s, 0) > 0]
+    fc1, fc2 = st.columns([4, 1])
+    with fc1:
+        picked_status = st.multiselect(
+            "Show statuses",
+            options=PLANT_STATUS_OPTIONS,
+            default=present or PLANT_STATUS_OPTIONS,
+            format_func=lambda s: f"{s} ({int(counts.get(s, 0))})",
+            help="Filter the table to plants with these statuses — e.g. pick only "
+                 "Inactive to review shut-down plants. Editing/saving affects just "
+                 "the rows shown.",
+        )
+    with fc2:
+        st.metric("In view", f"{int(status_label.isin(picked_status).sum())}/{len(plants)}")
+
+    if picked_status and set(picked_status) != set(PLANT_STATUS_OPTIONS):
+        view = plants[status_label.isin(picked_status)]
+    else:
+        view = plants
+    # SRs currently on screen — bounds what a save is allowed to delete.
+    scope_srs = set(pd.to_numeric(view["plant_sr_no"], errors="coerce").dropna().astype(int)) \
+        if not view.empty else set()
+
+    grid = view.reindex(
         columns=["plant_sr_no", "site_name", "zone", "installed_capacity", "status"]
     )
     if grid.empty:
         grid = pd.DataFrame(
             columns=["plant_sr_no", "site_name", "zone", "installed_capacity", "status"]
         )
-    # Blank status = a normal reporting plant; a chosen flag = an exception.
     grid["status"] = grid["status"].map(canonical_status)
 
     edited = st.data_editor(
@@ -4520,7 +4579,10 @@ def render_plant_register(engine: Engine) -> None:
                 "Each plant needs a unique SR No — fix these before saving."
             )
         else:
-            n = save_plants(engine, edited)
+            # Scope the save to the filtered view so hidden plants aren't deleted;
+            # a full-table view (all statuses) does a normal full replace.
+            scope = None if view is plants else scope_srs
+            n = save_plants(engine, edited, scope_srs=scope)
             load_plants.clear()
             load_mis.clear()
             compute_fleet_status.clear()
