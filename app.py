@@ -3411,9 +3411,9 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
         demand_delta = None
 
     # ----- 1. Headline KPI: modules to replace, paired with the membrane count -----
-    # Each module houses a fixed number of membranes; the fleet membrane count is
-    # that per-module figure times the module count.
-    membranes = MEMBRANES_PER_MODULE * total_modules
+    # Each module holds a fixed number of membranes, so the membranes to replace is
+    # the modules-to-replace figure (the hero number) times that per-module count.
+    membranes = MEMBRANES_PER_MODULE * need
     hero_col, mem_col = st.columns([3, 1])
     with hero_col:
         hero_card(
@@ -3428,10 +3428,10 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
             f"""
             <div class="hero-card" style="border-color:#bfdbfe;
                  background:linear-gradient(180deg,#eff6ff 0%,#ffffff 70%);height:100%;">
-                <div class="hero-title">Membranes</div>
+                <div class="hero-title">Membranes to Replace</div>
                 <div class="hero-value" style="color:#2563eb;
                      font-size:clamp(1.9rem,3.5vw,3rem);">{membranes:,}</div>
-                <div class="hero-subtitle">{MEMBRANES_PER_MODULE} × {total_modules:,} modules</div>
+                <div class="hero-subtitle">{MEMBRANES_PER_MODULE} × {need:,} modules</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -4073,7 +4073,11 @@ def extract_imr_from_images(
         types.Part.from_bytes(data=data, mime_type=mime) for data, mime in images
     ]
     parts.append(EXTRACTION_PROMPT)
-    config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
+    # A crowded, multi-page report produces a long JSON; give it plenty of output
+    # room so the reply isn't truncated mid-string (which then fails json.loads).
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json", temperature=0, max_output_tokens=32768,
+    )
 
     # (model, seconds-to-wait-before-this-attempt): try primary, retry primary
     # after a pause, then fall back to a second model.
@@ -4129,14 +4133,14 @@ def _to_images(files: list[tuple[bytes, str]]) -> list[tuple[bytes, str]]:
 
 
 def extract_imr_via_groq(files: list[tuple[bytes, str]], api_key: str) -> dict:
-    """Backup extractor: Groq Qwen3.6 vision -> parsed JSON dict."""
+    """Backup extractor: Groq Qwen3.6 vision -> parsed JSON dict. Qwen vision is
+    images-only, so any PDF is rasterized to page images first."""
     import base64
 
     from groq import Groq  # lazy: only needed on fallback
 
-    images = _to_images(files)
     content: list[dict] = [{"type": "text", "text": EXTRACTION_PROMPT}]
-    for data, mime in images:
+    for data, mime in _to_images(files):
         b64 = base64.b64encode(data).decode("ascii")
         content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
 
@@ -4146,6 +4150,7 @@ def extract_imr_via_groq(files: list[tuple[bytes, str]], api_key: str) -> dict:
         messages=[{"role": "user", "content": content}],
         response_format={"type": "json_object"},
         temperature=0,
+        max_tokens=16384,  # headroom so a long report's JSON isn't cut off
     )
     return _coerce_extracted(json.loads(response.choices[0].message.content or "{}"))
 
@@ -4154,15 +4159,102 @@ class ExtractionFailed(Exception):
     """Every configured provider failed; message lists what happened."""
 
 
+def _looks_like_overflow(exc: Exception) -> bool:
+    """Heuristic: did this failure come from the model's JSON being cut off /
+    rejected because the report was too big for one reply? Those are the cases the
+    per-page fallback fixes (vs. auth/quota errors, which it wouldn't)."""
+    if isinstance(exc, json.JSONDecodeError):
+        return True
+    t = str(exc).lower()
+    return any(
+        s in t for s in (
+            "unterminated", "expecting", "failed to validate json", "json_validate",
+            "max_tokens", "maximum context", "too long", "truncat", "finish_reason",
+        )
+    )
+
+
+def merge_extracted(parts: list[dict]) -> dict:
+    """Combine per-page extractions into one IMR dict: cover fields take the first
+    non-empty value; stages merge by label (their module lists concatenate, deduped
+    by Mo No); parameters concatenate, deduped by tag."""
+    merged: dict = {
+        "plant_sr_no": None, "report_date": None, "zone": None,
+        "site_name": None, "plant_capacity": None, "stages": [], "parameters": [],
+    }
+    stage_by_key: dict[str, dict] = {}
+    param_by_tag: dict[str, dict] = {}
+
+    def empty(v: object) -> bool:
+        return v is None or (isinstance(v, str) and not v.strip())
+
+    for raw in parts:
+        page = _coerce_extracted(raw)
+        for field in ("plant_sr_no", "report_date", "zone", "site_name", "plant_capacity"):
+            if empty(merged[field]) and not empty(page.get(field)):
+                merged[field] = page.get(field)
+        for stage in page.get("stages") or []:
+            key = str(stage.get("stage_label") or "").strip().upper()
+            tgt = stage_by_key.setdefault(
+                key, {"stage_label": stage.get("stage_label"), "volume_ml": None, "modules": []}
+            )
+            if empty(tgt["volume_ml"]) and not empty(stage.get("volume_ml")):
+                tgt["volume_ml"] = stage.get("volume_ml")
+            seen = {m.get("mo_no") for m in tgt["modules"]}
+            for module in stage.get("modules") or []:
+                mo = module.get("mo_no")
+                if mo is None or mo not in seen:
+                    tgt["modules"].append(module)
+                    seen.add(mo)
+        for param in page.get("parameters") or []:
+            tag = normalize_text(param.get("tag"))
+            if tag and tag not in param_by_tag:
+                param_by_tag[tag] = param
+
+    merged["stages"] = list(stage_by_key.values())
+    merged["parameters"] = list(param_by_tag.values())
+    return merged
+
+
+def _extract_paged(call, files: list[tuple[bytes, str]]) -> dict:
+    """Run `call` on the whole document at once; if that fails because the reply
+    overflowed (crowded/multi-page report), rasterize to pages and extract each
+    page separately, then merge. `call` takes a list of (bytes, mime) items — the
+    whole document for the one-shot, a single page image for the per-page pass —
+    and returns a parsed dict."""
+    try:
+        return call(files)
+    except Exception as exc:  # noqa: BLE001
+        if not _looks_like_overflow(exc):
+            raise
+        pages = _to_images(files)
+        if len(pages) <= 1:
+            raise
+        results, errors = [], []
+        for page in pages:
+            try:
+                results.append(call([page]))
+            except Exception as page_exc:  # noqa: BLE001 - skip a bad page, keep the rest
+                errors.append(str(page_exc)[:80])
+        if not results:
+            raise ExtractionFailed("per-page extraction failed: " + " | ".join(errors[:3])) from exc
+        return merge_extracted(results)
+
+
 def extract_imr(
     files: list[tuple[bytes, str]], gemini_key: str | None, groq_key: str | None
 ) -> tuple[dict, str]:
-    """Extract with Gemini (primary); fall back to Groq on any Gemini failure.
-    Returns (data, provider_label). Raises ExtractionFailed if all providers fail."""
+    """Extract with Gemini (primary); fall back to Groq on any Gemini failure. Each
+    provider first tries the whole document in one call, then — if the reply
+    overflowed (crowded/multi-page report) — falls back to per-page extraction and
+    merges. Returns (data, provider_label); raises ExtractionFailed if all fail."""
     notes: list[str] = []
     if gemini_key:
         try:
-            return extract_imr_from_images(files, SCAN_MODEL, gemini_key), "Gemini (2.5-flash)"
+            data = _extract_paged(
+                lambda imgs: extract_imr_from_images(imgs, SCAN_MODEL, gemini_key), files
+            )
+            return data, "Gemini (2.5-flash)"
         except GeminiRateLimited:
             notes.append("Gemini hit its free-tier limit (429)")
         except GeminiUnavailable:
@@ -4171,7 +4263,8 @@ def extract_imr(
             notes.append(f"Gemini error: {str(exc)[:120]}")
     if groq_key:
         try:
-            return extract_imr_via_groq(files, groq_key), "Groq (Qwen3.6)"
+            data = _extract_paged(lambda imgs: extract_imr_via_groq(imgs, groq_key), files)
+            return data, "Groq (Qwen3.6)"
         except Exception as exc:  # noqa: BLE001
             notes.append(f"Groq error: {str(exc)[:120]}")
     if not gemini_key and not groq_key:
