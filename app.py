@@ -1620,6 +1620,41 @@ def known_zones(plants: pd.DataFrame) -> list[str]:
     return sorted(zs) if zs else list(DEFAULT_ZONES)
 
 
+# A plant's register status. A BLANK status = a normal RO plant expected to submit
+# a monthly IMR. Any of these flags marks an exception — a non-operating state or a
+# non-module RO type — that is NOT expected to report, so it's excluded from the
+# IMR Tracker's roster. (SPRO = spiral RO, UF RO = ultrafiltration RO: these report
+# differently, not as per-module IMRs.)
+PLANT_STATUS_OPTIONS = [
+    "STRO", "SPRO", "UF RO", "Stand By RO", "Not in Rochem Scope", "Plant Shutdown",
+]
+_STATUS_ALIASES = {
+    "stro": "STRO",
+    "spro": "SPRO", "spiral ro": "SPRO", "sp ro": "SPRO",
+    "uf ro": "UF RO", "ufro": "UF RO",
+    "stand by ro": "Stand By RO", "standby ro": "Stand By RO", "standby": "Stand By RO",
+    "not in rochem scope": "Not in Rochem Scope", "out of scope": "Not in Rochem Scope",
+    "plant shutdown": "Plant Shutdown", "shutdown": "Plant Shutdown", "inactive": "Plant Shutdown",
+}
+
+
+def canonical_status(status: object) -> str | None:
+    """Map a raw register status to one of PLANT_STATUS_OPTIONS, or None for a
+    normal reporting plant (blank / 'active' / unrecognized)."""
+    if status is None or (isinstance(status, float) and pd.isna(status)):
+        return None
+    key = re.sub(r"\s+", " ", str(status)).strip().lower()
+    if not key or key == "active":
+        return None
+    return _STATUS_ALIASES.get(key)
+
+
+def status_is_reporting(status: object) -> bool:
+    """True if the plant is expected to submit a monthly IMR — i.e. it carries no
+    exception flag (shutdown / standby / out-of-scope / non-module RO type)."""
+    return canonical_status(status) is None
+
+
 def seed_plants_if_empty(engine: Engine, data_dir: str) -> int:
     """Populate the editable plant register once, only if it's empty. Seeds from
     the O&M list on disk; if that's not present, falls back to any zoned rows
@@ -1681,10 +1716,11 @@ def save_plants(engine: Engine, edited: pd.DataFrame) -> int:
     clean["plant_sr_no"] = clean["plant_sr_no"].astype(int)
     clean = clean.drop_duplicates("plant_sr_no", keep="last")
     clean["zone"] = clean.get("zone").map(canonicalize_zone) if "zone" in clean else None
-    status = clean["status"] if "status" in clean else "active"
-    clean["status"] = (
-        pd.Series(status, index=clean.index).fillna("active").astype(str).str.lower()
-        .replace("", "active")
+    # Store a canonical exception flag (PLANT_STATUS_OPTIONS) or "active" for a
+    # blank/normal reporting plant.
+    status = clean["status"] if "status" in clean else None
+    clean["status"] = pd.Series(status, index=clean.index).map(
+        lambda v: canonical_status(v) or "active"
     )
     for col in ("site_name", "installed_capacity"):
         if col in clean:
@@ -1907,7 +1943,8 @@ def load_plants() -> pd.DataFrame:
         return pd.DataFrame(columns=PLANTS_COLUMNS)
     df["zone"] = df["zone"].map(canonicalize_zone)
     if "status" in df:
-        df["status"] = df["status"].fillna("active").astype(str).str.lower()
+        # Keep the stored casing (e.g. "Plant Shutdown"); logic normalizes as needed.
+        df["status"] = df["status"].fillna("active").astype(str).str.strip()
     return df.sort_values(["zone", "plant_sr_no"], na_position="last").reset_index(drop=True)
 
 
@@ -2245,18 +2282,25 @@ def render_parse_preview(result: ParseResult) -> None:
         st.caption("Nothing was extracted from this file.")
 
 
-def render_staged_reports(engine: Engine) -> None:
-    """Render the pending-review queue: per-file stats + quality issues + a
-    Confirm/Discard pair. Confirm commits to the live tables; nothing is written
-    until then."""
+def render_staged_review(engine: Engine) -> None:
+    """Main-area review of just-uploaded reports: an Excel-like preview of each
+    workbook, its quality flags, and the rows that will be committed — with a
+    Confirm/Discard pair. Nothing is written until Confirm. Renders nothing when
+    no uploads are pending."""
     staged = st.session_state.get("staged", {})
     if not staged:
         return
-    st.markdown("**Pending review**")
+
+    st.title("📥 Review uploaded reports")
+    st.caption(
+        "Preview each workbook exactly as uploaded, check the quality flags, then "
+        "Confirm to commit or Discard. Nothing is saved to the database until you Confirm."
+    )
+
     for name in list(staged):
         entry = staged[name]
         with st.container(border=True):
-            st.markdown(f"**{name}**")
+            st.subheader(name)
             if "error" in entry:
                 st.error(f"Could not parse: {entry['error']}")
                 if st.button("Discard", key=f"discard_{name}"):
@@ -2281,19 +2325,23 @@ def render_staged_reports(engine: Engine) -> None:
             for issue in issues:
                 ISSUE_RENDERERS.get(issue.level, st.info)(issue.message)
 
-            with st.expander("🔍 Preview extracted data"):
+            # The star of the review: the workbook rendered like a real spreadsheet.
+            render_excel_workbook(entry["data"], name, key=f"staged_{name}")
+
+            with st.expander("Rows that will be committed to the database"):
                 render_parse_preview(result)
 
             blocked = any(i.level == "ERROR" for i in issues)
             ok_col, no_col = st.columns(2)
             if ok_col.button(
-                "Confirm & commit", key=f"commit_{name}", type="primary", disabled=blocked
+                "✓ Confirm & commit", key=f"commit_{name}", type="primary", disabled=blocked
             ):
                 commit_parse_result(engine, name, entry["content_hash"], result)
                 store_report_bytes(engine, name, entry["content_hash"], entry["data"])
                 load_readings.clear()
                 load_parameters.clear()
                 load_mis.clear()
+                load_plants.clear()
                 compute_fleet_status.clear()
                 staged.pop(name, None)
                 st.success(f"Committed {name}.")
@@ -3786,7 +3834,12 @@ def render_data_manager(engine: Engine) -> None:
             stage_uploaded_files(engine, uploaded_files or [])
             rerun_app()
 
-        render_staged_reports(engine)
+        pending = st.session_state.get("staged", {})
+        if pending:
+            st.info(
+                f"📥 {len(pending)} file(s) awaiting review in the main panel → "
+                "check the Excel preview, then Confirm or Discard."
+            )
 
         # --- Re-parse a stored report through the same gate ---
         stored = report_files_index(engine)
@@ -4372,15 +4425,16 @@ def render_scan_page(engine: Engine) -> None:
 
 
 def build_submission_roster(plants: pd.DataFrame) -> pd.DataFrame:
-    """The roster of plants expected to report: every ACTIVE plant in the register,
-    with its zone and site name. A shut-down (inactive) plant is not expected to
-    report, so it's excluded here (but kept in the register for history)."""
+    """The roster of plants expected to report: every register plant with a normal
+    (blank) status. A plant flagged with any exception status (Plant Shutdown,
+    Stand By RO, Not in Rochem Scope, STRO/SPRO/UF RO) is not expected to submit an
+    IMR, so it's excluded here — but kept in the register for history."""
     cols = ["plant_sr_no", "zone", "site_name"]
     if plants is None or plants.empty:
         return pd.DataFrame(columns=cols)
     active = plants.dropna(subset=["plant_sr_no"]).copy()
     if "status" in active:
-        active = active[active["status"].fillna("active").astype(str).str.lower() != "inactive"]
+        active = active[active["status"].map(status_is_reporting)]
     if active.empty:
         return pd.DataFrame(columns=cols)
     active["plant_sr_no"] = active["plant_sr_no"].astype(int)
@@ -4432,9 +4486,8 @@ def render_plant_register(engine: Engine) -> None:
         grid = pd.DataFrame(
             columns=["plant_sr_no", "site_name", "zone", "installed_capacity", "status"]
         )
-    grid["status"] = (
-        grid["status"].fillna("active").astype(str).str.capitalize().replace("", "Active")
-    )
+    # Blank status = a normal reporting plant; a chosen flag = an exception.
+    grid["status"] = grid["status"].map(canonical_status)
 
     edited = st.data_editor(
         grid,
@@ -4448,7 +4501,10 @@ def render_plant_register(engine: Engine) -> None:
             "zone": st.column_config.SelectboxColumn("Zone", options=zones, width="medium"),
             "installed_capacity": st.column_config.TextColumn("Capacity", width="small"),
             "status": st.column_config.SelectboxColumn(
-                "Status", options=["Active", "Inactive"], width="small"
+                "Status", options=PLANT_STATUS_OPTIONS, width="medium",
+                help="Leave blank for a normal RO plant that reports monthly. Pick a "
+                     "flag to mark an exception — any flag excludes the plant from the "
+                     "IMR Tracker's expected list (but keeps it in the register).",
             ),
         },
     )
@@ -4476,8 +4532,8 @@ def render_plant_register(engine: Engine) -> None:
             rerun_app()
 
     if not plants.empty:
-        active = (
-            int((plants["status"].fillna("active").str.lower() != "inactive").sum())
+        reporting = (
+            int(plants["status"].map(status_is_reporting).sum())
             if "status" in plants else len(plants)
         )
         tally = " · ".join(
@@ -4485,7 +4541,10 @@ def render_plant_register(engine: Engine) -> None:
             plants["zone"].map(canonicalize_zone).fillna("Unknown")
             .value_counts().sort_index().items()
         )
-        st.caption(f"{len(plants)} plants ({active} active) · {tally}")
+        st.caption(
+            f"{len(plants)} plants ({reporting} reporting, "
+            f"{len(plants) - reporting} flagged) · {tally}"
+        )
 
 
 def render_input_tracker(df: pd.DataFrame, plants: pd.DataFrame) -> None:
@@ -5015,44 +5074,40 @@ def render_imr_preview(engine: Engine) -> None:
         key="preview_download_original",
     )
 
-    # Open with openpyxl (data_only=True shows cached values, not formulas).
+    render_excel_workbook(data, choice, key="imr_preview")
+
+
+def render_excel_workbook(data: bytes, label: str, key: str) -> None:
+    """Render raw Excel bytes as an Excel-like preview — a spreadsheet grid with
+    sheet tabs, column-letter headers, a row-number gutter, merged cells and
+    gridlines. Shared by the IMR Preview page and the upload-review panel."""
     from openpyxl import load_workbook as _load_wb
     try:
         wb = _load_wb(io.BytesIO(data), read_only=False, data_only=True)
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Could not open **{choice}** as an Excel workbook: {exc}")
+        st.error(f"Could not open **{label}** as an Excel workbook: {exc}")
         return
 
     sheet_names = wb.sheetnames
     if not sheet_names:
         st.warning("The workbook has no sheets.")
+        wb.close()
         return
 
-    # Inject the Excel-look CSS.
     st.markdown(EXCEL_PREVIEW_CSS, unsafe_allow_html=True)
-
-    # Toolbar mock (read-only indicator).
     st.markdown(
         f'<div class="xl-toolbar">'
-        f'<span>📗 {choice}</span>'
+        f'<span>📗 {label}</span>'
         f'<span>{len(sheet_names)} sheet{"s" if len(sheet_names) != 1 else ""}</span>'
         f'<span>Read-only preview</span>'
         f'</div>',
         unsafe_allow_html=True,
     )
-
-    # Sheet tab selector.
     picked_sheet = st.radio(
-        "Sheet",
-        sheet_names,
-        horizontal=True,
-        key="preview_sheet_tab",
-        label_visibility="collapsed",
+        "Sheet", sheet_names, horizontal=True,
+        key=f"{key}_sheet_tab", label_visibility="collapsed",
     )
-
     ws = wb[picked_sheet]
-
-    # Formula bar.
     dims = f"{ws.max_row or 0} rows × {ws.max_column or 0} cols"
     st.markdown(
         f'<div class="xl-formula-bar">'
@@ -5061,11 +5116,10 @@ def render_imr_preview(engine: Engine) -> None:
         f'</div>',
         unsafe_allow_html=True,
     )
-
-    # Render the sheet.
-    html = _render_sheet_as_excel_html(ws, max_rows=200, max_cols=None)
-    st.markdown(html, unsafe_allow_html=True)
-
+    st.markdown(
+        _render_sheet_as_excel_html(ws, max_rows=200, max_cols=None),
+        unsafe_allow_html=True,
+    )
     wb.close()
 
 
@@ -5266,7 +5320,13 @@ def main() -> None:
             ),
         ]
     )
-    pages.run()
+    # A just-uploaded report takes over the main panel for review (Excel preview +
+    # Confirm/Discard); the sidebar nav stays put. Once nothing is pending, the
+    # selected page renders normally.
+    if st.session_state.get("staged"):
+        render_staged_review(engine)
+    else:
+        pages.run()
 
 
 if __name__ == "__main__":
