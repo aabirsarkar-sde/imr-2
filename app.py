@@ -10,7 +10,7 @@ import shutil
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -4000,15 +4000,57 @@ def render_data_manager(engine: Engine) -> None:
 # --------------------------------------------------------------------------- #
 SCAN_ZONES = ["Ahmedabad", "Vadodara", "Ankleshwar", "Panoli", "Jhagadia", "Dahej", "Vapi"]
 SCAN_MODEL = "gemini-2.5-flash"
-TEMPLATE_PATH = APP_DIR / "templates" / "IMR_template.xlsx"
 
-# Where each value lands in templates/IMR_template.xlsx (verified cell map).
-SCAN_STAGE_BLOCKS = {  # leading roman numeral -> (mo, inst, flow, cond) columns
-    "I": (1, 2, 5, 6),       # A B E F
-    "II": (8, 9, 12, 13),    # H I L M
-    "III": (15, 16, 19, 20), # O P S T
+# The scan page emits its workbook by GENERATING a sheet shaped to the data,
+# rather than pouring the data into a fixed template grid. The old fixed grid had
+# room for three stages of 23 modules and silently dropped everything past that —
+# a IV STAGE outright, and 37 of Superform's 60 third-stage modules.
+#
+# Generating is safe because the workbook is transport, not an archive: the
+# operator reviews and corrects every value in the on-page editor, and the file
+# exists only to carry that reviewed data into the SAME block parser that reads
+# real IMR workbooks. That parser is driven entirely by cell text and relative
+# position (find_header_row -> find_module_blocks -> extract_rows_from_sheet,
+# plus read_cover_block and extract_operating_parameters) and never looks at
+# fonts, borders or merges — so the sheet is emitted plain, and the only thing
+# that must be preserved verbatim is the header/label/unit WORDING below.
+SCAN_BLOCK_WIDTH = 7          # 6 columns per stage + a spacer, as on the paper form
+SCAN_COVER_ROWS = (3, 4, 5)   # within read_cover_block's first-14-rows search window
+SCAN_STAGE_LABEL_ROW = 7      # find_stage_label scans up from the header row
+SCAN_HEADER_ROW = 8
+SCAN_DATA_ROW = 9
+
+# Column headers, verbatim: is_module_header / is_install_date_header /
+# is_time_header / is_flow_header / is_conductivity_header key off these words.
+SCAN_BLOCK_HEADERS = [
+    "Mo no.", "Inst Date", "Time for ______ ml",
+    "Colour/ Non Colour", "Total flow liter/hr.", "Cond.    us/cm",
+]
+
+# extract_operating_parameters identifies a reading by its UNIT cell, so a
+# parameter written without one is invisible to the parser. The extractor only
+# returns (tag, value), so the unit is restored here — by exact tag where the
+# form names it, else by instrument prefix so a tag we haven't seen still lands.
+SCAN_PARAM_UNITS = {
+    "ph 141": "-", "ti 151": "deg. C", "reject cond": "us/cm",
+    "feed flow": "m3/hr", "permeat flow": "m3/hr", "permeate flow": "m3/hr",
 }
-SCAN_DATA_TOP, SCAN_DATA_BOTTOM = 10, 32
+SCAN_PARAM_UNIT_BY_PREFIX = {
+    "pi": "bar", "cis": "us/cm", "ci": "us/cm",
+    "fis": "lit/hrs.", "fi": "lit/hrs.", "ti": "deg. C", "ph": "-",
+}
+
+
+def scan_param_unit(tag: object) -> str | None:
+    """The unit to write beside an extracted operating parameter, or None if the
+    tag is unrecognizable (in which case it can't round-trip and is skipped)."""
+    norm = normalize_text(tag)
+    if not norm:
+        return None
+    if norm in SCAN_PARAM_UNITS:
+        return SCAN_PARAM_UNITS[norm]
+    prefix = norm.split()[0] if norm.split() else ""
+    return SCAN_PARAM_UNIT_BY_PREFIX.get(prefix)
 
 EXTRACTION_PROMPT = """You are reading a handwritten "Individual Module Report (IMR)" for a
 reverse-osmosis plant. Return ONLY JSON matching exactly this shape:
@@ -4080,6 +4122,14 @@ class GeminiUnavailable(Exception):
     """Model is transiently overloaded (503/500/UNAVAILABLE) after retries."""
 
 
+class GeminiTruncated(Exception):
+    """The reply hit the output ceiling and stopped mid-JSON, so it won't parse.
+
+    Worth its own type because the raw symptom is a json.loads error deep in the
+    string ("Expecting property name ... char 3225"), which reads like a model
+    quality problem when it is really a budget problem."""
+
+
 # When the primary model is overloaded, fall back to a second model alias whose
 # pool is usually separate. Same family, still free.
 SCAN_FALLBACK_MODEL = "gemini-flash-latest"
@@ -4105,8 +4155,9 @@ def extract_imr_from_images(
 
     Resilient to the transient overloads (503 UNAVAILABLE) Gemini throws under load:
     retries the primary model with backoff, then tries a fallback model. Raises
-    GeminiRateLimited on a 429 (wait for quota) and GeminiUnavailable if every
-    attempt is overloaded."""
+    GeminiRateLimited on a 429 (wait for quota), GeminiTruncated if the reply kept
+    running out of output room, and GeminiUnavailable if every attempt is
+    overloaded."""
     from google import genai  # lazy: only needed on this page
     from google.genai import types
 
@@ -4115,31 +4166,90 @@ def extract_imr_from_images(
         types.Part.from_bytes(data=data, mime_type=mime) for data, mime in images
     ]
     parts.append(EXTRACTION_PROMPT)
-    # A crowded, multi-page report produces a long JSON; give it plenty of output
-    # room so the reply isn't truncated mid-string (which then fails json.loads).
-    config = types.GenerateContentConfig(
-        response_mime_type="application/json", temperature=0, max_output_tokens=32768,
-    )
+
+    def build_config(drop_thinking: bool) -> object:
+        # A 4-stage, 120-module form runs to ~10k output tokens, and on a thinking
+        # model the deliberation is charged against the SAME ceiling (a real run
+        # here: 9,167 thinking + 9,575 JSON). Ask for the model's full 65,536 so a
+        # long report can't be cut off mid-JSON. Thinking is left ON by default —
+        # it earns its keep on smudged handwriting — and only surrendered on a
+        # retry that already truncated, where the output room matters more.
+        kwargs: dict[str, object] = {
+            "response_mime_type": "application/json",
+            "temperature": 0,
+            "max_output_tokens": 65536,
+        }
+        if drop_thinking:
+            kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+        return types.GenerateContentConfig(**kwargs)
 
     # (model, seconds-to-wait-before-this-attempt): try primary, retry primary
     # after a pause, then fall back to a second model.
     attempts = [(model, 0.0), (model, 2.0), (SCAN_FALLBACK_MODEL, 3.0)]
     last_error: Exception | None = None
+    truncated = False
     for mdl, wait in attempts:
         if wait:
             time.sleep(wait)
         try:
-            response = client.models.generate_content(model=mdl, contents=parts, config=config)
-            return _coerce_extracted(json.loads(response.text or "{}"))
+            response = client.models.generate_content(
+                model=mdl, contents=parts, config=build_config(truncated)
+            )
         except Exception as exc:  # noqa: BLE001
-            text = str(exc).lower()
-            if "429" in text or "resource_exhausted" in text or "quota" in text:
+            if _is_quota_error(exc):
                 raise GeminiRateLimited(str(exc)) from exc
-            if any(s in text for s in ("503", "500", "unavailable", "overload", "internal")):
+            if _is_transient_error(exc):
                 last_error = exc
                 continue  # transient — try again / fall back
             raise  # a real error (bad request, auth, etc.) — surface it
+
+        # A reply that ran out of room stops mid-JSON, so json.loads fails with an
+        # offset deep in the string. Name it here instead of letting the parser
+        # error stand in for it, and retry with the thinking budget surrendered.
+        if _hit_output_ceiling(response):
+            truncated = True
+            last_error = GeminiTruncated(
+                f"{mdl} ran out of output room and stopped mid-JSON "
+                "(the form is too dense for one reply)."
+            )
+            continue
+        try:
+            return _coerce_extracted(json.loads(response.text or "{}"))
+        except json.JSONDecodeError as exc:
+            # Malformed (not truncated) JSON is the single most retryable failure
+            # there is, and it used to be the one failure that fell straight
+            # through to `raise` without ever reaching the fallback model.
+            last_error = exc
+            continue
+
+    if isinstance(last_error, GeminiTruncated):
+        raise GeminiTruncated(str(last_error))
     raise GeminiUnavailable(str(last_error) if last_error else "Gemini unavailable")
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return bool(re.search(r"\b429\b", text)) or "resource_exhausted" in text or "quota" in text
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """Server-side blips worth retrying. The status codes are matched on word
+    boundaries: a bare `"500" in text` also fires on any error whose message
+    happens to contain a number like 3500, which silently miscategorises
+    unrelated failures as retryable."""
+    text = str(exc).lower()
+    if re.search(r"\b(500|502|503|504)\b", text):
+        return True
+    return any(s in text for s in ("unavailable", "overload", "internal", "deadline"))
+
+
+def _hit_output_ceiling(response: object) -> bool:
+    """True if the reply stopped because it hit max_output_tokens."""
+    candidates = getattr(response, "candidates", None) or []
+    for cand in candidates:
+        if "MAX_TOKENS" in str(getattr(cand, "finish_reason", "")).upper():
+            return True
+    return False
 
 
 # Groq backup: separate infrastructure, so it survives a Gemini overload. Qwen3.6
@@ -4205,7 +4315,7 @@ def _looks_like_overflow(exc: Exception) -> bool:
     """Heuristic: did this failure come from the model's JSON being cut off /
     rejected because the report was too big for one reply? Those are the cases the
     per-page fallback fixes (vs. auth/quota errors, which it wouldn't)."""
-    if isinstance(exc, json.JSONDecodeError):
+    if isinstance(exc, (json.JSONDecodeError, GeminiTruncated)):
         return True
     t = str(exc).lower()
     return any(
@@ -4301,6 +4411,11 @@ def extract_imr(
             notes.append("Gemini hit its free-tier limit (429)")
         except GeminiUnavailable:
             notes.append("Gemini was overloaded (503)")
+        except GeminiTruncated:
+            notes.append(
+                "Gemini ran out of output room on this form (too many modules for "
+                "one reply) — split the photo by stage and scan the halves"
+            )
         except Exception as exc:  # noqa: BLE001
             notes.append(f"Gemini error: {str(exc)[:120]}")
     if groq_key:
@@ -4314,13 +4429,6 @@ def extract_imr(
     raise ExtractionFailed(" → ".join(notes))
 
 
-def _stage_block(stage_label: str) -> tuple[int, int, int, int] | None:
-    """Map a stage label (e.g. 'III STAGE (PT)') to its block columns by the
-    leading roman numeral."""
-    token = str(stage_label).strip().upper().split()[0] if str(stage_label).strip() else ""
-    return SCAN_STAGE_BLOCKS.get(token)
-
-
 def compute_scan_flow(time_sec: object, volume_ml: object) -> float | None:
     """Total flow (L/hr) from the timed-volume method the paper form uses:
     flow = volume_ml * 3.6 / time_sec. None if either input is missing or zero."""
@@ -4331,86 +4439,139 @@ def compute_scan_flow(time_sec: object, volume_ml: object) -> float | None:
     return None
 
 
-def fill_imr_template(extracted: dict) -> bytes:
-    """Write an extracted/corrected IMR dict into a copy of the finalized template
-    and return the workbook bytes."""
+def _scan_cell(value: object) -> object:
+    """Blank cells from the editor arrive as NaN/empty string; keep them empty so
+    the sheet never shows a literal 'nan'."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
+def _scan_date(value: object) -> object:
+    """Write dates as real date cells, never as text.
+
+    read_cover_block parses a TEXT date with dayfirst=True, because hand-filled
+    forms write dd/mm — which silently turns our own ISO "2026-07-09" into 7 Sep,
+    a future month the reader then discards, losing the report date entirely. A
+    real date cell takes its unambiguous datetime branch instead.
+
+    ONLY an exact ISO date is converted. The date field is free text in the
+    editor, so anything else may well be a hand-typed "09/07/2026" — that has to
+    stay text and reach read_cover_block's dayfirst rule, or converting it here
+    would read it month-first and land on the wrong month, which is the very bug
+    this function exists to prevent."""
+    cleaned = _scan_cell(value)
+    if cleaned is None:
+        return None
+    if isinstance(cleaned, (datetime, date)):
+        return cleaned
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(cleaned).strip()):
+        return cleaned
+    parsed = pd.to_datetime(str(cleaned).strip(), errors="coerce")
+    return parsed.date() if pd.notna(parsed) else cleaned
+
+
+def build_imr_workbook(extracted: dict) -> bytes:
+    """Render an extracted/corrected IMR dict as a workbook the ingest parser reads.
+
+    One stage block per stage found, each exactly as tall as its own module list,
+    laid out left to right with SCAN_BLOCK_WIDTH columns apiece. Nothing is capped
+    and no stage is special-cased, so a IV STAGE or a 60-module stage comes through
+    whole. See the SCAN_* constants for why generating this is safe and which
+    strings the parser depends on."""
     import openpyxl
     from openpyxl.utils import get_column_letter
 
-    def clean(v: object) -> object:
-        """Blank cells from the editor arrive as NaN/''; keep them empty so the
-        sheet never shows a literal 'nan'."""
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return None
-        if isinstance(v, str) and not v.strip():
-            return None
-        return v
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "IMR"
+    ws["A1"] = "INDIVIDUAL MODULE REPORT (IMR)"
 
-    wb = openpyxl.load_workbook(TEMPLATE_PATH)
-    ws = wb["IMR"]
+    # Cover: read_cover_block searches the first 14 rows x 12 columns for a label
+    # and takes the first non-empty cell to its right.
+    sr_row, site_row, cap_row = SCAN_COVER_ROWS
+    ws.cell(row=sr_row, column=1, value="PLANT SR NO :-")
+    ws.cell(row=sr_row, column=2, value=_scan_cell(extracted.get("plant_sr_no")))
+    ws.cell(row=sr_row, column=4, value="REPORT DATE :-")
+    ws.cell(row=sr_row, column=5, value=_scan_date(extracted.get("report_date")))
+    ws.cell(row=site_row, column=1, value="SITE NAME :-")
+    ws.cell(row=site_row, column=2, value=_scan_cell(extracted.get("site_name")))
+    ws.cell(row=site_row, column=4, value="ZONE :-")
+    ws.cell(row=site_row, column=5, value=_scan_cell(extracted.get("zone")))
+    ws.cell(row=cap_row, column=1, value="PLANT CAPACITY :-")
+    ws.cell(row=cap_row, column=2, value=_scan_cell(extracted.get("plant_capacity")))
 
-    # cover
-    ws["C4"] = clean(extracted.get("plant_sr_no"))
-    ws["J4"] = clean(extracted.get("report_date"))
-    ws["C5"] = clean(extracted.get("site_name"))
-    ws["J5"] = clean(extracted.get("zone"))
-    ws["C6"] = clean(extracted.get("plant_capacity"))
-
-    # stage grids
-    for stage in extracted.get("stages") or []:
-        cols = _stage_block(stage.get("stage_label", ""))
-        if not cols:
-            continue
-        mo_c, inst_c, flow_c, cond_c = cols
-        time_c = mo_c + 2  # the "Time for ___ ml" column sits two right of Mo no.
+    stages = [s for s in (extracted.get("stages") or []) if s]
+    last_data_row = SCAN_DATA_ROW
+    for index, stage in enumerate(stages):
+        base = 1 + index * SCAN_BLOCK_WIDTH  # 1-based first column of this block
+        mo_c, inst_c, time_c, flow_c, cond_c = base, base + 1, base + 2, base + 4, base + 5
         time_letter = get_column_letter(time_c)
-        # keep the printed stage label verbatim on the band (row 8 = block start)
-        ws.cell(row=8, column=mo_c, value=stage.get("stage_label"))
-        # Fill the timed volume into the header so the live flow formula is
-        # self-documenting; numerator = volume_ml / 1000 * 3600 = volume_ml * 3.6.
+
+        ws.cell(row=SCAN_STAGE_LABEL_ROW, column=mo_c,
+                value=stage.get("stage_label") or f"STAGE {index + 1}")
+        for offset, header in enumerate(SCAN_BLOCK_HEADERS):
+            ws.cell(row=SCAN_HEADER_ROW, column=base + offset, value=header)
+
+        # Naming the timed volume in the header is what lets parse_volume_ml pick
+        # it up downstream, so flow can be re-derived from the stopwatch reading.
         volume_ml = pd.to_numeric(stage.get("volume_ml"), errors="coerce")
         numerator = None
         if pd.notna(volume_ml) and volume_ml > 0:
-            ws.cell(row=9, column=time_c, value=f"Time for {volume_ml:g} ml")
-            numerator = volume_ml * 3.6
-        modules = (stage.get("modules") or [])[: SCAN_DATA_BOTTOM - SCAN_DATA_TOP + 1]
-        for i, m in enumerate(modules):
-            mo = clean(m.get("mo_no"))
-            if mo is None:
-                continue  # skip blank editor rows
-            r = SCAN_DATA_TOP + i
-            ws.cell(row=r, column=mo_c, value=mo)
-            ws.cell(row=r, column=inst_c, value=clean(m.get("inst_date")))
-            remark = str(clean(m.get("remark")) or "")
-            if "by pass" in remark.lower() or "bypass" in remark.lower():
-                ws.cell(row=r, column=cond_c, value="BY PASS")
-            else:
-                seconds = pd.to_numeric(m.get("time_sec"), errors="coerce")
-                ws.cell(row=r, column=time_c, value=float(seconds) if pd.notna(seconds) else None)
-                # With both the timed volume and the reading, write the same live
-                # formula the paper form uses so editing the time updates the flow;
-                # otherwise fall back to the transcribed flow number.
-                if numerator is not None and pd.notna(seconds) and seconds != 0:
-                    ws.cell(row=r, column=flow_c, value=f"={numerator:g}/{time_letter}{r}")
-                else:
-                    ws.cell(row=r, column=flow_c, value=clean(m.get("flow")))
-                ws.cell(row=r, column=cond_c, value=clean(m.get("cond")))
+            ws.cell(row=SCAN_HEADER_ROW, column=time_c, value=f"Time for {volume_ml:g} ml")
+            numerator = float(volume_ml) * 3.6
 
-    # operating parameters: map EVERY label cell in the param region to the value
-    # cell on its right, then write each extracted param to its matching label.
-    # Matching on normalized text means text-only tags ("Reject cond", "Feed Flow",
-    # "Permeat Flow") work too, and "CIS - 151 -" vs "CIS 151" both resolve.
-    value_cell_by_label: dict[str, object] = {}
-    for row in ws.iter_rows(min_row=35, max_row=46, min_col=1, max_col=10):
-        for cell in row:
-            norm = normalize_text(cell.value)
-            if norm:
-                value_cell_by_label.setdefault(norm, ws.cell(row=cell.row, column=cell.column + 1))
-    for p in extracted.get("parameters") or []:
-        target = value_cell_by_label.get(normalize_text(p.get("tag")))
-        val = clean(p.get("value"))
-        if target is not None and val is not None:
-            target.value = val
+        row = SCAN_DATA_ROW
+        for module in stage.get("modules") or []:
+            mo = _scan_cell(module.get("mo_no"))
+            if mo is None:
+                continue  # blank editor row
+            ws.cell(row=row, column=mo_c, value=mo)
+            ws.cell(row=row, column=inst_c, value=_scan_date(module.get("inst_date")))
+            remark = str(_scan_cell(module.get("remark")) or "")
+            if "by pass" in remark.lower() or "bypass" in remark.lower():
+                ws.cell(row=row, column=cond_c, value="BY PASS")
+            else:
+                seconds = pd.to_numeric(module.get("time_sec"), errors="coerce")
+                ws.cell(row=row, column=time_c,
+                        value=float(seconds) if pd.notna(seconds) else None)
+                # With both the timed volume and the reading, write the live
+                # formula the paper form uses so editing the time updates the
+                # flow; otherwise fall back to the transcribed flow number.
+                if numerator is not None and pd.notna(seconds) and seconds != 0:
+                    ws.cell(row=row, column=flow_c, value=f"={numerator:g}/{time_letter}{row}")
+                else:
+                    ws.cell(row=row, column=flow_c, value=_scan_cell(module.get("flow")))
+                ws.cell(row=row, column=cond_c, value=_scan_cell(module.get("cond")))
+            row += 1
+
+        # Each block gets its own AVERAGE under its own data — blocks no longer
+        # share a row, so a short stage isn't padded out to the tallest one.
+        if row > SCAN_DATA_ROW:
+            ws.cell(row=row, column=mo_c + 2, value="AVERAGE")
+            for col in (flow_c, cond_c):
+                letter = get_column_letter(col)
+                ws.cell(row=row, column=col,
+                        value=f"=IFERROR(ROUND(AVERAGE({letter}{SCAN_DATA_ROW}:{letter}{row - 1}),2),\"\")")
+        last_data_row = max(last_data_row, row)
+
+    # Operating parameters, below the grid. extract_operating_parameters keys off
+    # the UNIT cell, reading the value one column left and the tag two left, so
+    # the tag must sit at column C or later for that lookback to be in bounds.
+    param_row = last_data_row + 2
+    ws.cell(row=param_row, column=3, value="OPERATING PARAMETERS")
+    param_row += 1
+    for param in extracted.get("parameters") or []:
+        value = _scan_cell(param.get("value"))
+        unit = scan_param_unit(param.get("tag"))
+        if value is None or unit is None:
+            continue  # no unit means the parser can't see it — don't pretend
+        ws.cell(row=param_row, column=3, value=str(param.get("tag")))
+        ws.cell(row=param_row, column=4, value=value)
+        ws.cell(row=param_row, column=5, value=unit)
+        param_row += 1
 
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -4559,12 +4720,20 @@ def render_scan_page(engine: Engine) -> None:
         "parameters": corrected_params,
     }
 
-    xlsx_bytes = fill_imr_template(corrected)
+    xlsx_bytes = build_imr_workbook(corrected)
     base = f"{corrected['plant_sr_no'] or 'imr'}_{corrected['report_date'] or 'report'}"
     filename = safe_upload_name(f"{base}.xlsx")
 
     # ----- download / commit -----
     st.markdown("---")
+    written = sum(
+        1 for s in corrected["stages"] for m in (s.get("modules") or [])
+        if _scan_cell(m.get("mo_no")) is not None
+    )
+    st.caption(
+        f"Excel: {len(corrected['stages'])} stage(s), {written} module(s) — "
+        "the sheet is built to fit, so nothing is dropped."
+    )
     dl, cm = st.columns(2)
     with dl:
         st.download_button(
