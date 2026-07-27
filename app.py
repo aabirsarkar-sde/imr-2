@@ -2148,6 +2148,29 @@ def make_chart(
     return fig
 
 
+def plant_no_column(values: pd.Series) -> pd.Series:
+    """Format plant SR numbers for the "Plant No" column shown beside a plant name.
+
+    Plant sheet names are inconsistent about carrying their SR ("Aarti Jhagadia
+    HP Ro (1959)" vs "Aarti Industries Ud."), so every plant table gets the SR as
+    its own column. Rendered as text, not int: Streamlit would otherwise print an
+    id as "1,959"."""
+    return values.map(lambda v: f"{int(v)}" if pd.notna(v) else "—")
+
+
+def plant_name_with_sr(readings: pd.DataFrame, plant: object) -> str:
+    """"Name (SR)" for a heading, where a table would instead get its own column.
+
+    Many sheet names already carry the SR ("Aarti Jhagadia HP Ro (1959)", "Aarti
+    Alchemie PTRO 2497"), so it is only appended when the name doesn't already
+    read as that SR."""
+    srs = readings.loc[readings["plant"] == plant, "plant_sr_no"].dropna()
+    if srs.empty:
+        return str(plant)
+    sr = int(srs.iloc[0])
+    return str(plant) if plant_sr_no_from_name(plant) == sr else f"{plant} ({sr})"
+
+
 def metric_card(title: str, value: str, subtitle: str = "", color: str = "#0f172a") -> None:
     st.markdown(
         f"""
@@ -2856,7 +2879,7 @@ def render_replacement_page(df: pd.DataFrame) -> None:
         "naturally high-TDS stage isn't penalised against a cleaner one."
     )
     group, plant = select_group_plant(df)
-    st.caption(f"{group} | {plant}")
+    st.caption(f"{group} | {plant_name_with_sr(df, plant)}")
     plant_df = df[(df["plant_group"] == group) & (df["plant"] == plant)]
     render_outlier_section(plant_df)
 
@@ -2994,6 +3017,25 @@ def build_zone_by_sr(mis: pd.DataFrame) -> dict[object, object]:
     return zone_by_sr
 
 
+def resolve_plant_sr(plants: pd.Series, readings: pd.DataFrame | None) -> pd.Series:
+    """Best-effort plant_sr_no for a Series of plant display names.
+
+    The `parameters` table carries no plant_sr_no, so prefer the SR the readings
+    already resolved for that plant name — the SAME SR the rest of the app joins
+    on — and only fall back to parsing it out of the display name. Parsing alone
+    fails for the new sheet-naming ("Cadila pharma. ANK", "AARTI PHASE I VAPI"),
+    which is what left the zone (and now the Plant No) column blank."""
+    sr_by_plant_name: dict[object, int] = {}
+    if readings is not None and not readings.empty:
+        resolved = readings.dropna(subset=["plant_sr_no"])
+        sr_by_plant_name = dict(
+            zip(resolved["plant"], resolved["plant_sr_no"].astype(int))
+        )
+    return plants.map(
+        lambda name: sr_by_plant_name.get(name) or plant_sr_no_from_name(name)
+    )
+
+
 def compute_salt_passage(
     parameters: pd.DataFrame, mis: pd.DataFrame, readings: pd.DataFrame | None = None
 ) -> pd.DataFrame:
@@ -3003,15 +3045,8 @@ def compute_salt_passage(
     recorded once per plant sheet. Salt passage % = permeate / feed * 100 — the
     share of feed salinity that leaks through the whole RO train. Returns one row
     per (plant, month) that carries BOTH readings, with the plant's zone joined in
-    (via plant_sr_no -> latest MIS row, mirroring compute_fleet_status), sorted by
-    passage descending.
-
-    The `parameters` table carries no plant_sr_no, so the SR (needed for the zone
-    join) is taken from the resolved `readings` by plant name — the SAME SR the
-    rest of the app uses — and only falls back to parsing it out of the display
-    name for plants absent from readings. Parsing the name alone fails for the new
-    sheet-naming ("BHARAT 3523(200w)", "Cadila pharma. ANK"), which is what made
-    every row show zone "Unknown"."""
+    (via resolve_plant_sr -> latest MIS row, mirroring compute_fleet_status),
+    sorted by passage descending."""
     columns = [
         "plant_group", "plant", "plant_sr_no", "zone",
         "report_date", "feed", "permeate", "passage_pct",
@@ -3045,19 +3080,8 @@ def compute_salt_passage(
         return pd.DataFrame(columns=columns)
     wide["passage_pct"] = wide["permeate"] / wide["feed"] * 100.0
 
-    sr_by_plant_name: dict[object, int] = {}
-    if readings is not None and not readings.empty:
-        resolved = readings.dropna(subset=["plant_sr_no"])
-        sr_by_plant_name = dict(
-            zip(resolved["plant"], resolved["plant_sr_no"].astype(int))
-        )
-
-    def resolve_sr(plant_name: object) -> int | None:
-        sr = sr_by_plant_name.get(plant_name)
-        return sr if sr is not None else plant_sr_no_from_name(plant_name)
-
     zone_by_sr = build_zone_by_sr(mis)
-    wide["plant_sr_no"] = wide["plant"].map(resolve_sr)
+    wide["plant_sr_no"] = resolve_plant_sr(wide["plant"], readings)
     wide["zone"] = wide["plant_sr_no"].map(lambda sr: zone_by_sr.get(sr) or "Unknown")
 
     return (
@@ -3067,7 +3091,9 @@ def compute_salt_passage(
     )
 
 
-def compute_permeate_flow(parameters: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFrame:
+def compute_permeate_flow(
+    parameters: pd.DataFrame, mis: pd.DataFrame, readings: pd.DataFrame | None = None
+) -> pd.DataFrame:
     """Per-plant per-month permeate (product) flow from the FIS 180 tag, in m3/hr.
 
     Permeate flow is logged once per plant sheet as FIS 180, in either m3/hr or
@@ -3108,13 +3134,15 @@ def compute_permeate_flow(parameters: pd.DataFrame, mis: pd.DataFrame) -> pd.Dat
     flow["change_pct"] = (flow["flow_m3hr"] / prev - 1.0) * 100.0
 
     zone_by_sr = build_zone_by_sr(mis)
-    flow["plant_sr_no"] = flow["plant"].map(plant_sr_no_from_name)
+    flow["plant_sr_no"] = resolve_plant_sr(flow["plant"], readings)
     flow["zone"] = flow["plant_sr_no"].map(lambda sr: zone_by_sr.get(sr) or "Unknown")
 
     return flow.reindex(columns=columns).reset_index(drop=True)
 
 
-def compute_permeate_conductivity(parameters: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFrame:
+def compute_permeate_conductivity(
+    parameters: pd.DataFrame, mis: pd.DataFrame, readings: pd.DataFrame | None = None
+) -> pd.DataFrame:
     """Per-plant per-month permeate conductivity (CIS 180) with its MoM rise.
 
     Permeate (product) conductivity is logged once per plant sheet as CIS 180.
@@ -3151,7 +3179,7 @@ def compute_permeate_conductivity(parameters: pd.DataFrame, mis: pd.DataFrame) -
     cond["change_pct"] = (cond["permeate"] / prev - 1.0) * 100.0
 
     zone_by_sr = build_zone_by_sr(mis)
-    cond["plant_sr_no"] = cond["plant"].map(plant_sr_no_from_name)
+    cond["plant_sr_no"] = resolve_plant_sr(cond["plant"], readings)
     cond["zone"] = cond["plant_sr_no"].map(lambda sr: zone_by_sr.get(sr) or "Unknown")
 
     return cond.reindex(columns=columns).reset_index(drop=True)
@@ -3171,6 +3199,7 @@ def build_plant_ranking(snapshot: pd.DataFrame, latest: pd.Timestamp) -> pd.Data
         rows.append(
             {
                 "Plant": plant,
+                "Plant No": plant_no_column(pdf["plant_sr_no"]).iloc[0],
                 "Zone": pdf["zone"].iloc[0],
                 "Modules": module_count,
                 "Bypassed": bypassed,
@@ -3294,7 +3323,9 @@ def render_plant_flagged_modules(
     plant_rows = snapshot[snapshot["plant"] == plant]
     flagged = plant_rows[plant_rows["need"]].copy()
 
-    st.markdown(f"#### {plant} — flagged modules · {month_text}")
+    st.markdown(
+        f"#### {plant_name_with_sr(plant_rows, plant)} — flagged modules · {month_text}"
+    )
     if flagged.empty:
         st.success(f"No modules flagged for {plant} in {month_text}.")
         return
@@ -3531,6 +3562,7 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
         worst_table = pd.DataFrame(
             {
                 "Plant": worst["plant"],
+                "Plant No": plant_no_column(worst["plant_sr_no"]),
                 "Stage": worst["stage_label"],
                 "Module": worst["module_label"],
                 "Conductivity (uS/cm)": worst["conductivity"].map(lambda v: f"{v:,.0f}"),
@@ -3558,6 +3590,7 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
         jump_table = pd.DataFrame(
             {
                 "Plant": jumps["plant"],
+                "Plant No": plant_no_column(jumps["plant_sr_no"]),
                 "Stage": jumps["stage_label"],
                 "Module": jumps["module_label"],
                 "Prev (uS/cm)": jumps["prev_conductivity"].map(lambda v: f"{v:,.0f}"),
@@ -3592,6 +3625,7 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
         drop_table = pd.DataFrame(
             {
                 "Plant": drops["plant"],
+                "Plant No": plant_no_column(drops["plant_sr_no"]),
                 "Stage": drops["stage_label"],
                 "Module": drops["module_label"],
                 "Prev (L/hr)": drops["prev_flow"].map(lambda v: f"{v:,.0f}"),
@@ -3613,7 +3647,7 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
     # ----- 5d. Highest conductivity salt passage (feed vs permeate) -----
     st.markdown("---")
     st.subheader(
-        f"Top 10 sites — salt passage > {SALT_PASSAGE_FLAG_PCT:.0f}% — {month_text}",
+        f"Top 15 sites — salt passage > {SALT_PASSAGE_FLAG_PCT:.0f}% — {month_text}",
         anchor="salt-passage",
     )
     st.caption(
@@ -3626,7 +3660,7 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
     passage = passage[passage["zone"].isin(active_zones)]
     passage = passage[passage["report_date"] == selected]
     passage = passage[passage["passage_pct"] > SALT_PASSAGE_FLAG_PCT]
-    passage = passage.sort_values("passage_pct", ascending=False).head(10)
+    passage = passage.sort_values("passage_pct", ascending=False).head(15)
     if passage.empty:
         st.info(
             f"No site exceeds {SALT_PASSAGE_FLAG_PCT:.0f}% salt passage this month "
@@ -3636,6 +3670,7 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
         passage_table = pd.DataFrame(
             {
                 "Plant": passage["plant"],
+                "Plant No": plant_no_column(passage["plant_sr_no"]),
                 "Zone": passage["zone"],
                 "Feed (uS/cm)": passage["feed"].map(lambda v: f"{v:,.0f}"),
                 "Permeate (uS/cm)": passage["permeate"].map(lambda v: f"{v:,.0f}"),
@@ -3661,7 +3696,7 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
         "plant's own prior month. A site-wide rise means the product water got "
         "saltier across the train — a feed, cleaning, or membrane-integrity signal."
     )
-    perm_rise = compute_permeate_conductivity(params, mis)
+    perm_rise = compute_permeate_conductivity(params, mis, df)
     perm_rise = perm_rise[perm_rise["zone"].isin(active_zones)]
     perm_rise = perm_rise[perm_rise["report_date"] == selected]
     perm_rise = perm_rise.dropna(subset=["prev_permeate"])
@@ -3676,6 +3711,7 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
         perm_table = pd.DataFrame(
             {
                 "Plant": perm_rise["plant"],
+                "Plant No": plant_no_column(perm_rise["plant_sr_no"]),
                 "Zone": perm_rise["zone"],
                 "Prev (uS/cm)": perm_rise["prev_permeate"].map(lambda v: f"{v:,.0f}"),
                 "Now (uS/cm)": perm_rise["permeate"].map(lambda v: f"{v:,.0f}"),
@@ -3702,7 +3738,7 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
         "versus the plant's own prior month. A sustained fall in permeate flow is "
         "a classic fouling / membrane-loss signal."
     )
-    flow_mom = compute_permeate_flow(params, mis)
+    flow_mom = compute_permeate_flow(params, mis, df)
     flow_mom = flow_mom[flow_mom["zone"].isin(active_zones)]
     flow_mom = flow_mom[flow_mom["report_date"] == selected]
     flow_mom = flow_mom.dropna(subset=["prev_flow_m3hr"])
@@ -3717,6 +3753,7 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
         flow_table = pd.DataFrame(
             {
                 "Plant": flow_mom["plant"],
+                "Plant No": plant_no_column(flow_mom["plant_sr_no"]),
                 "Zone": flow_mom["zone"],
                 "Prev (m3/hr)": flow_mom["prev_flow_m3hr"].map(lambda v: f"{v:,.2f}"),
                 "Now (m3/hr)": flow_mom["flow_m3hr"].map(lambda v: f"{v:,.2f}"),
@@ -3759,6 +3796,7 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
             cohort_table = pd.DataFrame(
                 {
                     "Plant": cohort["plant"],
+                    "Plant No": plant_no_column(cohort["plant_sr_no"]),
                     "Zone": cohort["zone"],
                     "Stage": cohort["stage_label"],
                     "Module": cohort["module_label"],
@@ -3784,7 +3822,7 @@ def render_dashboard(df: pd.DataFrame, params: pd.DataFrame) -> None:
     series = aggregate_series(filtered, metric_col)
 
     st.title("RO Plant Membrane Health Dashboard")
-    st.caption(f"{selected_group} | {selected_plant}")
+    st.caption(f"{selected_group} | {plant_name_with_sr(df, selected_plant)}")
 
     if series.empty:
         st.warning("No valid numeric readings are available for this module and metric.")
@@ -3832,17 +3870,21 @@ def render_dashboard(df: pd.DataFrame, params: pd.DataFrame) -> None:
                 "source_file",
                 "report_date",
                 "plant",
+                "plant_sr_no",
                 "stage",
                 "module_label",
                 "install_date",
                 "flow_lph",
                 "conductivity_us_cm",
             ]
-        ].rename(
+        ].assign(
+            plant_sr_no=lambda d: plant_no_column(d["plant_sr_no"])
+        ).rename(
             columns={
                 "source_file": "Source File",
                 "report_date": "Report Date",
                 "plant": "Plant",
+                "plant_sr_no": "Plant No",
                 "stage": "Stage",
                 "module_label": "Module Number",
                 "install_date": "Install Date",
