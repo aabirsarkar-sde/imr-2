@@ -4027,6 +4027,15 @@ SCAN_BLOCK_HEADERS = [
     "Colour/ Non Colour", "Total flow liter/hr.", "Cond.    us/cm",
 ]
 
+# Presentation, lifted from the printed form so a generated sheet still reads as
+# an IMR. Sizing and styling are independent concerns: the grid is built to fit
+# the data (any stage count, any module count) and then dressed with the styles
+# below, rather than inheriting a look and a 3x23 cage together from a file.
+SCAN_COL_WIDTHS = [8.7, 9.7, 13.0, 10.1, 8.7, 10.7]  # per stage block
+SCAN_SPACER_WIDTH = 2.0
+SCAN_ROW_H = {"title": 40.0, "cover": 21.0, "band": 18.0, "header": 33.75, "data": 18.0}
+SCAN_VALUE_FILL = "FFFDE7"  # pale yellow on fill-in cells, as on the form
+
 # extract_operating_parameters identifies a reading by its UNIT cell, so a
 # parameter written without one is invisible to the parser. The extractor only
 # returns (tag, value), so the unit is restored here — by exact tag where the
@@ -4473,47 +4482,123 @@ def _scan_date(value: object) -> object:
     return parsed.date() if pd.notna(parsed) else cleaned
 
 
+_SCAN_BORDERS: dict[tuple[str | None, ...], object] = {}
+
+
+def _scan_border(left: str, right: str, top: str, bottom: str) -> object:
+    """Cached Border — a 120-module sheet touches ~900 cells, and building a fresh
+    style object per cell is both slow and bloats the saved workbook."""
+    from openpyxl.styles import Border, Side
+
+    key = (left, right, top, bottom)
+    if key not in _SCAN_BORDERS:
+        _SCAN_BORDERS[key] = Border(
+            left=Side(style=left), right=Side(style=right),
+            top=Side(style=top), bottom=Side(style=bottom),
+        )
+    return _SCAN_BORDERS[key]
+
+
 def build_imr_workbook(extracted: dict) -> bytes:
     """Render an extracted/corrected IMR dict as a workbook the ingest parser reads.
 
     One stage block per stage found, each exactly as tall as its own module list,
-    laid out left to right with SCAN_BLOCK_WIDTH columns apiece. Nothing is capped
-    and no stage is special-cased, so a IV STAGE or a 60-module stage comes through
-    whole. See the SCAN_* constants for why generating this is safe and which
-    strings the parser depends on."""
+    laid out left to right with SCAN_BLOCK_WIDTH columns apiece — so a IV STAGE or
+    a 60-module stage comes through whole, and no plant is a special case. The
+    sheet is then styled to match the printed form (see the SCAN_* constants for
+    why generating it is safe and which strings the parser depends on)."""
     import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "IMR"
-    ws["A1"] = "INDIVIDUAL MODULE REPORT (IMR)"
 
-    # Cover: read_cover_block searches the first 14 rows x 12 columns for a label
-    # and takes the first non-empty cell to its right.
-    sr_row, site_row, cap_row = SCAN_COVER_ROWS
-    ws.cell(row=sr_row, column=1, value="PLANT SR NO :-")
-    ws.cell(row=sr_row, column=2, value=_scan_cell(extracted.get("plant_sr_no")))
-    ws.cell(row=sr_row, column=4, value="REPORT DATE :-")
-    ws.cell(row=sr_row, column=5, value=_scan_date(extracted.get("report_date")))
-    ws.cell(row=site_row, column=1, value="SITE NAME :-")
-    ws.cell(row=site_row, column=2, value=_scan_cell(extracted.get("site_name")))
-    ws.cell(row=site_row, column=4, value="ZONE :-")
-    ws.cell(row=site_row, column=5, value=_scan_cell(extracted.get("zone")))
-    ws.cell(row=cap_row, column=1, value="PLANT CAPACITY :-")
-    ws.cell(row=cap_row, column=2, value=_scan_cell(extracted.get("plant_capacity")))
+    centre = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    centre_flat = Alignment(horizontal="center", vertical="center")
+    value_fill = PatternFill(fill_type="solid", fgColor=SCAN_VALUE_FILL)
 
     stages = [s for s in (extracted.get("stages") or []) if s]
+    n_blocks = max(len(stages), 1)
+    last_col = n_blocks * SCAN_BLOCK_WIDTH - 1  # drop the trailing spacer
+
+    # ----- title -----
+    ws["A1"] = "INDIVIDUAL MODULE REPORT (IMR)"
+    ws["A1"].font = Font(name="Calibri", size=24, bold=True)
+    ws["A1"].alignment = centre_flat
+    ws["A1"].border = _scan_border("medium", "medium", "medium", "medium")
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(last_col, 2))
+    ws.row_dimensions[1].height = SCAN_ROW_H["title"]
+
+    # ----- cover -----
+    # Labels are merged over two columns because a single module column (8.7) is
+    # too narrow for "PLANT CAPACITY :-" and the text would spill over its value.
+    # read_cover_block finds a label anywhere in the first 14 rows x 12 columns and
+    # takes the first NON-EMPTY cell to its right, so the merge — whose trailing
+    # cells read as blank — and the skipped spacer column are both invisible to it.
+    sr_row, site_row, cap_row = SCAN_COVER_ROWS
+    left = Alignment(horizontal="left", vertical="center")
+
+    def cover_field(row: int, label: str, value: object, second: bool) -> None:
+        label_col, value_col = (5, 8) if second else (1, 3)
+        head = ws.cell(row=row, column=label_col, value=label)
+        head.font = Font(name="Calibri", size=10, bold=True)
+        head.alignment = left
+        ws.merge_cells(start_row=row, start_column=label_col,
+                       end_row=row, end_column=label_col + 1)
+        target = ws.cell(row=row, column=value_col, value=value)
+        target.font = Font(name="Calibri", size=11)
+        target.alignment = left
+        target.fill = value_fill
+        if isinstance(value, (datetime, date)):
+            target.number_format = "DD-MM-YYYY"  # otherwise a date renders as ###
+        ws.merge_cells(start_row=row, start_column=value_col,
+                       end_row=row, end_column=value_col + 1)
+        for col in range(label_col, label_col + 2):
+            ws.cell(row=row, column=col).border = _scan_border(
+                "medium" if col == label_col else "thin", "thin", "thin", "thin")
+        for col in range(value_col, value_col + 2):
+            cell = ws.cell(row=row, column=col)
+            cell.border = _scan_border(
+                "thin", "medium" if col == value_col + 1 else "thin", "thin", "thin")
+            cell.fill = value_fill
+
+    cover_field(sr_row, "PLANT SR NO :-", _scan_cell(extracted.get("plant_sr_no")), False)
+    cover_field(sr_row, "REPORT DATE :-", _scan_date(extracted.get("report_date")), True)
+    cover_field(site_row, "SITE NAME :-", _scan_cell(extracted.get("site_name")), False)
+    cover_field(site_row, "ZONE :-", _scan_cell(extracted.get("zone")), True)
+    cover_field(cap_row, "PLANT CAPACITY :-", _scan_cell(extracted.get("plant_capacity")), False)
+    for row in SCAN_COVER_ROWS:
+        ws.row_dimensions[row].height = SCAN_ROW_H["cover"]
+
+    # ----- stage blocks, each sized to its own module list -----
     last_data_row = SCAN_DATA_ROW
     for index, stage in enumerate(stages):
         base = 1 + index * SCAN_BLOCK_WIDTH  # 1-based first column of this block
         mo_c, inst_c, time_c, flow_c, cond_c = base, base + 1, base + 2, base + 4, base + 5
         time_letter = get_column_letter(time_c)
 
-        ws.cell(row=SCAN_STAGE_LABEL_ROW, column=mo_c,
-                value=stage.get("stage_label") or f"STAGE {index + 1}")
+        band = ws.cell(row=SCAN_STAGE_LABEL_ROW, column=mo_c,
+                       value=stage.get("stage_label") or f"STAGE {index + 1}")
+        band.font = Font(name="Calibri", size=11, bold=True)
+        band.alignment = centre
+        ws.merge_cells(start_row=SCAN_STAGE_LABEL_ROW, start_column=mo_c,
+                       end_row=SCAN_STAGE_LABEL_ROW, end_column=cond_c)
+        for offset in range(6):
+            ws.cell(row=SCAN_STAGE_LABEL_ROW, column=base + offset).border = _scan_border(
+                "medium" if offset == 0 else "thin",
+                "medium" if offset == 5 else "thin", "medium", "thin",
+            )
+
         for offset, header in enumerate(SCAN_BLOCK_HEADERS):
-            ws.cell(row=SCAN_HEADER_ROW, column=base + offset, value=header)
+            cell = ws.cell(row=SCAN_HEADER_ROW, column=base + offset, value=header)
+            cell.font = Font(name="Calibri", size=9, bold=True)
+            cell.alignment = centre
+            cell.border = _scan_border(
+                "medium" if offset == 0 else "thin",
+                "medium" if offset == 5 else "thin", "thin", "thin",
+            )
 
         # Naming the timed volume in the header is what lets parse_volume_ml pick
         # it up downstream, so flow can be re-derived from the stopwatch reading.
@@ -4547,31 +4632,104 @@ def build_imr_workbook(extracted: dict) -> bytes:
                 ws.cell(row=row, column=cond_c, value=_scan_cell(module.get("cond")))
             row += 1
 
+        end_row = row - 1
+        for r in range(SCAN_DATA_ROW, row):
+            ws.row_dimensions[r].height = SCAN_ROW_H["data"]
+            for offset in range(6):
+                cell = ws.cell(row=r, column=base + offset)
+                cell.font = Font(name="Calibri", size=11)
+                cell.alignment = centre_flat
+                cell.border = _scan_border(
+                    "medium" if offset == 0 else "thin",
+                    "medium" if offset == 5 else "thin",
+                    "thin", "medium" if r == end_row else "thin",
+                )
+            # The flow formula divides, so it prints to full float precision
+            # (276.9231) unless told otherwise; dates need a format to render.
+            ws.cell(row=r, column=flow_c).number_format = "0.00"
+            ws.cell(row=r, column=inst_c).number_format = "DD-MM-YYYY"
+
         # Each block gets its own AVERAGE under its own data — blocks no longer
         # share a row, so a short stage isn't padded out to the tallest one.
-        if row > SCAN_DATA_ROW:
-            ws.cell(row=row, column=mo_c + 2, value="AVERAGE")
+        if end_row >= SCAN_DATA_ROW:
+            avg_row = row
+            label = ws.cell(row=avg_row, column=mo_c, value="AVERAGE")
+            label.font = Font(name="Calibri", size=11, bold=True)
+            label.alignment = centre_flat
             for col in (flow_c, cond_c):
                 letter = get_column_letter(col)
-                ws.cell(row=row, column=col,
-                        value=f"=IFERROR(ROUND(AVERAGE({letter}{SCAN_DATA_ROW}:{letter}{row - 1}),2),\"\")")
+                cell = ws.cell(
+                    row=avg_row, column=col,
+                    value=f'=IFERROR(ROUND(AVERAGE({letter}{SCAN_DATA_ROW}:{letter}{end_row}),2),"")',
+                )
+                cell.font = Font(name="Calibri", size=11, bold=True)
+                cell.alignment = centre_flat
+                cell.number_format = "0.00"
+            for offset in range(6):
+                ws.cell(row=avg_row, column=base + offset).border = _scan_border(
+                    "medium" if offset == 0 else "thin",
+                    "medium" if offset == 5 else "thin", "medium", "medium",
+                )
+            row += 1
         last_data_row = max(last_data_row, row)
 
-    # Operating parameters, below the grid. extract_operating_parameters keys off
-    # the UNIT cell, reading the value one column left and the tag two left, so
-    # the tag must sit at column C or later for that lookback to be in bounds.
-    param_row = last_data_row + 2
-    ws.cell(row=param_row, column=3, value="OPERATING PARAMETERS")
+        for offset, width in enumerate(SCAN_COL_WIDTHS):
+            ws.column_dimensions[get_column_letter(base + offset)].width = width
+        if index < len(stages) - 1:
+            ws.column_dimensions[get_column_letter(base + 6)].width = SCAN_SPACER_WIDTH
+
+    ws.row_dimensions[SCAN_STAGE_LABEL_ROW].height = SCAN_ROW_H["band"]
+    ws.row_dimensions[SCAN_HEADER_ROW].height = SCAN_ROW_H["header"]
+
+    # ----- operating parameters -----
+    # extract_operating_parameters keys off the UNIT cell, reading the value one
+    # column left and the tag two left, so the tag must sit at column C or later
+    # for that lookback to stay in bounds.
+    param_row = last_data_row + 1
+    heading = ws.cell(row=param_row, column=3, value="OPERATING PARAMETERS")
+    heading.font = Font(name="Calibri", size=12, bold=True)
+    heading.alignment = centre
+    ws.merge_cells(start_row=param_row, start_column=3, end_row=param_row, end_column=5)
+    for col in (3, 4, 5):
+        ws.cell(row=param_row, column=col).border = _scan_border(
+            "medium" if col == 3 else "thin", "medium" if col == 5 else "thin",
+            "medium", "thin",
+        )
     param_row += 1
-    for param in extracted.get("parameters") or []:
-        value = _scan_cell(param.get("value"))
-        unit = scan_param_unit(param.get("tag"))
-        if value is None or unit is None:
-            continue  # no unit means the parser can't see it — don't pretend
-        ws.cell(row=param_row, column=3, value=str(param.get("tag")))
-        ws.cell(row=param_row, column=4, value=value)
-        ws.cell(row=param_row, column=5, value=unit)
+
+    written = [
+        (p, scan_param_unit(p.get("tag")), _scan_cell(p.get("value")))
+        for p in extracted.get("parameters") or []
+    ]
+    written = [(p, u, v) for p, u, v in written if u is not None and v is not None]
+    for position, (param, unit, value) in enumerate(written):
+        last = position == len(written) - 1
+        cells = [
+            (3, str(param.get("tag")), True),
+            (4, value, False),
+            (5, unit, False),
+        ]
+        for col, content, bold in cells:
+            cell = ws.cell(row=param_row, column=col, value=content)
+            cell.font = Font(name="Calibri", size=12, bold=bold)
+            cell.alignment = centre_flat if col != 3 else Alignment(vertical="center")
+            cell.border = _scan_border(
+                "medium" if col == 3 else "thin", "medium" if col == 5 else "thin",
+                "thin", "medium" if last else "thin",
+            )
+            if col == 4:
+                cell.fill = value_fill
         param_row += 1
+
+    # A 60-module stage scrolls past the headers, so pin them; landscape A3 at
+    # fit-to-width keeps a 4-block sheet printable on one page.
+    ws.freeze_panes = ws.cell(row=SCAN_DATA_ROW, column=1)
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.paperSize = 8  # A3
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.sheet_view.zoomScale = 100
 
     buffer = io.BytesIO()
     wb.save(buffer)
