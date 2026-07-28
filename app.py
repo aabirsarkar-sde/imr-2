@@ -1756,6 +1756,43 @@ def save_plants(
     return len(clean)
 
 
+def add_plant(
+    engine: Engine,
+    plant_sr_no: int,
+    site_name: str | None,
+    zone: str | None,
+    installed_capacity: str | None,
+    status: str | None,
+) -> None:
+    """Insert one new plant into the register (onboarding a new client's plant).
+
+    Raises ValueError if the SR No is already taken — an existing plant is edited
+    in the table, never silently overwritten from the add form."""
+    sr = int(plant_sr_no)
+    with engine.begin() as conn:
+        taken = conn.execute(
+            text("SELECT site_name FROM plants WHERE plant_sr_no = :s"), {"s": sr}
+        ).first()
+        if taken is not None:
+            name = (taken[0] or "").strip()
+            raise ValueError(
+                f"SR No {sr} already exists in the register"
+                + (f" ({name})." if name else ".")
+                + " Edit that row in the table instead."
+            )
+        row = pd.DataFrame([{
+            "plant_sr_no": sr,
+            "site_name": (str(site_name).strip() or None) if site_name else None,
+            "zone": canonicalize_zone(zone),
+            "installed_capacity": (
+                (str(installed_capacity).strip() or None) if installed_capacity else None
+            ),
+            "status": canonical_status(status) or "Active",
+            "updated_at": datetime.now(timezone.utc),
+        }]).reindex(columns=PLANTS_COLUMNS)
+        row.to_sql("plants", conn, if_exists="append", index=False)
+
+
 @dataclass
 class Issue:
     """One line in a report's data-quality report. level is ERROR (blocks the
@@ -4963,8 +5000,8 @@ def render_plant_register(engine: Engine) -> None:
         "zone and whether it's still operating. Fix a zone, add a new client's "
         "plant, or mark a shut-down plant Inactive. The IMR Tracker and every zone "
         "view read from this; an Inactive plant drops out of the tracker's expected "
-        "list but keeps its history. Add rows with the ＋ at the bottom of the table; "
-        "delete a row by selecting it and pressing the trash icon."
+        "list but keeps its history. Use the form below to onboard a plant, or edit "
+        "any row in the table; delete a row by selecting it and pressing the trash icon."
     )
     plants = load_plants()
 
@@ -4980,6 +5017,42 @@ def render_plant_register(engine: Engine) -> None:
             if z and z not in zones:
                 st.session_state.setdefault("extra_zones", []).append(z)
             rerun_app()
+
+    # ----- Add a plant (new business) -----
+    with st.expander("🏭 Add a plant (onboarding a new client / site)"):
+        with st.form("add_plant_form", clear_on_submit=True):
+            a1, a2 = st.columns([1, 3])
+            new_sr = a1.number_input(
+                "SR No", min_value=1, step=1, value=None, format="%d",
+                help="The plant's serial number — the key every IMR workbook and "
+                     "every zone view joins on. Must be unique.",
+            )
+            new_site = a2.text_input("Site name", placeholder="e.g. Acme Chemicals, Dahej")
+            b1, b2, b3 = st.columns(3)
+            new_zone_pick = b1.selectbox(
+                "Zone", options=zones, index=None, placeholder="Pick a zone",
+                help="Not listed? Add it above first, then it appears here.",
+            )
+            new_capacity = b2.text_input("Capacity", placeholder="e.g. 100 KLD")
+            new_status = b3.selectbox("Status", options=PLANT_STATUS_OPTIONS, index=0)
+            submitted = st.form_submit_button("Add plant", type="primary")
+        if submitted:
+            if new_sr is None:
+                st.error("SR No is required — it's how readings join to this plant.")
+            elif not (new_site or "").strip():
+                st.error("Site name is required.")
+            else:
+                try:
+                    add_plant(engine, int(new_sr), new_site, new_zone_pick,
+                              new_capacity, new_status)
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    load_plants.clear()
+                    load_mis.clear()
+                    compute_fleet_status.clear()
+                    st.success(f"Added {new_site.strip()} (SR {int(new_sr)}).")
+                    rerun_app()
 
     # ----- Status filter/slicer (top of page) -----
     status_label = (
@@ -5002,13 +5075,43 @@ def render_plant_register(engine: Engine) -> None:
     with fc2:
         st.metric("In view", f"{int(status_label.isin(picked_status).sum())}/{len(plants)}")
 
-    if picked_status and set(picked_status) != set(PLANT_STATUS_OPTIONS):
-        view = plants[status_label.isin(picked_status)]
-    else:
-        view = plants
+    is_full_view = not (picked_status and set(picked_status) != set(PLANT_STATUS_OPTIONS))
+    view = plants if is_full_view else plants[status_label.isin(picked_status)]
     # SRs currently on screen — bounds what a save is allowed to delete.
     scope_srs = set(pd.to_numeric(view["plant_sr_no"], errors="coerce").dropna().astype(int)) \
         if not view.empty else set()
+
+    # ----- Sort (the editor's headers aren't clickable, so sort explicitly) -----
+    SORT_COLUMNS = {
+        "Zone, then SR No": ["zone", "plant_sr_no"],
+        "SR No": ["plant_sr_no"],
+        "Site name": ["site_name"],
+        "Zone": ["zone"],
+        "Capacity": ["installed_capacity"],
+        "Status": ["status"],
+    }
+    s1, s2 = st.columns([4, 1])
+    sort_by = s1.selectbox(
+        "Sort by", list(SORT_COLUMNS), index=0,
+        help="Reorders the table below. Display-only — it doesn't change what a save "
+             "writes, but it does reset any edits you haven't saved yet.",
+    )
+    ascending = s2.radio(
+        "Order", ["A→Z", "Z→A"], index=0, horizontal=True, label_visibility="hidden",
+    ) == "A→Z"
+    if not view.empty:
+        keys = [c for c in SORT_COLUMNS[sort_by] if c in view.columns]
+        if keys:
+            sort_frame = view[keys].copy()
+            for col in keys:
+                if col != "plant_sr_no":  # case-insensitive text sort, blanks last
+                    sort_frame[col] = (
+                        sort_frame[col].astype("string").str.strip().str.lower()
+                        .replace("", pd.NA)
+                    )
+            view = view.loc[
+                sort_frame.sort_values(keys, ascending=ascending, na_position="last").index
+            ]
 
     grid = view.reindex(
         columns=["plant_sr_no", "site_name", "zone", "installed_capacity", "status"]
@@ -5017,14 +5120,19 @@ def render_plant_register(engine: Engine) -> None:
         grid = pd.DataFrame(
             columns=["plant_sr_no", "site_name", "zone", "installed_capacity", "status"]
         )
+    grid = grid.reset_index(drop=True)
     grid["status"] = grid["status"].map(canonical_status)
 
+    # The editor keys its pending edits by row POSITION, so re-sorting or re-filtering
+    # would reapply them to the wrong plants. Fold both into the key: a change starts
+    # the editor fresh on the new ordering (and discards unsaved edits).
+    editor_key = f"plant_editor::{sort_by}::{ascending}::{','.join(sorted(picked_status))}"
     edited = st.data_editor(
         grid,
         num_rows="dynamic",
         width="stretch",
         height=560,
-        key="plant_editor",
+        key=editor_key,
         column_config={
             "plant_sr_no": st.column_config.NumberColumn("SR No", format="%d", width="small"),
             "site_name": st.column_config.TextColumn("Site name", width="large"),
@@ -5052,7 +5160,7 @@ def render_plant_register(engine: Engine) -> None:
         else:
             # Scope the save to the filtered view so hidden plants aren't deleted;
             # a full-table view (all statuses) does a normal full replace.
-            scope = None if view is plants else scope_srs
+            scope = None if is_full_view else scope_srs
             n = save_plants(engine, edited, scope_srs=scope)
             load_plants.clear()
             load_mis.clear()
