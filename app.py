@@ -3401,14 +3401,35 @@ def make_age_profile_chart(snapshot: pd.DataFrame, latest: pd.Timestamp) -> go.F
         return None
     counts = years.astype(int).value_counts().sort_index()
     latest_year = pd.Timestamp(latest).year
+    labels = [str(year) for year in counts.index]
     colors = ["#dc2626" if (latest_year - year) > 5 else "#2563eb" for year in counts.index]
+    hover = "%{x}<br>%{customdata:,} modules<extra></extra>"
 
-    fig = go.Figure(
+    fig = go.Figure()
+    # Full-height backdrop behind each column. A year with 2 modules next to one with
+    # 500 is a hairline bar that is near-impossible to hit; the backdrop makes the whole
+    # column a click target, and it reports the same year/count as the real bar.
+    fig.add_trace(
         go.Bar(
-            x=[str(year) for year in counts.index],
+            x=labels,
+            y=[int(counts.max())] * len(counts),
+            customdata=counts.values,
+            marker_color="rgba(37, 99, 235, 0.07)",
+            hovertemplate=hover,
+            width=0.9,
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=labels,
             y=counts.values,
+            customdata=counts.values,
             marker_color=colors,
-            hovertemplate="%{x}<br>%{y} modules<extra></extra>",
+            hovertemplate=hover,
+            text=[f"{v:,}" for v in counts.values],
+            textposition="outside",
+            cliponaxis=False,
+            width=0.9,
         )
     )
     fig.update_layout(
@@ -3419,8 +3440,15 @@ def make_age_profile_chart(snapshot: pd.DataFrame, latest: pd.Timestamp) -> go.F
         template="plotly_white",
         height=380,
         showlegend=False,
+        barmode="overlay",
+        bargap=0.12,
+        hovermode="closest",
+        # Click-to-select is the point of this chart; drag-to-zoom only gets in the way.
+        dragmode=False,
     )
     fig.update_xaxes(type="category")
+    # Headroom so the tallest bar's count label is not clipped by the plot edge.
+    fig.update_yaxes(range=[0, int(counts.max()) * 1.12])
     return fig
 
 
@@ -3888,7 +3916,10 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
     if age_chart is None:
         st.info("No install dates available to build the age profile.")
     else:
-        st.caption("Click a bar to list the modules installed that year.")
+        st.caption(
+            "Click anywhere in a year's column — not just the bar itself — to list the "
+            "modules installed that year. Shift-click to add more years."
+        )
         age_event = st.plotly_chart(
             age_chart,
             width="stretch",
@@ -5769,6 +5800,45 @@ table.xl-sheet td {
 """
 
 
+def report_plant_index(
+    readings: pd.DataFrame, mis: pd.DataFrame, plants: pd.DataFrame
+) -> pd.DataFrame:
+    """Which plant appears in which stored report: one row per
+    (source_file, plant_sr_no, site_name). Names come from three places — the
+    workbook's own sheet name, its MIS/cover site name, and the register's name for
+    that SR — so a plant is findable by whichever name the user knows it by. Column
+    names match `plant_search_mask()` so the same lookup rules apply here."""
+    cols = ["source_file", "plant_sr_no", "site_name"]
+    parts: list[pd.DataFrame] = []
+    if readings is not None and not readings.empty:
+        parts.append(
+            readings.reindex(columns=["source_file", "plant_sr_no", "plant"])
+            .rename(columns={"plant": "site_name"})
+        )
+    if mis is not None and not mis.empty:
+        rows = mis
+        if "source_file" in rows:  # drop the synthetic register-authority rows
+            rows = rows[rows["source_file"] != REGISTER_SOURCE]
+        parts.append(rows.reindex(columns=cols))
+    if not parts:
+        return pd.DataFrame(columns=cols)
+
+    idx = pd.concat(parts, ignore_index=True).dropna(subset=["source_file"])
+    idx["plant_sr_no"] = pd.to_numeric(idx["plant_sr_no"], errors="coerce").astype("Int64")
+
+    if plants is not None and not plants.empty:
+        register = plants.dropna(subset=["plant_sr_no"])
+        names = dict(zip(
+            pd.to_numeric(register["plant_sr_no"], errors="coerce").astype("Int64"),
+            register.get("site_name", pd.Series(dtype=object)),
+        ))
+        aliases = idx[["source_file", "plant_sr_no"]].drop_duplicates().copy()
+        aliases["site_name"] = aliases["plant_sr_no"].map(names)
+        idx = pd.concat([idx, aliases.dropna(subset=["site_name"])], ignore_index=True)
+
+    return idx.reindex(columns=cols).drop_duplicates().reset_index(drop=True)
+
+
 def render_imr_preview(engine: Engine) -> None:
     """Render a stored IMR workbook exactly as it appears in Excel — with sheet
     tabs, column headers, row numbers, merged cells, and the classic spreadsheet
@@ -5776,7 +5846,8 @@ def render_imr_preview(engine: Engine) -> None:
     st.title("📗 IMR Preview")
     st.caption(
         "Select a previously uploaded IMR to view the raw Excel workbook exactly as stored — "
-        "each sheet rendered with its original layout, merged cells, and values."
+        "each sheet rendered with its original layout, merged cells, and values. Search by "
+        "SR No or site name to find the reports a particular plant appears in."
     )
 
     stored = report_files_index(engine)
@@ -5790,12 +5861,55 @@ def render_imr_preview(engine: Engine) -> None:
     # Also get ingested_files summary for the landing table.
     reports = ingested_report_summary(engine)
 
+    # ----- Look up which reports contain a given plant -----
+    query = st.text_input(
+        "🔎 Find the reports for a plant",
+        placeholder="SR No (e.g. 1043) or part of a site name",
+        help="Narrows the report list below to the workbooks that contain that plant. "
+             "Matches the SR No, the workbook's own sheet/site name, or the name the "
+             "plant has in the Plant Register.",
+        key="preview_plant_query",
+    ).strip()
+
+    options = stored
+    if query:
+        index = report_plant_index(load_readings(), load_mis(), load_plants())
+        hits = index[plant_search_mask(index, query)] if not index.empty else index
+        files = {f for f in hits["source_file"] if f in set(stored)}
+        if not files:
+            st.warning(
+                f"No stored report contains a plant matching “{query}”. Showing every "
+                "report instead — the plant may not have been ingested yet."
+            )
+        else:
+            options = [f for f in stored if f in files]
+            found = (
+                hits.dropna(subset=["plant_sr_no"])
+                # Names are appended sheet name -> MIS -> register, so the last one
+                # per SR is the tidiest name we have for it.
+                .drop_duplicates("plant_sr_no", keep="last")
+                .sort_values("plant_sr_no")
+            )
+            named = " · ".join(
+                f"SR {int(r['plant_sr_no'])}"
+                + (f" {r['site_name']}" if pd.notna(r["site_name"]) else "")
+                for _, r in found.head(5).iterrows()
+            )
+            st.success(
+                f"{len(options)} of {len(stored)} reports contain "
+                + (named or f"“{query}”")
+                + (" …" if len(found) > 5 else "")
+            )
+
     choice = st.selectbox(
         "Select a report to preview",
-        stored,
-        index=None,
+        options,
+        # A search that lands on a single report opens it straight away.
+        index=0 if (query and len(options) == 1 and options is not stored) else None,
         placeholder="Pick a committed report…",
-        key="preview_report_choice",
+        # The query is part of the key so narrowing the list can't leave a stale
+        # selection pointing at a report that is no longer an option.
+        key=f"preview_report_choice::{query.lower()}",
     )
 
     if not choice:
