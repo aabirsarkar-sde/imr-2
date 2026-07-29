@@ -2305,17 +2305,26 @@ def plant_name_with_sr(readings: pd.DataFrame, plant: object) -> str:
     return str(plant) if plant_sr_no_from_name(plant) == sr else f"{plant} ({sr})"
 
 
-def metric_card(title: str, value: str, subtitle: str = "", color: str = "#0f172a") -> None:
-    st.markdown(
-        f"""
-        <div class="metric-card">
-            <div class="metric-title">{title}</div>
-            <div class="metric-value" style="color:{color};">{value}</div>
-            <div class="metric-subtitle">{subtitle}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+def metric_card(
+    title: str,
+    value: str,
+    subtitle: str = "",
+    color: str = "#0f172a",
+    anchor: str | None = None,
+) -> None:
+    """A KPI tile. Pass `anchor` (a section's `anchor=` id) to make the whole card a
+    link that jumps to the detail behind the number — same pattern as `jump_nav()`,
+    so it is a plain anchor with no rerun."""
+    card = f"""
+        <div class="metric-title">{title}</div>
+        <div class="metric-value" style="color:{color};">{value}</div>
+        <div class="metric-subtitle">{subtitle}</div>
+    """
+    if anchor:
+        body = f'<a class="metric-card metric-card-link" href="#{anchor}">{card}</a>'
+    else:
+        body = f'<div class="metric-card">{card}</div>'
+    st.markdown(body, unsafe_allow_html=True)
 
 
 def hero_card(title: str, value: str, subtitle: str = "", color: str = "#dc2626") -> None:
@@ -3525,6 +3534,113 @@ def render_open_imr_button(row: pd.Series, *, key: str) -> None:
             st.switch_page(target)
 
 
+def flag_reason(row: pd.Series) -> str:
+    """Why this module is on a flagged list — bypassed, or which degradation
+    signal(s) fired. Shared by every drill-down so the wording never diverges."""
+    if row["status"] == "bypass":
+        return "Bypassed"
+    tags = []
+    if row["degraded_iqr"]:
+        tags.append("Peer outlier (IQR)")
+    if row["degraded_mom"]:
+        tags.append("MoM jump")
+    return " + ".join(tags) if tags else "Degraded"
+
+
+def build_flagged_detail_table(rows: pd.DataFrame, latest: pd.Timestamp) -> pd.DataFrame:
+    """Every number behind a flag, one row per module, so a drill-down list can be
+    read and exported without opening the workbook. Bypassed modules have no flow or
+    conductivity by definition — those cells read "—" rather than being dropped."""
+    def num(series: pd.Series, fmt: str) -> pd.Series:
+        return series.map(lambda v: format(v, fmt) if pd.notna(v) else "—")
+
+    install = pd.to_datetime(rows["install_date"], errors="coerce")
+    age_years = (pd.Timestamp(latest) - install).dt.days / 365.25
+    delta = rows["conductivity"] - rows["prev_conductivity"]
+
+    return pd.DataFrame(
+        {
+            "Plant": rows["plant"],
+            "Plant No": plant_no_column(rows["plant_sr_no"]),
+            "Zone": rows["zone"],
+            "Stage": rows["stage_label"],
+            "Module": rows["module_label"],
+            "Reason": rows.apply(flag_reason, axis=1),
+            "Conductivity (uS/cm)": num(rows["conductivity"], ",.0f"),
+            "Prev Month (uS/cm)": num(rows["prev_conductivity"], ",.0f"),
+            "Δ Conductivity": delta.map(lambda v: f"{v:+,.0f}" if pd.notna(v) else "—"),
+            "Stage Fence (uS/cm)": num(rows["cutoff"], ",.0f"),
+            "Flow (LPH)": num(rows["flow"], ",.1f"),
+            "Prev Flow (LPH)": num(rows["prev_flow"], ",.1f"),
+            "Install Date": install.dt.strftime("%d %b %Y").fillna("Unknown"),
+            "Age (yrs)": age_years.map(lambda v: f"{v:,.1f}" if pd.notna(v) else "—"),
+            "Report": rows["source_file"],
+        }
+    )
+
+
+def render_flagged_module_list(
+    snapshot: pd.DataFrame, latest: pd.Timestamp, month_text: str, *, bypassed: bool
+) -> None:
+    """The full fleet-wide list behind the Degraded / Bypassed KPI cards.
+
+    `bypassed=True` lists offline modules; otherwise the degraded (still-active)
+    ones. Sorted worst-first by conductivity for degraded, and by plant for
+    bypassed (which have no reading to rank on).
+    """
+    if bypassed:
+        rows = snapshot[snapshot["status"] == "bypass"]
+        title, anchor = "Bypassed modules", "bypassed-modules"
+        caption = (
+            "Every module taken offline this month. A bypass is the strongest "
+            "replacement signal there is — the plant has already stopped using it."
+        )
+        order, ascending = ["plant", "stage_label", "module_label"], True
+        empty = "No bypassed modules"
+    else:
+        rows = snapshot[snapshot["degraded"]]
+        title, anchor = "Degraded modules", "degraded-modules"
+        caption = (
+            "Every still-active module flagged this month — either a peer outlier "
+            "against its own stage (IQR) or an unusual month-over-month jump."
+        )
+        order, ascending = ["conductivity"], False
+        empty = "No degraded modules"
+
+    st.markdown("---")
+    st.subheader(f"{title} — {month_text}", anchor=anchor)
+    if rows.empty:
+        st.success(f"{empty} in {month_text}.")
+        return
+
+    st.caption(f"{len(rows):,} module(s). {caption}")
+    # Sort the source frame so a selected row index still points at the same module.
+    rows = rows.sort_values(order, ascending=ascending).reset_index(drop=True)
+    table = build_flagged_detail_table(rows, latest)
+
+    st.caption("Select a row to open the IMR that module's reading came from.")
+    key = "bypassed" if bypassed else "degraded"
+    event = st.dataframe(
+        table,
+        width="stretch",
+        hide_index=True,
+        height=440,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"portfolio_{key}_list",
+    )
+    picked = event.selection.get("rows", []) if event else []
+    if picked:
+        render_open_imr_button(rows.iloc[picked[0]], key=f"{key}_list")
+
+    st.download_button(
+        f"Download {title.lower()} (CSV)",
+        table.to_csv(index=False).encode("utf-8"),
+        file_name=f"{key}_modules_{month_text.replace(' ', '_')}.csv",
+        mime="text/csv",
+    )
+
+
 def render_plant_flagged_modules(
     snapshot: pd.DataFrame, plant: str, month_text: str
 ) -> None:
@@ -3553,16 +3669,6 @@ def render_plant_flagged_modules(
         f"+ {n_bypass:,} bypassed."
     )
 
-    def _reason(row: pd.Series) -> str:
-        if row["status"] == "bypass":
-            return "Bypassed"
-        tags = []
-        if row["degraded_iqr"]:
-            tags.append("Peer outlier (IQR)")
-        if row["degraded_mom"]:
-            tags.append("MoM jump")
-        return " + ".join(tags) if tags else "Degraded"
-
     flagged = flagged.sort_values(
         ["status", "conductivity"], ascending=[True, False]
     ).reset_index(drop=True)
@@ -3570,7 +3676,7 @@ def render_plant_flagged_modules(
         {
             "Stage": flagged["stage_label"],
             "Module": flagged["module_label"],
-            "Reason": flagged.apply(_reason, axis=1),
+            "Reason": flagged.apply(flag_reason, axis=1),
             "Conductivity (uS/cm)": flagged["conductivity"].map(
                 lambda v: f"{v:,.0f}" if pd.notna(v) else "—"
             ),
@@ -3701,9 +3807,15 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
     with kpis[1]:
         metric_card("Active Modules", f"{active_modules:,}", f"{total_modules:,} total this month")
     with kpis[2]:
-        metric_card("Degraded", f"{degraded:,}", "active, IQR or MoM jump", "#d97706")
+        metric_card(
+            "Degraded", f"{degraded:,}", "click for the full list", "#d97706",
+            anchor="degraded-modules",
+        )
     with kpis[3]:
-        metric_card("Bypassed", f"{bypassed:,}", "offline modules", "#dc2626")
+        metric_card(
+            "Bypassed", f"{bypassed:,}", "click for the full list", "#dc2626",
+            anchor="bypassed-modules",
+        )
     with kpis[4]:
         metric_card(
             "Last Month Demand",
@@ -3730,6 +3842,8 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
     jump_nav(
         [
             ("Plant ranking", "plant-ranking", "per-plant attention"),
+            ("Degraded modules", "degraded-modules", "full list"),
+            ("Bypassed modules", "bypassed-modules", "full list"),
             ("Worst 50 modules", "worst-modules", "highest conductivity"),
             ("Conductivity rises", "cond-rises", "module MoM"),
             ("Flow drops", "flow-drops", "module MoM"),
@@ -3768,6 +3882,10 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
     if selected_rows and not ranking.empty:
         chosen_plant = str(ranking.iloc[selected_rows[0]]["Plant"])
         render_plant_flagged_modules(snapshot, chosen_plant, month_text)
+
+    # ----- 2b. The lists behind the Degraded / Bypassed KPI cards -----
+    render_flagged_module_list(snapshot, selected, month_text, bypassed=False)
+    render_flagged_module_list(snapshot, selected, month_text, bypassed=True)
 
     # ----- 3. Fleet trend -----
     st.markdown("---")
@@ -6166,6 +6284,21 @@ def main() -> None:
             padding: 16px 18px;
             min-height: 118px;
             box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+        }
+        /* A metric card that links to its own detail section. Block-level so the
+           whole tile is the hit area, and it must not pick up link underline/blue —
+           the inner rows set their own colours. */
+        a.metric-card-link {
+            display: block;
+            text-decoration: none;
+            color: inherit;
+            cursor: pointer;
+            transition: border-color .12s ease, box-shadow .12s ease, transform .12s ease;
+        }
+        a.metric-card-link:hover {
+            border-color: #bfdbfe;
+            box-shadow: 0 2px 8px rgba(15, 23, 42, 0.12);
+            transform: translateY(-1px);
         }
         .metric-title {
             color: #64748b;
