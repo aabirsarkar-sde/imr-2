@@ -5068,6 +5068,29 @@ def submission_matrix(df: pd.DataFrame) -> pd.DataFrame:
     return sub.groupby(["plant_sr_no", "month"]).size().unstack(fill_value=0) > 0
 
 
+def plant_search_mask(plants: pd.DataFrame, query: str) -> pd.Series:
+    """Rows of `plants` matching a Plant Register lookup. A query that is exactly a
+    plant's SR No wins outright (so searching 104 doesn't bury it under 1040-1049);
+    otherwise it matches the digits anywhere in an SR No, or the text anywhere in a
+    site name — both case-insensitive."""
+    q = str(query).strip().lower()
+    if not q or plants.empty:
+        return pd.Series(True, index=plants.index)
+
+    sr = plants["plant_sr_no"].astype("string").fillna("")
+    digits = re.sub(r"\D", "", q)
+    if digits:
+        exact = sr == digits
+        if bool(exact.any()):
+            return exact
+
+    name = plants.get("site_name", pd.Series(dtype=object)).reindex(plants.index)
+    mask = name.astype("string").fillna("").str.lower().str.contains(q, regex=False)
+    if digits:
+        mask = mask | sr.str.contains(digits, regex=False)
+    return mask.fillna(False)
+
+
 def render_plant_register(engine: Engine) -> None:
     st.title("Plant Register")
     st.caption(
@@ -5075,23 +5098,13 @@ def render_plant_register(engine: Engine) -> None:
         "zone and whether it's still operating. Fix a zone, add a new client's "
         "plant, or mark a shut-down plant Inactive. The IMR Tracker and every zone "
         "view read from this; an Inactive plant drops out of the tracker's expected "
-        "list but keeps its history. Use the form below to onboard a plant, or edit "
-        "any row in the table; delete a row by selecting it and pressing the trash icon."
+        "list but keeps its history. Use the form below to onboard a plant, the search "
+        "to look one up by SR No, or edit any row in the table; delete a row by "
+        "selecting it and pressing the trash icon."
     )
     plants = load_plants()
 
-    zones = sorted(set(known_zones(plants)) | set(st.session_state.get("extra_zones", [])))
-    with st.expander("➕ Add a new zone (onboarding a new region)"):
-        c1, c2 = st.columns([3, 1])
-        new_zone = c1.text_input(
-            "New zone name", key="new_zone_input",
-            label_visibility="collapsed", placeholder="e.g. Surat",
-        )
-        if c2.button("Add zone") and new_zone.strip():
-            z = canonicalize_zone(new_zone)
-            if z and z not in zones:
-                st.session_state.setdefault("extra_zones", []).append(z)
-            rerun_app()
+    zones = known_zones(plants)
 
     # ----- Add a plant (new business) -----
     with st.expander("🏭 Add a plant (onboarding a new client / site)"):
@@ -5106,7 +5119,6 @@ def render_plant_register(engine: Engine) -> None:
             b1, b2, b3 = st.columns(3)
             new_zone_pick = b1.selectbox(
                 "Zone", options=zones, index=None, placeholder="Pick a zone",
-                help="Not listed? Add it above first, then it appears here.",
             )
             new_capacity = b2.text_input("Capacity", placeholder="e.g. 100 KLD")
             new_type = b3.selectbox(
@@ -5156,44 +5168,50 @@ def render_plant_register(engine: Engine) -> None:
     with fc2:
         st.metric("In view", f"{int(status_label.isin(picked_status).sum())}/{len(plants)}")
 
-    is_full_view = not (picked_status and set(picked_status) != set(PLANT_STATUS_OPTIONS))
-    view = plants if is_full_view else plants[status_label.isin(picked_status)]
+    # ----- Look up a plant by SR No (or name) -----
+    query = st.text_input(
+        "🔎 Find a plant",
+        placeholder="SR No (e.g. 1043) or part of a site name",
+        help="Filters the table to the matching plants. An SR No matches exactly first; "
+             "if nothing has that SR, the digits are matched anywhere in an SR No. "
+             "Editing/saving affects just the rows shown.",
+    ).strip()
+
+    status_filtered = bool(picked_status) and set(picked_status) != set(PLANT_STATUS_OPTIONS)
+    view = plants[status_label.isin(picked_status)] if status_filtered else plants
+    if query and not view.empty:
+        view = view[plant_search_mask(view, query)]
+    # A save may only delete rows that were on screen, so a search counts as a filter.
+    is_full_view = not status_filtered and not query
     # SRs currently on screen — bounds what a save is allowed to delete.
     scope_srs = set(pd.to_numeric(view["plant_sr_no"], errors="coerce").dropna().astype(int)) \
         if not view.empty else set()
 
-    # ----- Sort (the editor's headers aren't clickable, so sort explicitly) -----
-    SORT_COLUMNS = {
-        "Zone, then SR No": ["zone", "plant_sr_no"],
-        "SR No": ["plant_sr_no"],
-        "Site name": ["site_name"],
-        "Zone": ["zone"],
-        "Capacity": ["installed_capacity"],
-        "Status": ["status"],
-        "Type": ["plant_type"],
-    }
-    s1, s2 = st.columns([4, 1])
-    sort_by = s1.selectbox(
-        "Sort by", list(SORT_COLUMNS), index=0,
-        help="Reorders the table below. Display-only — it doesn't change what a save "
-             "writes, but it does reset any edits you haven't saved yet.",
-    )
-    ascending = s2.radio(
-        "Order", ["A→Z", "Z→A"], index=0, horizontal=True, label_visibility="hidden",
-    ) == "A→Z"
-    if not view.empty:
-        keys = [c for c in SORT_COLUMNS[sort_by] if c in view.columns]
-        if keys:
-            sort_frame = view[keys].copy()
-            for col in keys:
-                if col != "plant_sr_no":  # case-insensitive text sort, blanks last
-                    sort_frame[col] = (
-                        sort_frame[col].astype("string").str.strip().str.lower()
-                        .replace("", pd.NA)
-                    )
-            view = view.loc[
-                sort_frame.sort_values(keys, ascending=ascending, na_position="last").index
-            ]
+    if query:
+        if view.empty:
+            st.warning(
+                f"No plant matches “{query}”. If this is a new site, add it above — "
+                "and check the status filter isn't hiding it."
+            )
+        elif len(view) == 1:
+            hit = view.iloc[0]
+            st.success(
+                f"SR {int(hit['plant_sr_no'])} · {hit.get('site_name') or 'unnamed'} · "
+                f"{hit.get('zone') or 'no zone'} · "
+                f"{canonical_plant_type(hit.get('plant_type')) or DEFAULT_PLANT_TYPE} · "
+                f"{canonical_status(hit.get('status')) or 'Active'}"
+                + (f" · {hit['installed_capacity']}" if hit.get("installed_capacity") else "")
+            )
+        else:
+            st.info(f"{len(view)} plants match “{query}”.")
+
+    # Always A-Z by site name (case-insensitive, unnamed plants last) — the editor's
+    # headers aren't clickable, so the order is fixed here rather than left to the user.
+    if not view.empty and "site_name" in view.columns:
+        key = (
+            view["site_name"].astype("string").str.strip().str.lower().replace("", pd.NA)
+        )
+        view = view.loc[key.sort_values(na_position="last").index]
 
     GRID_COLUMNS = [
         "plant_sr_no", "site_name", "zone", "installed_capacity", "plant_type", "status",
@@ -5208,10 +5226,10 @@ def render_plant_register(engine: Engine) -> None:
         lambda v: canonical_plant_type(v) or DEFAULT_PLANT_TYPE
     )
 
-    # The editor keys its pending edits by row POSITION, so re-sorting or re-filtering
-    # would reapply them to the wrong plants. Fold both into the key: a change starts
-    # the editor fresh on the new ordering (and discards unsaved edits).
-    editor_key = f"plant_editor::{sort_by}::{ascending}::{','.join(sorted(picked_status))}"
+    # The editor keys its pending edits by row POSITION, so re-filtering would reapply
+    # them to the wrong plants. Fold the filter and the search into the key: changing
+    # either starts the editor fresh on the new row set (and discards unsaved edits).
+    editor_key = f"plant_editor::{','.join(sorted(picked_status))}::{query.lower()}"
     edited = st.data_editor(
         grid,
         num_rows="dynamic",
