@@ -1297,6 +1297,25 @@ def get_engine() -> Engine | None:
 def init_db(engine: Engine) -> None:
     DB_METADATA.create_all(engine)
     migrate_added_columns(engine)
+    migrate_renamed_statuses(engine)
+
+
+# Register statuses that have been relabelled. Reads all go through
+# `canonical_status()`, which still resolves the old spellings, so this is only to
+# stop the retired label from lingering in the stored data.
+_RENAMED_STATUSES = {"STRO": "STPT RO"}
+
+
+def migrate_renamed_statuses(engine: Engine) -> None:
+    inspector = inspect(engine)
+    if not inspector.has_table("plants"):
+        return
+    with engine.begin() as conn:
+        for old, new in _RENAMED_STATUSES.items():
+            conn.execute(
+                text("UPDATE plants SET status = :new WHERE status = :old"),
+                {"new": new, "old": old},
+            )
 
 
 # Tables the app maintains in-app (not rebuilt by re-ingest), so a column added to
@@ -1664,13 +1683,16 @@ def known_zones(plants: pd.DataFrame) -> list[str]:
 # it's excluded from the IMR Tracker's roster. (SPRO = spiral RO, UF RO =
 # ultrafiltration RO: these report differently, not as per-module IMRs.)
 PLANT_STATUS_OPTIONS = [
-    "Active", "Inactive", "STRO", "SPRO", "UF RO",
+    "Active", "Inactive", "STPT RO", "SPRO", "UF RO",
     "Stand By RO", "Not in Rochem Scope", "Plant Shutdown",
 ]
 _STATUS_ALIASES = {
     "active": "Active",
     "inactive": "Inactive",
-    "stro": "STRO",
+    # "STRO" was the old label for this status; rows already stored under it (and
+    # workbooks that spell it either way) still resolve to the current one.
+    "stpt ro": "STPT RO", "stptro": "STPT RO", "stpt": "STPT RO",
+    "stro": "STPT RO", "st ro": "STPT RO", "st-ro": "STPT RO",
     "spro": "SPRO", "spiral ro": "SPRO", "sp ro": "SPRO",
     "uf ro": "UF RO", "ufro": "UF RO",
     "stand by ro": "Stand By RO", "standby ro": "Stand By RO", "standby": "Stand By RO",
@@ -3019,7 +3041,7 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
         "plant_group", "plant", "plant_sr_no", "zone", "stage_label",
         "module_label", "report_date", "conductivity", "prev_conductivity",
         "flow", "prev_flow", "install_date", "status", "degraded_iqr",
-        "degraded_mom", "degraded", "need", "cutoff",
+        "degraded_mom", "degraded", "need", "cutoff", "source_file",
     ]
     if readings.empty:
         return pd.DataFrame(columns=columns)
@@ -3051,6 +3073,9 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
             flow=(flow_col, "mean"),
             install_date=("install_date", "first"),
             is_bypass=("status", lambda s: bool((s == "bypass").any())),
+            # The workbook this month's reading was parsed from, so a module row can
+            # link straight back to its own IMR in the preview.
+            source_file=("source_file", "first"),
         )
         active = agg[~agg["is_bypass"]]
         cutoff = float("nan")
@@ -3080,6 +3105,7 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
                     "status": "bypass" if bypass else "active",
                     "degraded_iqr": degraded_iqr,
                     "cutoff": cutoff,
+                    "source_file": row["source_file"],
                 }
             )
 
@@ -3452,6 +3478,53 @@ def make_age_profile_chart(snapshot: pd.DataFrame, latest: pd.Timestamp) -> go.F
     return fig
 
 
+# st.switch_page() needs the actual Page object, and the pages are built inside
+# main(); this lets one page navigate to another by name. Repopulated every run.
+PAGES: dict[str, object] = {}
+
+
+def render_open_imr_button(row: pd.Series, *, key: str) -> None:
+    """For one selected module row, offer a jump to the IMR Preview showing the
+    workbook that reading was parsed from.
+
+    `row` must come from the fleet-status frame (not a display table), so it still
+    carries `source_file` / `plant_sr_no`. The request is handed to the preview page
+    through session state; that page decides whether the file is still previewable.
+    """
+    plant = str(row.get("plant") or "")
+    sr = row.get("plant_sr_no")
+    source = row.get("source_file")
+    stage = str(row.get("stage_label") or "")
+    module = str(row.get("module_label") or "")
+    when = row.get("report_date")
+    month = pd.Timestamp(when).strftime("%b %Y") if pd.notna(when) else ""
+
+    who = f"{plant}{f' (SR {int(sr)})' if pd.notna(sr) else ''}"
+    st.markdown(f"**{who}** · {stage} · Module {module}{f' · {month}' if month else ''}")
+
+    if not source or pd.isna(source):
+        st.info("No source workbook is recorded for this reading, so there is nothing to open.")
+        return
+
+    if st.button(
+        f"📗 Open {source} in IMR Preview",
+        key=f"open_imr_{key}",
+        type="primary",
+        help="Opens the raw workbook this reading came from, with the plant pre-searched.",
+    ):
+        st.session_state["preview_open_request"] = {
+            "source_file": str(source),
+            # Search by SR No when we have one — it is unambiguous where a site name
+            # may be spelled differently across the sheet, MIS, and register.
+            "query": str(int(sr)) if pd.notna(sr) else plant,
+        }
+        target = PAGES.get("preview")
+        if target is None:  # navigation not built yet (shouldn't happen in-app)
+            st.error("The IMR Preview page is unavailable.")
+        else:
+            st.switch_page(target)
+
+
 def render_plant_flagged_modules(
     snapshot: pd.DataFrame, plant: str, month_text: str
 ) -> None:
@@ -3492,7 +3565,7 @@ def render_plant_flagged_modules(
 
     flagged = flagged.sort_values(
         ["status", "conductivity"], ascending=[True, False]
-    )
+    ).reset_index(drop=True)
     detail = pd.DataFrame(
         {
             "Stage": flagged["stage_label"],
@@ -3512,7 +3585,19 @@ def render_plant_flagged_modules(
             ),
         }
     )
-    st.dataframe(detail, width="stretch", hide_index=True)
+    st.caption("Select a row to open the IMR that module's reading came from.")
+    detail_event = st.dataframe(
+        detail,
+        width="stretch",
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        # Keyed per plant so switching plants doesn't carry a stale row selection.
+        key=f"flagged_modules::{plant}",
+    )
+    detail_rows = detail_event.selection.get("rows", []) if detail_event else []
+    if detail_rows:
+        render_open_imr_button(flagged.iloc[detail_rows[0]], key=f"flagged::{plant}")
     st.download_button(
         "Download flagged modules (CSV)",
         detail.to_csv(index=False).encode("utf-8"),
@@ -3933,9 +4018,16 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
             install_year = pd.to_datetime(
                 snapshot["install_date"], errors="coerce"
             ).dt.year
-            cohort = snapshot[install_year.astype("Int64").astype(str).isin(picked_years)]
+            # Sort the source frame, not the display table, so a selected row index
+            # still points at the same module in `cohort` (which carries source_file).
+            cohort = (
+                snapshot[install_year.astype("Int64").astype(str).isin(picked_years)]
+                .sort_values(["plant", "stage_label", "module_label"])
+                .reset_index(drop=True)
+            )
             year_text = ", ".join(sorted(picked_years))
             st.markdown(f"**Modules installed in {year_text}** — {len(cohort):,} fitted")
+            st.caption("Select a row to open the IMR that module's reading came from.")
             cohort_table = pd.DataFrame(
                 {
                     "Plant": cohort["plant"],
@@ -3948,8 +4040,19 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
                     ).dt.strftime("%d %b %Y"),
                     "Status": cohort["status"],
                 }
-            ).sort_values(["Plant", "Stage", "Module"])
-            st.dataframe(cohort_table, width="stretch", hide_index=True, height=360)
+            )
+            cohort_event = st.dataframe(
+                cohort_table,
+                width="stretch",
+                hide_index=True,
+                height=360,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="portfolio_age_cohort",
+            )
+            cohort_rows = cohort_event.selection.get("rows", []) if cohort_event else []
+            if cohort_rows:
+                render_open_imr_button(cohort.iloc[cohort_rows[0]], key="age_cohort")
             st.download_button(
                 "Download these modules (CSV)",
                 cohort_table.to_csv(index=False).encode("utf-8"),
@@ -5538,6 +5641,17 @@ def _col_letter(col_idx: int) -> str:
     return result
 
 
+def is_dark_hex(rgb: str) -> bool:
+    """True if a 6-digit RRGGBB fill is dark enough that text on it must be light.
+    Uses perceived luminance (ITU-R BT.601), so a mid yellow counts as light and a
+    mid blue as dark, the way the eye reads them."""
+    try:
+        r, g, b = (int(rgb[i:i + 2], 16) for i in (0, 2, 4))
+    except (ValueError, IndexError):
+        return False
+    return (0.299 * r + 0.587 * g + 0.114 * b) < 140
+
+
 def _render_sheet_as_excel_html(
     ws, *, max_rows: int = 200, max_cols: int | None = None
 ) -> str:
@@ -5608,7 +5722,10 @@ def _render_sheet_as_excel_html(
             except Exception:  # noqa: BLE001
                 pass
 
-            # Build cell background from fill.
+            # Build cell background from fill. The workbook's own font colours are
+            # not carried over, so a dark fill (navy/dark-green banner rows are
+            # common in these sheets) would render dark-on-dark — pair it with light
+            # text instead.
             bg = ""
             try:
                 if cell.fill and cell.fill.fgColor and cell.fill.fgColor.rgb and cell.fill.fgColor.rgb not in ("00000000", "0",):
@@ -5617,6 +5734,7 @@ def _render_sheet_as_excel_html(
                         rgb = rgb[2:]  # strip alpha
                     if len(rgb) == 6 and rgb != "000000":
                         bg = f"background:#{rgb};"
+                        bg += "color:#ffffff;" if is_dark_hex(rgb) else "color:#111827;"
             except Exception:  # noqa: BLE001
                 pass
 
@@ -5639,7 +5757,7 @@ def _render_sheet_as_excel_html(
     clipped_note = ""
     if (ws.max_row or 0) > max_rows:
         clipped_note = (
-            f'<tr><td colspan="{n_cols + 1}" style="text-align:center;color:#64748b;'
+            f'<tr><td colspan="{n_cols + 1}" style="text-align:center;color:#475569;'
             f'font-style:italic;padding:8px;">Showing first {max_rows} of '
             f'{ws.max_row} rows</td></tr>'
         )
@@ -5665,6 +5783,10 @@ EXCEL_PREVIEW_CSS = """
 table.xl-sheet {
     border-collapse: collapse;
     font-family: Calibri, "Segoe UI", Arial, sans-serif;
+    /* The sheet is painted on a white ground, so its text colour must be pinned
+       here — inheriting Streamlit's body colour renders grey (or near-white under a
+       dark theme) text on white cells. */
+    color: #111827;
     font-size: 12px;
     white-space: nowrap;
     width: max-content;
@@ -5722,6 +5844,7 @@ table.xl-sheet td.xl-row-hdr {
 /* Data cells — white default */
 table.xl-sheet td {
     background: #ffffff;
+    color: #111827;
 }
 /* Sheet tab bar */
 .xl-tab-bar {
@@ -5850,6 +5973,15 @@ def render_imr_preview(engine: Engine) -> None:
         "SR No or site name to find the reports a particular plant appears in."
     )
 
+    # A deep link from another page (selecting a module on the Portfolio) hands off
+    # the plant to search for and the exact workbook to open. Seeding the widget keys
+    # before the widgets are built is what makes them come up pre-filled; popping the
+    # request means later reruns on this page behave normally.
+    request = st.session_state.pop("preview_open_request", None)
+    if request:
+        st.session_state["preview_plant_query"] = str(request.get("query") or "")
+    requested_file = str(request.get("source_file")) if request else None
+
     stored = report_files_index(engine)
     if not stored:
         st.info(
@@ -5871,11 +6003,24 @@ def render_imr_preview(engine: Engine) -> None:
         key="preview_plant_query",
     ).strip()
 
+    if requested_file and requested_file not in stored:
+        st.warning(
+            f"The raw file for **{requested_file}** is not in the report store, so it "
+            "cannot be previewed. It was likely ingested before reports were kept "
+            "byte-for-byte — re-upload it to make it previewable. Showing the other "
+            "reports for this plant instead."
+        )
+        requested_file = None
+
     options = stored
     if query:
         index = report_plant_index(load_readings(), load_mis(), load_plants())
         hits = index[plant_search_mask(index, query)] if not index.empty else index
         files = {f for f in hits["source_file"] if f in set(stored)}
+        if requested_file:
+            # The caller already knows this report holds the plant; never let the
+            # name-matching drop the very file we were asked to open.
+            files.add(requested_file)
         if not files:
             st.warning(
                 f"No stored report contains a plant matching “{query}”. Showing every "
@@ -5901,15 +6046,24 @@ def render_imr_preview(engine: Engine) -> None:
                 + (" …" if len(found) > 5 else "")
             )
 
+    # The query is part of the key so narrowing the list can't leave a stale
+    # selection pointing at a report that is no longer an option.
+    choice_key = f"preview_report_choice::{query.lower()}"
+    if requested_file in options:
+        # Clear anything this key is holding from an earlier visit, so the widget
+        # initializes from `index` below and the deep link wins.
+        st.session_state.pop(choice_key, None)
+        default_index = options.index(requested_file)
+    elif query and len(options) == 1 and options is not stored:
+        default_index = 0  # a search that lands on a single report opens it
+    else:
+        default_index = None
     choice = st.selectbox(
         "Select a report to preview",
         options,
-        # A search that lands on a single report opens it straight away.
-        index=0 if (query and len(options) == 1 and options is not stored) else None,
+        index=default_index,
         placeholder="Pick a committed report…",
-        # The query is part of the key so narrowing the list can't leave a stale
-        # selection pointing at a report that is no longer an option.
-        key=f"preview_report_choice::{query.lower()}",
+        key=choice_key,
     )
 
     if not choice:
@@ -6145,6 +6299,14 @@ def main() -> None:
 
     render_data_manager(engine)
 
+    PAGES.clear()
+    PAGES["preview"] = st.Page(
+        lambda: render_imr_preview(engine),
+        title="IMR Preview",
+        icon="🔍",
+        url_path="preview",
+    )
+
     pages = st.navigation(
         [
             st.Page(
@@ -6166,12 +6328,7 @@ def main() -> None:
                 icon="🏭",
                 url_path="register",
             ),
-            st.Page(
-                lambda: render_imr_preview(engine),
-                title="IMR Preview",
-                icon="🔍",
-                url_path="preview",
-            ),
+            PAGES["preview"],
             st.Page(
                 lambda: render_scan_page(engine),
                 title="Scan IMR",
