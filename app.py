@@ -28,6 +28,7 @@ from sqlalchemy import (
     Table,
     Text,
     create_engine,
+    inspect,
     text,
 )
 from sqlalchemy.engine import Engine
@@ -1258,6 +1259,7 @@ PLANTS_TABLE = Table(
     Column("zone", Text),
     Column("installed_capacity", Text),
     Column("status", Text),  # "active" (expected to report) / "inactive" (shut down)
+    Column("plant_type", Text),  # PLANT_TYPE_OPTIONS; defaults to "PT"
     Column("updated_at", DateTime),
 )
 
@@ -1294,6 +1296,38 @@ def get_engine() -> Engine | None:
 
 def init_db(engine: Engine) -> None:
     DB_METADATA.create_all(engine)
+    migrate_added_columns(engine)
+
+
+# Tables the app maintains in-app (not rebuilt by re-ingest), so a column added to
+# one of them has to be ALTERed onto the live table — a re-parse won't backfill it.
+MIGRATED_TABLES = ("plants",)
+
+
+def migrate_added_columns(engine: Engine) -> None:
+    """`create_all()` creates MISSING tables but never ALTERs an existing one, so a
+    column added to a table that is already live in prod has to be patched on. Adds
+    any column the Table definition has and the live table lacks. Portable across
+    Postgres and SQLite (neither is given a DEFAULT — the app treats NULL as blank
+    and normalizes on save)."""
+    inspector = inspect(engine)
+    for name in MIGRATED_TABLES:
+        table = DB_METADATA.tables.get(name)
+        if table is None or not inspector.has_table(name):
+            continue
+        live = {c["name"] for c in inspector.get_columns(name)}
+        for col in table.columns:
+            if col.name in live:
+                continue
+            col_type = col.type.compile(engine.dialect)
+            with engine.begin() as conn:
+                conn.execute(text(f"ALTER TABLE {name} ADD COLUMN {col.name} {col_type}"))
+                # Existing plants predate the type column — seed them to the default
+                # so the register never shows a blank type.
+                if (name, col.name) == ("plants", "plant_type"):
+                    conn.execute(text(
+                        "UPDATE plants SET plant_type = :t WHERE plant_type IS NULL"
+                    ), {"t": DEFAULT_PLANT_TYPE})
 
 
 def file_fingerprint(path: Path) -> str:
@@ -1656,6 +1690,34 @@ def canonical_status(status: object) -> str | None:
     return _STATUS_ALIASES.get(key)
 
 
+# The kind of system installed at a plant, picked per plant on the Plant Register.
+# Everything starts as PT (the default) until someone marks the exceptions.
+PLANT_TYPE_OPTIONS = [
+    "PT", "HP", "SP", "STPT", "UF", "LP", "Wringer", "Hybrid RO", "Chemical",
+    "Utility", "Aqua",
+]
+DEFAULT_PLANT_TYPE = "PT"
+_PLANT_TYPE_BY_KEY = {t.lower(): t for t in PLANT_TYPE_OPTIONS}
+_PLANT_TYPE_ALIASES = {
+    "hybrid": "Hybrid RO", "hybridro": "Hybrid RO", "hybrid r o": "Hybrid RO",
+    "st pt": "STPT", "st-pt": "STPT",
+    "uf ro": "UF", "ufro": "UF",
+    "chemicals": "Chemical", "chem": "Chemical",
+    "utilities": "Utility",
+}
+
+
+def canonical_plant_type(plant_type: object) -> str | None:
+    """Map a raw plant type to one of PLANT_TYPE_OPTIONS, or None for a blank or
+    unrecognized value (the caller decides whether to fall back to the default)."""
+    if plant_type is None or (isinstance(plant_type, float) and pd.isna(plant_type)):
+        return None
+    key = re.sub(r"\s+", " ", str(plant_type)).strip().lower()
+    if not key:
+        return None
+    return _PLANT_TYPE_BY_KEY.get(key) or _PLANT_TYPE_ALIASES.get(key)
+
+
 def status_is_reporting(status: object) -> bool:
     """True if the plant is expected to submit a monthly IMR — i.e. Active (or a
     blank status). Every exception flag (Inactive, shutdown, standby, out-of-scope,
@@ -1708,6 +1770,7 @@ def seed_plants_if_empty(engine: Engine, data_dir: str) -> int:
 
     frame = pd.DataFrame({r["plant_sr_no"]: r for r in rows}.values())  # de-dupe by SR
     frame["status"] = "active"
+    frame["plant_type"] = DEFAULT_PLANT_TYPE
     frame["updated_at"] = datetime.now(timezone.utc)
     frame = frame.reindex(columns=PLANTS_COLUMNS)
     frame.to_sql("plants", engine, if_exists="append", index=False, method="multi", chunksize=500)
@@ -1736,6 +1799,11 @@ def save_plants(
     clean["status"] = pd.Series(status, index=clean.index).map(
         lambda v: canonical_status(v) or "Active"
     )
+    # Same for the system type: blank/unrecognized -> the default (PT).
+    ptype = clean["plant_type"] if "plant_type" in clean else None
+    clean["plant_type"] = pd.Series(ptype, index=clean.index).map(
+        lambda v: canonical_plant_type(v) or DEFAULT_PLANT_TYPE
+    )
     for col in ("site_name", "installed_capacity"):
         if col in clean:
             clean[col] = clean[col].map(lambda v: None if pd.isna(v) else (str(v).strip() or None))
@@ -1763,6 +1831,7 @@ def add_plant(
     zone: str | None,
     installed_capacity: str | None,
     status: str | None,
+    plant_type: str | None = None,
 ) -> None:
     """Insert one new plant into the register (onboarding a new client's plant).
 
@@ -1788,6 +1857,7 @@ def add_plant(
                 (str(installed_capacity).strip() or None) if installed_capacity else None
             ),
             "status": canonical_status(status) or "Active",
+            "plant_type": canonical_plant_type(plant_type) or DEFAULT_PLANT_TYPE,
             "updated_at": datetime.now(timezone.utc),
         }]).reindex(columns=PLANTS_COLUMNS)
         row.to_sql("plants", conn, if_exists="append", index=False)
@@ -2003,6 +2073,11 @@ def load_plants() -> pd.DataFrame:
     if "status" in df:
         # Keep the stored casing (e.g. "Plant Shutdown"); logic normalizes as needed.
         df["status"] = df["status"].fillna("active").astype(str).str.strip()
+    if "plant_type" in df:
+        # Rows written before the type column existed read as blank -> the default.
+        df["plant_type"] = df["plant_type"].map(
+            lambda v: canonical_plant_type(v) or DEFAULT_PLANT_TYPE
+        )
     return df.sort_values(["zone", "plant_sr_no"], na_position="last").reset_index(drop=True)
 
 
@@ -5034,7 +5109,13 @@ def render_plant_register(engine: Engine) -> None:
                 help="Not listed? Add it above first, then it appears here.",
             )
             new_capacity = b2.text_input("Capacity", placeholder="e.g. 100 KLD")
-            new_status = b3.selectbox("Status", options=PLANT_STATUS_OPTIONS, index=0)
+            new_type = b3.selectbox(
+                "Type", options=PLANT_TYPE_OPTIONS,
+                index=PLANT_TYPE_OPTIONS.index(DEFAULT_PLANT_TYPE),
+                help="The kind of system at this plant. Leave as the default (PT) if "
+                     "you're not sure — it can be changed in the table any time.",
+            )
+            new_status = st.selectbox("Status", options=PLANT_STATUS_OPTIONS, index=0)
             submitted = st.form_submit_button("Add plant", type="primary")
         if submitted:
             if new_sr is None:
@@ -5044,7 +5125,7 @@ def render_plant_register(engine: Engine) -> None:
             else:
                 try:
                     add_plant(engine, int(new_sr), new_site, new_zone_pick,
-                              new_capacity, new_status)
+                              new_capacity, new_status, new_type)
                 except ValueError as exc:
                     st.error(str(exc))
                 else:
@@ -5089,6 +5170,7 @@ def render_plant_register(engine: Engine) -> None:
         "Zone": ["zone"],
         "Capacity": ["installed_capacity"],
         "Status": ["status"],
+        "Type": ["plant_type"],
     }
     s1, s2 = st.columns([4, 1])
     sort_by = s1.selectbox(
@@ -5113,15 +5195,18 @@ def render_plant_register(engine: Engine) -> None:
                 sort_frame.sort_values(keys, ascending=ascending, na_position="last").index
             ]
 
-    grid = view.reindex(
-        columns=["plant_sr_no", "site_name", "zone", "installed_capacity", "status"]
-    )
+    GRID_COLUMNS = [
+        "plant_sr_no", "site_name", "zone", "installed_capacity", "plant_type", "status",
+    ]
+    grid = view.reindex(columns=GRID_COLUMNS)
     if grid.empty:
-        grid = pd.DataFrame(
-            columns=["plant_sr_no", "site_name", "zone", "installed_capacity", "status"]
-        )
+        grid = pd.DataFrame(columns=GRID_COLUMNS)
     grid = grid.reset_index(drop=True)
     grid["status"] = grid["status"].map(canonical_status)
+    # Everything is PT until someone marks the exceptions.
+    grid["plant_type"] = grid["plant_type"].map(
+        lambda v: canonical_plant_type(v) or DEFAULT_PLANT_TYPE
+    )
 
     # The editor keys its pending edits by row POSITION, so re-sorting or re-filtering
     # would reapply them to the wrong plants. Fold both into the key: a change starts
@@ -5138,6 +5223,11 @@ def render_plant_register(engine: Engine) -> None:
             "site_name": st.column_config.TextColumn("Site name", width="large"),
             "zone": st.column_config.SelectboxColumn("Zone", options=zones, width="medium"),
             "installed_capacity": st.column_config.TextColumn("Capacity", width="small"),
+            "plant_type": st.column_config.SelectboxColumn(
+                "Type", options=PLANT_TYPE_OPTIONS, width="small", required=True,
+                help="The kind of system installed at this plant. Everything starts as "
+                     "PT — change the ones that aren't.",
+            ),
             "status": st.column_config.SelectboxColumn(
                 "Status", options=PLANT_STATUS_OPTIONS, width="medium",
                 help="Leave blank for a normal RO plant that reports monthly. Pick a "
@@ -5186,6 +5276,15 @@ def render_plant_register(engine: Engine) -> None:
             f"{len(plants)} plants ({reporting} reporting, "
             f"{len(plants) - reporting} flagged) · {tally}"
         )
+        types = (
+            plants.get("plant_type", pd.Series(dtype=object))
+            .reindex(plants.index)
+            .map(lambda v: canonical_plant_type(v) or DEFAULT_PLANT_TYPE)
+            .value_counts()
+        )
+        st.caption("Types · " + " · ".join(
+            f"{t}: {int(types[t])}" for t in PLANT_TYPE_OPTIONS if types.get(t, 0) > 0
+        ))
 
 
 def render_input_tracker(df: pd.DataFrame, plants: pd.DataFrame) -> None:

@@ -88,6 +88,12 @@ runs on Postgres (prod) and SQLite (tests).
   columns. Because ingest is DELETE-then-insert by `source_file`, re-ingest never duplicates.
   **Always run the ALTERs before re-ingest** — `to_sql(..., if_exists="append")` fails if a
   DataFrame column has no matching table column.
+- **Exception: tables listed in `MIGRATED_TABLES`** (currently just `plants`) migrate
+  themselves. `init_db()` calls `migrate_added_columns()`, which diffs the `Table`
+  definition against the live table and ALTERs in whatever is missing — needed because
+  `plants` is maintained in-app, so no re-ingest would ever back-fill it. Add a column to
+  `PLANTS_TABLE` and it appears on the next boot; add its default back-fill next to the
+  `plant_type` one if blank isn't an acceptable starting value.
 
 ## Key conventions
 
