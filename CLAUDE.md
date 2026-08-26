@@ -88,12 +88,29 @@ runs on Postgres (prod) and SQLite (tests).
   columns. Because ingest is DELETE-then-insert by `source_file`, re-ingest never duplicates.
   **Always run the ALTERs before re-ingest** — `to_sql(..., if_exists="append")` fails if a
   DataFrame column has no matching table column.
-- **Exception: tables listed in `MIGRATED_TABLES`** (currently just `plants`) migrate
+- **Exception: tables listed in `MIGRATED_TABLES`** (`plants`, `parameters`) migrate
   themselves. `init_db()` calls `migrate_added_columns()`, which diffs the `Table`
   definition against the live table and ALTERs in whatever is missing — needed because
   `plants` is maintained in-app, so no re-ingest would ever back-fill it. Add a column to
   `PLANTS_TABLE` and it appears on the next boot; add its default back-fill next to the
   `plant_type` one if blank isn't an acceptable starting value.
+  For an **ingest-built** table in that list, the ALTER can't fill the column on its own,
+  so pair it with a `DELETE FROM ingested_files` in the same `if` (see the
+  `("parameters", "plant_sr_no")` case) — that makes the startup `ingest_reports` treat
+  every report as new and back-fill by re-parsing. `init_db()` runs before both ingest
+  passes in `main()`, so the ALTER always lands first.
+
+## Plant identity
+
+**A plant IS its `plant_sr_no`, never its display name.** Sheet names collide in both
+directions: several sites run two RO trains under one name ("Aarti Jhagadia" is both 1957
+and 2708), and one plant is renamed or misspelled across months ("Glenmark Ank RO 1
+(1748)" is now "Alivus Life science LTD"). So **every per-plant groupby, dedup, join or
+picker keys on `plant_identity_key()`** (the SR, falling back to the name only when no SR
+could be resolved) — grouping on `plant` merges two physically separate plants and
+mislabels their Plant SR No. `readings` and `parameters` both carry `plant_sr_no`;
+`plant_level_frame()` attaches it (plus `plant_key` and `zone`) to a parameter frame, and
+`current_plant_name()` picks the name to display for a set of rows.
 
 ## Key conventions
 

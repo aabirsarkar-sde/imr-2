@@ -94,6 +94,10 @@ PARAM_COLUMNS = [
     "source_file",
     "plant_group",
     "plant",
+    # The plant's id, resolved at parse time from the sheet's COVER block or its
+    # name. Two RO trains at one site share a display name ("Aarti Jhagadia" is
+    # both 1957 and 2708), so the SR — not the name — is a plant's identity.
+    "plant_sr_no",
     "report_date",
     "tag",
     "kind",
@@ -188,6 +192,30 @@ def plant_sr_no_from_name(name: object) -> int | None:
         return int(parens[-1])
     match = re.search(r"(\d{3,})\s*\.?\s*$", text)
     return int(match.group(1)) if match else None
+
+
+def current_plant_name(frame: pd.DataFrame) -> str:
+    """The name to display for one plant's rows — the one its most recent report
+    used. Plants get renamed (Glenmark -> Alivus, Solvay -> Synesqo, Piramal ->
+    PGP) and misspelled, so rows sharing a Plant SR No can carry several names;
+    showing an arbitrary one would label a plant with a name it has retired."""
+    if frame.empty:
+        return ""
+    if "report_date" in frame.columns and frame["report_date"].notna().any():
+        frame = frame.sort_values("report_date")
+    return str(frame["plant"].iloc[-1])
+
+
+def plant_identity_key(frame: pd.DataFrame) -> pd.Series:
+    """The value that identifies a plant: its Plant SR No, or its display name
+    when no SR could be resolved.
+
+    A site can run several RO trains whose sheets carry ONE display name — "Aarti
+    Jhagadia" is both 1957 and 2708, "Ami life karakhadi" is both 3247 and 3251 —
+    so any grouping, dedup or join on the name alone silently merges two
+    physically separate plants. Every per-plant rollup keys on this instead."""
+    sr = pd.to_numeric(frame["plant_sr_no"], errors="coerce").astype("Int64")
+    return sr.astype(object).where(sr.notna(), frame["plant"].astype(str))
 
 
 def parse_report_metadata(path: Path) -> ReportMeta:
@@ -866,6 +894,7 @@ def extract_operating_parameters(
     sheet_name: str,
     metadata: ReportMeta,
     plant_override: str | None = None,
+    plant_sr_no_override: int | None = None,
 ) -> list[dict[str, object]]:
     """Scan a raw sheet for (tag, value, unit) instrument readings.
 
@@ -876,6 +905,11 @@ def extract_operating_parameters(
     occurrence of a tag wins.
     """
     plant = plant_override or clean_sheet_name(sheet_name)
+    plant_sr_no = (
+        plant_sr_no_override
+        if plant_sr_no_override is not None
+        else plant_sr_no_from_name(sheet_name)
+    )
     found: dict[str, dict[str, object]] = {}
     rows, cols = raw.shape
 
@@ -904,6 +938,7 @@ def extract_operating_parameters(
                 "source_file": report_path.name,
                 "plant_group": metadata.plant_group,
                 "plant": plant,
+                "plant_sr_no": plant_sr_no,
                 "report_date": metadata.report_date,
                 "tag": tag.upper(),
                 "kind": kind,
@@ -927,11 +962,12 @@ def read_report_parameters(path: Path) -> list[dict[str, object]]:
         raw = pd.read_excel(path, sheet_name=sheet_name, header=None)
         if is_master_om_list(raw):
             return []
-        plant, _sr, eff_meta, _cover = sheet_context(raw, sheet_name, metadata)
+        plant, plant_sr_no, eff_meta, _cover = sheet_context(raw, sheet_name, metadata)
         records.extend(
             extract_operating_parameters(
                 raw,
                 plant_override=plant,
+                plant_sr_no_override=plant_sr_no,
                 report_path=path,
                 sheet_name=sheet_name,
                 metadata=eff_meta,
@@ -1197,6 +1233,10 @@ PARAMETERS_TABLE = Table(
     Column("source_file", Text),
     Column("plant_group", Text),
     Column("plant", Text),
+    # Same id as readings.plant_sr_no — a plant's real identity. Sites run more
+    # than one RO train under one display name, so plant-level analytics key on
+    # this, never on `plant`.
+    Column("plant_sr_no", Integer),
     Column("report_date", Date),
     Column("tag", Text),
     Column("kind", Text),
@@ -1318,9 +1358,12 @@ def migrate_renamed_statuses(engine: Engine) -> None:
             )
 
 
-# Tables the app maintains in-app (not rebuilt by re-ingest), so a column added to
-# one of them has to be ALTERed onto the live table — a re-parse won't backfill it.
-MIGRATED_TABLES = ("plants",)
+# Tables whose live schema is patched up at boot. `plants` is maintained in-app,
+# so no re-ingest would ever back-fill it. `parameters` is here because it is read
+# on every page but only rewritten when a report is re-parsed — the ALTER has to
+# land before the re-parse that fills the new column, and init_db() runs ahead of
+# both ingest passes in main(), so this is the one place that ordering holds.
+MIGRATED_TABLES = ("plants", "parameters")
 
 
 def migrate_added_columns(engine: Engine) -> None:
@@ -1347,6 +1390,14 @@ def migrate_added_columns(engine: Engine) -> None:
                     conn.execute(text(
                         "UPDATE plants SET plant_type = :t WHERE plant_type IS NULL"
                     ), {"t": DEFAULT_PLANT_TYPE})
+                # A column on an ingest-built table is only filled by re-parsing.
+                # Clearing the hashes makes the startup ingest treat every report
+                # as new, so it re-parses and back-fills. Rows are replaced
+                # DELETE-then-insert per source_file, so this never duplicates —
+                # and a report that can no longer be parsed simply keeps the rows
+                # it already has.
+                if (name, col.name) == ("parameters", "plant_sr_no"):
+                    conn.execute(text("DELETE FROM ingested_files"))
 
 
 def file_fingerprint(path: Path) -> str:
@@ -1411,9 +1462,16 @@ def normalize_parameter_records(records: list[dict[str, object]]) -> pd.DataFram
     df = pd.DataFrame(records)
     df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    if "plant_sr_no" not in df.columns:
+        df["plant_sr_no"] = pd.NA
+    df["plant_sr_no"] = pd.to_numeric(df["plant_sr_no"], errors="coerce").astype("Int64")
     df = df.dropna(subset=["report_date", "value"])
+    # Dedup on the SR as well as the name: one workbook can hold two sheets for
+    # two RO trains at the same site, which share a display name. Keying on the
+    # name alone silently dropped the second train's whole parameter block.
     df = df.drop_duplicates(
-        subset=["source_file", "plant", "report_date", "tag"], keep="last"
+        subset=["source_file", "plant", "plant_sr_no", "report_date", "tag"],
+        keep="last",
     )
     return df.reindex(columns=PARAM_COLUMNS)
 
@@ -2156,13 +2214,26 @@ def apply_register_authority(mis: pd.DataFrame, plants: pd.DataFrame) -> pd.Data
 
 
 def feed_pressure_series(
-    params: pd.DataFrame, plant_group: str, plant: str
+    params: pd.DataFrame, plant_group: str, plant: str, plant_sr_no: int | None = None
 ) -> pd.DataFrame:
-    pressures = params[
-        (params["plant_group"] == plant_group)
-        & (params["plant"] == plant)
-        & (params["kind"] == "pressure")
-    ]
+    """The plant's PI 1601 feed pressure per month.
+
+    Matched on Plant SR No wherever we have one: a site's two RO trains share a
+    display name (so the name alone overlaid one train's pressure on the other's
+    readings), and a renamed plant's older rows carry a name the caller never
+    passes. Rows ingested before `parameters` carried an SR have none to match on,
+    so the name lookup stays as the fallback."""
+    pressures = params[params["kind"] == "pressure"]
+    by_sr = pressures.iloc[0:0]
+    if plant_sr_no is not None and "plant_sr_no" in pressures.columns:
+        by_sr = pressures[pressures["plant_sr_no"] == plant_sr_no]
+    pressures = (
+        by_sr
+        if not by_sr.empty
+        else pressures[
+            (pressures["plant_group"] == plant_group) & (pressures["plant"] == plant)
+        ]
+    )
     if pressures.empty:
         return pd.DataFrame(columns=["report_date", "value"])
 
@@ -2292,17 +2363,16 @@ def plant_no_column(values: pd.Series) -> pd.Series:
     return values.map(lambda v: f"{int(v)}" if pd.notna(v) else "—")
 
 
-def plant_name_with_sr(readings: pd.DataFrame, plant: object) -> str:
+def plant_label_with_sr(plant: str, plant_sr_no: int | None) -> str:
     """"Name (SR)" for a heading, where a table would instead get its own column.
 
     Many sheet names already carry the SR ("Aarti Jhagadia HP Ro (1959)", "Aarti
     Alchemie PTRO 2497"), so it is only appended when the name doesn't already
-    read as that SR."""
-    srs = readings.loc[readings["plant"] == plant, "plant_sr_no"].dropna()
-    if srs.empty:
-        return str(plant)
-    sr = int(srs.iloc[0])
-    return str(plant) if plant_sr_no_from_name(plant) == sr else f"{plant} ({sr})"
+    read as that SR. Takes the SR from the caller rather than looking it up by
+    name: one name can cover two RO trains, so a name alone cannot say which."""
+    if plant_sr_no is None:
+        return plant
+    return plant if plant_sr_no_from_name(plant) == plant_sr_no else f"{plant} ({plant_sr_no})"
 
 
 def metric_card(
@@ -2374,10 +2444,9 @@ def sidebar_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str, str, str]
         st.sidebar.caption(f"Plant group: {selected_group}")
 
     group_df = df[df["plant_group"] == selected_group]
-    plants = sorted(group_df["plant"].dropna().unique())
-    selected_plant = st.sidebar.selectbox("Plant", plants)
+    plant_key, selected_plant, selected_sr = select_plant(group_df, key="dash_plant")
 
-    plant_df = group_df[group_df["plant"] == selected_plant]
+    plant_df = rows_for_plant(group_df, plant_key)
     module_labels = sorted(
         plant_df["module_label"].dropna().unique(),
         key=lambda item: pd.to_numeric(item, errors="coerce"),
@@ -2387,7 +2456,64 @@ def sidebar_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str, str, str]
     metric_name = st.sidebar.radio("View Metric", list(METRICS), horizontal=False)
 
     filtered = plant_df[plant_df["module_label"] == selected_module].copy()
-    return filtered, selected_group, selected_plant, selected_module, metric_name
+    return (
+        filtered, selected_group, plant_key, selected_plant, selected_sr,
+        selected_module, metric_name,
+    )
+
+
+def plant_options(frame: pd.DataFrame) -> list[tuple[object, str, int | None]]:
+    """The plants to choose between, as (plant_key, display name, SR), by name.
+
+    One entry per PLANT, not per plant name. Keying the picker on the name was
+    wrong in both directions: several sites run two RO trains whose sheets share a
+    name ("Aarti Jhagadia" is both 1957 and 2708), so one entry silently merged two
+    separate plants; and a plant that was renamed or misspelled across months
+    ("Glenmark Ank RO 1 (1748)" is now "Alivus Life science LTD") appeared as two
+    entries, each holding only part of its own history."""
+    data = frame.dropna(subset=["plant"]).copy()
+    if data.empty:
+        return []
+    data["plant_key"] = plant_identity_key(data)
+    options: list[tuple[object, str, int | None]] = []
+    for plant_key, rows in data.groupby("plant_key"):
+        srs = rows["plant_sr_no"].dropna()
+        options.append(
+            (plant_key, current_plant_name(rows), int(srs.iloc[0]) if not srs.empty else None)
+        )
+    return sorted(options, key=lambda option: (option[1], option[2] or 0))
+
+
+def plant_option_label(
+    option: tuple[object, str, int | None], options: list[tuple[object, str, int | None]]
+) -> str:
+    """"Name" normally; "Name (SR)" when two plants still share a display name, so
+    the two trains can be told apart in the picker."""
+    _key, name, sr = option
+    shared = sum(1 for _, other, _ in options if other == name) > 1
+    if not shared:
+        return name
+    return f"{name} ({sr})" if sr is not None else f"{name} (no SR)"
+
+
+def select_plant(frame: pd.DataFrame, key: str) -> tuple[object, str, int | None]:
+    """Sidebar plant picker over whole plants. Returns (plant_key, name, SR)."""
+    options = plant_options(frame)
+    return st.sidebar.selectbox(
+        "Plant",
+        options,
+        format_func=lambda option: plant_option_label(option, options),
+        key=key,
+    )
+
+
+def rows_for_plant(frame: pd.DataFrame, plant_key: object) -> pd.DataFrame:
+    """Every row of one plant — matched on its identity key, so a sibling train
+    sharing the display name is excluded and a spell of rows filed under the
+    plant's older name is still included."""
+    if frame.empty:
+        return frame
+    return frame[plant_identity_key(frame) == plant_key]
 
 
 def stage_uploaded_files(engine: Engine, files: list[object]) -> None:
@@ -2506,7 +2632,7 @@ def render_staged_review(engine: Engine) -> None:
                 span = f" · {lo:%b %Y}" + (f"–{hi:%b %Y}" if hi != lo else "")
             st.caption(
                 f"{result.meta.plant_group} · {result.meta.report_date:%d %b %Y} · "
-                f"{readings['plant'].nunique()} plants · {len(readings)} readings · "
+                f"{plant_identity_key(readings).nunique()} plants · {len(readings)} readings · "
                 f"{bypass} bypass{span}"
             )
             for issue in issues:
@@ -2699,12 +2825,22 @@ MOM_JUMP_RATIO = 1.5
 MOM_MIN_DELTA = 150.0
 
 # Whole-plant conductivity salt passage. The plant-level instrument block records
-# feed conductivity as CIS 151 and combined permeate conductivity as CIS 180
-# (us/cm), once per plant sheet. Salt passage % = permeate / feed * 100 — the
-# share of feed salinity that leaks through the entire RO train. A healthy train
-# passes only a few percent, so a plant above this fraction is surfaced for review.
-FEED_COND_TAG = "151"
-PERMEATE_COND_TAG = "180"
+# feed conductivity and combined permeate conductivity (us/cm) once per plant
+# sheet. Salt passage % = permeate / feed * 100 — the share of feed salinity that
+# leaks through the entire RO train. A healthy train passes only a few percent, so
+# a plant above this fraction is surfaced for review.
+#
+# The tag numbering varies by skid: the leading digit is the train (CIS 151, CIS
+# 251, CIS 351), and the last two digits name the point — 41/51/71 on the feed
+# side, 80 for combined permeate. So BOTH patterns anchor on the "CIS" (in-line
+# conductivity) prefix and match the whole tag. Matching a bare "180" anywhere in
+# the tag — as this once did — also matched the permeate FLOW tag FIS 180, so a
+# flow value mis-typed as us/cm was read as permeate conductivity (Ami Life 3247
+# ranked at 89% salt passage on its 5600 lit/hr flow reading). Matching a bare
+# "151" likewise missed every plant tagged 141/171/241/251/351, which simply
+# never appeared in the ranking.
+FEED_COND_TAG_RE = r"^CIS\s*\d*(?:41|51|71)$"
+PERMEATE_COND_TAG_RE = r"^CIS\s*\d*80$"
 SALT_PASSAGE_FLAG_PCT = 10.0
 
 # Whole-plant permeate (product) flow, logged once per plant sheet as FIS 180 in
@@ -2712,7 +2848,10 @@ SALT_PASSAGE_FLAG_PCT = 10.0
 # a classic fouling/membrane-loss signal, so the Portfolio surfaces the biggest
 # drops. PERMEATE_FLOW_M3HR_PER_LPH converts litres/hr -> m3/hr so plants logged
 # in either unit rank on one scale.
-PERMEATE_FLOW_TAG = "180"
+# Anchored for the same reason as the conductivity tags: "FIS"/"FI"/"FT" are the
+# flow instruments, so a bare "180" would also sweep in PI 180 (pressure) or CIS
+# 180 (conductivity) rows whose unit cell was mis-typed as a flow unit.
+PERMEATE_FLOW_TAG_RE = r"^F(?:IS|I|T)\s*\d*80$"
 PERMEATE_FLOW_M3HR_PER_LPH = 0.001
 
 
@@ -2997,7 +3136,7 @@ def render_outlier_section(plant_df: pd.DataFrame) -> None:
         )
 
 
-def select_group_plant(df: pd.DataFrame) -> tuple[str, str]:
+def select_group_plant(df: pd.DataFrame) -> tuple[str, object, str, int | None]:
     """Sidebar plant picker for the standalone Replacement page (mirrors the
     dashboard's group/plant selectors, with its own widget keys)."""
     st.sidebar.header("Plant")
@@ -3007,9 +3146,7 @@ def select_group_plant(df: pd.DataFrame) -> tuple[str, str]:
     else:
         group = groups[0]
         st.sidebar.caption(f"Plant group: {group}")
-    plants = sorted(df[df["plant_group"] == group]["plant"].dropna().unique())
-    plant = st.sidebar.selectbox("Plant", plants, key="rep_plant")
-    return group, plant
+    return group, *select_plant(df[df["plant_group"] == group], key="rep_plant")
 
 
 def render_replacement_page(df: pd.DataFrame) -> None:
@@ -3021,9 +3158,9 @@ def render_replacement_page(df: pd.DataFrame) -> None:
         "over a fixed acceptable limit. Each stage is judged on its own readings, so a "
         "naturally high-TDS stage isn't penalised against a cleaner one."
     )
-    group, plant = select_group_plant(df)
-    st.caption(f"{group} | {plant_name_with_sr(df, plant)}")
-    plant_df = df[(df["plant_group"] == group) & (df["plant"] == plant)]
+    group, plant_key, plant, plant_sr_no = select_group_plant(df)
+    st.caption(f"{group} | {plant_label_with_sr(plant, plant_sr_no)}")
+    plant_df = rows_for_plant(df[df["plant_group"] == group], plant_key)
     render_outlier_section(plant_df)
 
 
@@ -3047,7 +3184,7 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
     col = str(METRICS["Conductivity"]["column"])
     flow_col = str(METRICS["Flow Rate"]["column"])
     columns = [
-        "plant_group", "plant", "plant_sr_no", "zone", "stage_label",
+        "plant_group", "plant", "plant_sr_no", "plant_key", "zone", "stage_label",
         "module_label", "report_date", "conductivity", "prev_conductivity",
         "flow", "prev_flow", "install_date", "status", "degraded_iqr",
         "degraded_mom", "degraded", "need", "cutoff", "source_file",
@@ -3059,23 +3196,31 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
     data["stage_label"] = data["stage"].fillna("").map(
         lambda value: str(value).strip() if str(value).strip() else "Unspecified"
     )
+    # A plant IS its Plant SR No. Several sites log two RO trains under one sheet
+    # name ("Aarti Jhagadia" is both 1957 and 2708), so every grouping below keys
+    # on plant_key. Keying on the name pooled two separate trains into one stage
+    # peer group — the IQR cutoff that decides "degraded" was computed across
+    # modules from different plants — and stamped both with whichever SR happened
+    # to come first. The name is kept for display only.
+    data["plant_key"] = plant_identity_key(data)
 
     # plant_sr_no -> zone via the shared resolver (canonicalized, latest MIS row
     # that names a zone) so the dashboard's zones match the rest of the app and a
     # blank later report can't blank a plant's known zone.
     zone_by_sr = build_zone_by_sr(mis)
 
-    plant_meta: dict[str, tuple[object, object, str]] = {}
-    for plant, pdf in data.groupby("plant"):
+    plant_meta: dict[object, tuple[object, str, object, str]] = {}
+    for plant_key, pdf in data.groupby("plant_key"):
         plant_group = pdf["plant_group"].iloc[0]
+        plant = current_plant_name(pdf)
         srs = pdf["plant_sr_no"].dropna()
         plant_sr = int(srs.iloc[0]) if not srs.empty else None
         zone = zone_by_sr.get(plant_sr) if plant_sr is not None else None
-        plant_meta[plant] = (plant_group, plant_sr, zone if zone else "Unknown")
+        plant_meta[plant_key] = (plant_group, plant, plant_sr, zone if zone else "Unknown")
 
     records: list[dict[str, object]] = []
-    for (plant, stage_label, report_date), group in data.groupby(
-        ["plant", "stage_label", "report_date"]
+    for (plant_key, stage_label, report_date), group in data.groupby(
+        ["plant_key", "stage_label", "report_date"]
     ):
         agg = group.groupby("module_label", as_index=False).agg(
             conductivity=(col, "mean"),
@@ -3095,7 +3240,7 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
             )
             iqr_map = dict(zip(evaluated["module_label"], evaluated["flag"]))
 
-        plant_group, plant_sr, zone = plant_meta[plant]
+        plant_group, plant, plant_sr, zone = plant_meta[plant_key]
         for _, row in agg.iterrows():
             bypass = bool(row["is_bypass"])
             degraded_iqr = (not bypass) and bool(iqr_map.get(row["module_label"], False))
@@ -3104,6 +3249,7 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
                     "plant_group": plant_group,
                     "plant": plant,
                     "plant_sr_no": plant_sr,
+                    "plant_key": plant_key,
                     "zone": zone,
                     "stage_label": stage_label,
                     "module_label": row["module_label"],
@@ -3123,12 +3269,12 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
         return pd.DataFrame(columns=columns)
 
     # Second signal: an unusually high month-over-month jump vs the SAME module's
-    # prior reading. Computed per (plant, stage, module) time series — blind to
+    # prior reading. Computed per (plant_key, stage, module) time series — blind to
     # within-stage peers, so it catches a stage that degrades in lockstep, the
     # case IQR misses. shift() compares each reading to that module's previous
     # available report (no flag on a module's first-ever month).
-    result = result.sort_values(["plant", "stage_label", "module_label", "report_date"])
-    grouped = result.groupby(["plant", "stage_label", "module_label"])
+    result = result.sort_values(["plant_key", "stage_label", "module_label", "report_date"])
+    grouped = result.groupby(["plant_key", "stage_label", "module_label"])
     prev = grouped["conductivity"].shift()
     result["prev_conductivity"] = prev
     result["prev_flow"] = grouped["flow"].shift()
@@ -3165,22 +3311,68 @@ def build_zone_by_sr(mis: pd.DataFrame) -> dict[object, object]:
 
 
 def resolve_plant_sr(plants: pd.Series, readings: pd.DataFrame | None) -> pd.Series:
-    """Best-effort plant_sr_no for a Series of plant display names.
+    """Fallback plant_sr_no for a Series of plant display names.
 
-    The `parameters` table carries no plant_sr_no, so prefer the SR the readings
-    already resolved for that plant name — the SAME SR the rest of the app joins
-    on — and only fall back to parsing it out of the display name. Parsing alone
-    fails for the new sheet-naming ("Cadila pharma. ANK", "AARTI PHASE I VAPI"),
-    which is what left the zone (and now the Plant No) column blank."""
+    Only for rows ingested before `parameters` carried its own plant_sr_no —
+    `plant_level_frame()` prefers the stored SR and calls this for the rest. It
+    looks up the SR the readings already resolved for that name (the SAME SR the
+    rest of the app joins on), then falls back to parsing it out of the name;
+    parsing alone fails for the newer sheet-naming ("Cadila pharma. ANK", "AARTI
+    PHASE I VAPI"), which is what left the zone and Plant No columns blank.
+
+    A name is resolved ONLY when it maps to exactly one SR. Several sites run two
+    RO trains logged under one display name — "Aarti Jhagadia" is both 1957 and
+    2708 — and this used to keep whichever row Postgres happened to return last,
+    stamping one train's readings with the other's Plant SR No. An ambiguous name
+    now resolves to NA (shown as a blank Plant No), because no number at all beats
+    a number the client would act on."""
     sr_by_plant_name: dict[object, int] = {}
-    if readings is not None and not readings.empty:
+    if readings is not None and not readings.empty and "plant_sr_no" in readings:
         resolved = readings.dropna(subset=["plant_sr_no"])
-        sr_by_plant_name = dict(
-            zip(resolved["plant"], resolved["plant_sr_no"].astype(int))
-        )
-    return plants.map(
-        lambda name: sr_by_plant_name.get(name) or plant_sr_no_from_name(name)
+        unique_srs = resolved.groupby("plant")["plant_sr_no"].unique()
+        sr_by_plant_name = {
+            name: int(srs[0]) for name, srs in unique_srs.items() if len(srs) == 1
+        }
+
+    def lookup(name: object) -> object:
+        sr = sr_by_plant_name.get(name)
+        if sr is not None:
+            return sr
+        parsed = plant_sr_no_from_name(name)
+        return parsed if parsed is not None else pd.NA
+
+    return plants.map(lookup).astype("Int64")
+
+
+def plant_level_frame(
+    frame: pd.DataFrame, mis: pd.DataFrame, readings: pd.DataFrame | None
+) -> pd.DataFrame:
+    """Give a plant-level parameter frame its identity columns: a trustworthy
+    `plant_sr_no`, a `plant_key` to group on, and the plant's `zone`.
+
+    A plant IS its SR number, not its display name. Sites run more than one RO
+    train under a single name, so every plant-level rollup (salt passage, permeate
+    flow, permeate conductivity) must dedup and group on `plant_key` — the SR
+    where we have one, the name only as a last resort for rows whose SR we could
+    never resolve. Grouping on the name merged two physically separate trains into
+    one row, mixing one plant's feed with another's permeate.
+
+    Rows carry their own plant_sr_no once they have been re-ingested; anything
+    older falls back to the name-based lookup."""
+    out = frame.copy()
+    stored = (
+        pd.to_numeric(out["plant_sr_no"], errors="coerce").astype("Int64")
+        if "plant_sr_no" in out.columns
+        else pd.Series(pd.NA, index=out.index, dtype="Int64")
     )
+    out["plant_sr_no"] = stored.fillna(resolve_plant_sr(out["plant"], readings))
+    out["plant_key"] = plant_identity_key(out)
+
+    zone_by_sr = build_zone_by_sr(mis)
+    out["zone"] = out["plant_sr_no"].map(
+        lambda sr: zone_by_sr.get(int(sr)) if pd.notna(sr) else None
+    ).fillna("Unknown")
+    return out
 
 
 def compute_salt_passage(
@@ -3188,12 +3380,15 @@ def compute_salt_passage(
 ) -> pd.DataFrame:
     """Per-plant per-month conductivity salt passage from the CIS feed/permeate tags.
 
-    Feed conductivity (CIS 151) and combined permeate conductivity (CIS 180) are
-    recorded once per plant sheet. Salt passage % = permeate / feed * 100 — the
-    share of feed salinity that leaks through the whole RO train. Returns one row
-    per (plant, month) that carries BOTH readings, with the plant's zone joined in
-    (via resolve_plant_sr -> latest MIS row, mirroring compute_fleet_status),
-    sorted by passage descending."""
+    Feed conductivity (CIS ?41/?51/?71) and combined permeate conductivity
+    (CIS ?80) are recorded once per plant sheet. Salt passage % = permeate / feed
+    * 100 — the share of feed salinity that leaks through the whole RO train.
+    Returns one row per (plant, month) that carries BOTH readings, with the
+    plant's zone joined in, sorted by passage descending.
+
+    Every step keys on `plant_key` (the Plant SR No), never the display name —
+    two RO trains at one site share a name, and grouping by name paired one
+    train's feed with the other's permeate and dropped the loser's row entirely."""
     columns = [
         "plant_group", "plant", "plant_sr_no", "zone",
         "report_date", "feed", "permeate", "passage_pct",
@@ -3205,20 +3400,29 @@ def compute_salt_passage(
     if cond.empty:
         return pd.DataFrame(columns=columns)
 
-    tag = cond["tag"].astype(str)
+    tag = cond["tag"].astype(str).str.strip().str.upper()
     cond["role"] = pd.NA
-    cond.loc[tag.str.contains(rf"\b{FEED_COND_TAG}\b"), "role"] = "feed"
-    cond.loc[tag.str.contains(rf"\b{PERMEATE_COND_TAG}\b"), "role"] = "permeate"
+    cond.loc[tag.str.match(FEED_COND_TAG_RE), "role"] = "feed"
+    cond.loc[tag.str.match(PERMEATE_COND_TAG_RE), "role"] = "permeate"
     cond = cond.dropna(subset=["role"])
     if cond.empty:
         return pd.DataFrame(columns=columns)
 
+    cond = plant_level_frame(cond, mis, readings)
     # One value per (plant, month, role); last write wins on any duplicate.
-    cond = cond.drop_duplicates(["plant", "report_date", "role"], keep="last")
-    wide = cond.pivot_table(
-        index=["plant_group", "plant", "report_date"],
-        columns="role", values="value", aggfunc="last",
+    cond = cond.drop_duplicates(["plant_key", "report_date", "role"], keep="last")
+    # Pivot on plant_key alone, then merge the identity columns back on. Carrying
+    # plant_sr_no through the pivot index would drop every plant whose SR is still
+    # unresolved, since a NA index entry is silently dropped by the groupby.
+    wide = cond.pivot(
+        index=["plant_key", "report_date"], columns="role", values="value"
     ).reset_index()
+    # Identity per (plant_key, month), so each row is labelled with the name its
+    # OWN report used rather than one picked from some other month.
+    identity = cond.drop_duplicates(["plant_key", "report_date"], keep="last")[
+        ["plant_key", "report_date", "plant_group", "plant", "plant_sr_no", "zone"]
+    ]
+    wide = wide.merge(identity, on=["plant_key", "report_date"], how="left")
     if "feed" not in wide.columns or "permeate" not in wide.columns:
         return pd.DataFrame(columns=columns)
     wide = wide.dropna(subset=["feed", "permeate"])
@@ -3226,10 +3430,6 @@ def compute_salt_passage(
     if wide.empty:
         return pd.DataFrame(columns=columns)
     wide["passage_pct"] = wide["permeate"] / wide["feed"] * 100.0
-
-    zone_by_sr = build_zone_by_sr(mis)
-    wide["plant_sr_no"] = resolve_plant_sr(wide["plant"], readings)
-    wide["zone"] = wide["plant_sr_no"].map(lambda sr: zone_by_sr.get(sr) or "Unknown")
 
     return (
         wide.reindex(columns=columns)
@@ -3243,7 +3443,7 @@ def compute_permeate_flow(
 ) -> pd.DataFrame:
     """Per-plant per-month permeate (product) flow from the FIS 180 tag, in m3/hr.
 
-    Permeate flow is logged once per plant sheet as FIS 180, in either m3/hr or
+    Permeate flow is logged once per plant sheet as FIS ?80, in either m3/hr or
     litres/hr; litres/hr is converted to m3/hr so every plant ranks on one scale.
     Returns one row per (plant, month) with the month-over-month change vs the
     plant's OWN prior reading (`fall_m3hr` positive = a drop), zone joined in.
@@ -3258,7 +3458,7 @@ def compute_permeate_flow(
     flow = parameters[parameters["kind"] == "flow"].copy()
     if flow.empty:
         return pd.DataFrame(columns=columns)
-    flow = flow[flow["tag"].astype(str).str.contains(rf"\b{PERMEATE_FLOW_TAG}\b")]
+    flow = flow[flow["tag"].astype(str).str.strip().str.upper().str.match(PERMEATE_FLOW_TAG_RE)]
     if flow.empty:
         return pd.DataFrame(columns=columns)
 
@@ -3273,16 +3473,15 @@ def compute_permeate_flow(
         return pd.DataFrame(columns=columns)
 
     # One value per (plant, month); last write wins, then a per-plant time series.
-    flow = flow.drop_duplicates(["plant", "report_date"], keep="last")
-    flow = flow.sort_values(["plant", "report_date"])
-    prev = flow.groupby("plant")["flow_m3hr"].shift()
+    # Keyed on plant_key (the SR) so two RO trains sharing a site name keep their
+    # own series instead of collapsing into one and shifting against each other.
+    flow = plant_level_frame(flow, mis, readings)
+    flow = flow.drop_duplicates(["plant_key", "report_date"], keep="last")
+    flow = flow.sort_values(["plant_key", "report_date"])
+    prev = flow.groupby("plant_key")["flow_m3hr"].shift()
     flow["prev_flow_m3hr"] = prev
     flow["fall_m3hr"] = prev - flow["flow_m3hr"]
     flow["change_pct"] = (flow["flow_m3hr"] / prev - 1.0) * 100.0
-
-    zone_by_sr = build_zone_by_sr(mis)
-    flow["plant_sr_no"] = resolve_plant_sr(flow["plant"], readings)
-    flow["zone"] = flow["plant_sr_no"].map(lambda sr: zone_by_sr.get(sr) or "Unknown")
 
     return flow.reindex(columns=columns).reset_index(drop=True)
 
@@ -3290,9 +3489,10 @@ def compute_permeate_flow(
 def compute_permeate_conductivity(
     parameters: pd.DataFrame, mis: pd.DataFrame, readings: pd.DataFrame | None = None
 ) -> pd.DataFrame:
-    """Per-plant per-month permeate conductivity (CIS 180) with its MoM rise.
+    """Per-plant per-month permeate conductivity (CIS ?80) with its MoM rise.
 
-    Permeate (product) conductivity is logged once per plant sheet as CIS 180.
+    Permeate (product) conductivity is logged once per plant sheet as CIS ?80
+    (180 on train 1, 280 on train 2, ...).
     Returns one row per (plant, month) with the month-over-month change vs the
     plant's OWN prior reading (`rise` positive = product water got saltier — a
     plant-wide membrane / feed signal), zone joined in.
@@ -3307,7 +3507,7 @@ def compute_permeate_conductivity(
     cond = parameters[parameters["kind"] == "conductivity"].copy()
     if cond.empty:
         return pd.DataFrame(columns=columns)
-    cond = cond[cond["tag"].astype(str).str.contains(rf"\b{PERMEATE_COND_TAG}\b")]
+    cond = cond[cond["tag"].astype(str).str.strip().str.upper().str.match(PERMEATE_COND_TAG_RE)]
     if cond.empty:
         return pd.DataFrame(columns=columns)
 
@@ -3318,23 +3518,25 @@ def compute_permeate_conductivity(
         return pd.DataFrame(columns=columns)
 
     # One value per (plant, month); last write wins, then a per-plant time series.
-    cond = cond.drop_duplicates(["plant", "report_date"], keep="last")
-    cond = cond.sort_values(["plant", "report_date"])
-    prev = cond.groupby("plant")["permeate"].shift()
+    # Keyed on plant_key (the SR) for the same reason as the flow series.
+    cond = plant_level_frame(cond, mis, readings)
+    cond = cond.drop_duplicates(["plant_key", "report_date"], keep="last")
+    cond = cond.sort_values(["plant_key", "report_date"])
+    prev = cond.groupby("plant_key")["permeate"].shift()
     cond["prev_permeate"] = prev
     cond["rise"] = cond["permeate"] - prev
     cond["change_pct"] = (cond["permeate"] / prev - 1.0) * 100.0
-
-    zone_by_sr = build_zone_by_sr(mis)
-    cond["plant_sr_no"] = resolve_plant_sr(cond["plant"], readings)
-    cond["zone"] = cond["plant_sr_no"].map(lambda sr: zone_by_sr.get(sr) or "Unknown")
 
     return cond.reindex(columns=columns).reset_index(drop=True)
 
 
 def build_plant_ranking(snapshot: pd.DataFrame, latest: pd.Timestamp) -> pd.DataFrame:
+    """One row per PLANT — keyed on plant_key (the Plant SR No), so a site running
+    two RO trains under one sheet name ranks as the two plants it is, each with its
+    own Plant No, instead of one merged row stamped with an arbitrary SR."""
     rows: list[dict[str, object]] = []
-    for plant, pdf in snapshot.groupby("plant"):
+    for plant_key, pdf in snapshot.groupby("plant_key"):
+        plant = current_plant_name(pdf)
         module_count = len(pdf)
         bypassed = int((pdf["status"] == "bypass").sum())
         degraded = int(pdf["degraded"].sum())
@@ -3347,6 +3549,7 @@ def build_plant_ranking(snapshot: pd.DataFrame, latest: pd.Timestamp) -> pd.Data
             {
                 "Plant": plant,
                 "Plant No": plant_no_column(pdf["plant_sr_no"]).iloc[0],
+                "plant_key": plant_key,
                 "Zone": pdf["zone"].iloc[0],
                 "Modules": module_count,
                 "Bypassed": bypassed,
@@ -3642,19 +3845,21 @@ def render_flagged_module_list(
 
 
 def render_plant_flagged_modules(
-    snapshot: pd.DataFrame, plant: str, month_text: str
+    snapshot: pd.DataFrame, plant_key: object, plant: str, month_text: str
 ) -> None:
     """List every module flagged (degraded or bypassed) for one plant this month.
 
     `snapshot` is the already-zone/month-filtered fleet status, so degraded/need
     and the per-stage IQR cutoff are read straight off it — no recomputation.
+    Selected by `plant_key` (the Plant SR No), so a site with two RO trains under
+    one name lists only the train whose row was clicked.
     """
-    plant_rows = snapshot[snapshot["plant"] == plant]
-    flagged = plant_rows[plant_rows["need"]].copy()
+    plant_rows = snapshot[snapshot["plant_key"] == plant_key]
+    srs = plant_rows["plant_sr_no"].dropna().unique()
+    heading = plant_label_with_sr(plant, int(srs[0]) if len(srs) else None)
 
-    st.markdown(
-        f"#### {plant_name_with_sr(plant_rows, plant)} — flagged modules · {month_text}"
-    )
+    flagged = plant_rows[plant_rows["need"]].copy()
+    st.markdown(f"#### {heading} — flagged modules · {month_text}")
     if flagged.empty:
         st.success(f"No modules flagged for {plant} in {month_text}.")
         return
@@ -3749,7 +3954,9 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
     status_zoned = status[status["zone"].isin(active_zones)]
     snapshot = status_zoned[status_zoned["report_date"] == selected]
 
-    total_plants = int(snapshot["plant"].nunique())
+    # Counted on plant_key: a site running two RO trains under one sheet name is
+    # two plants, and the name would count it as one.
+    total_plants = int(snapshot["plant_key"].nunique())
     total_modules = len(snapshot)
     active_modules = int((snapshot["status"] == "active").sum())
     degraded = int(snapshot["degraded"].sum())
@@ -3862,8 +4069,12 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
         "to re-sort, or select a row to see that plant's flagged modules below."
     )
     ranking = build_plant_ranking(snapshot, selected)
+    # plant_key is the join back to the snapshot for the drill-down, not something
+    # to show — the reader already has "Plant No". Row positions are unchanged, so
+    # a selected row still indexes into `ranking`.
+    ranking_display = ranking.drop(columns=["plant_key"], errors="ignore")
     ranking_event = st.dataframe(
-        ranking,
+        ranking_display,
         width="stretch",
         hide_index=True,
         on_select="rerun",
@@ -3872,7 +4083,7 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
     )
     st.download_button(
         "Download plant ranking (CSV)",
-        ranking.to_csv(index=False).encode("utf-8"),
+        ranking_display.to_csv(index=False).encode("utf-8"),
         file_name=f"fleet_ranking_{month_text.replace(' ', '_')}.csv",
         mime="text/csv",
     )
@@ -3880,8 +4091,10 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
     # Drill-down: clicking a plant row lists every module flagged for it this month.
     selected_rows = ranking_event.selection.get("rows", []) if ranking_event else []
     if selected_rows and not ranking.empty:
-        chosen_plant = str(ranking.iloc[selected_rows[0]]["Plant"])
-        render_plant_flagged_modules(snapshot, chosen_plant, month_text)
+        chosen = ranking.iloc[selected_rows[0]]
+        render_plant_flagged_modules(
+            snapshot, chosen["plant_key"], str(chosen["Plant"]), month_text
+        )
 
     # ----- 2b. The lists behind the Degraded / Bypassed KPI cards -----
     render_flagged_module_list(snapshot, selected, month_text, bypassed=False)
@@ -4180,13 +4393,16 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
 
 
 def render_dashboard(df: pd.DataFrame, params: pd.DataFrame) -> None:
-    filtered, selected_group, selected_plant, selected_module, metric_name = sidebar_filters(df)
+    (
+        filtered, selected_group, plant_key, selected_plant, selected_sr,
+        selected_module, metric_name,
+    ) = sidebar_filters(df)
     metric_config = METRICS[metric_name]
     metric_col = str(metric_config["column"])
     series = aggregate_series(filtered, metric_col)
 
     st.title("RO Plant Membrane Health Dashboard")
-    st.caption(f"{selected_group} | {plant_name_with_sr(df, selected_plant)}")
+    st.caption(f"{selected_group} | {plant_label_with_sr(selected_plant, selected_sr)}")
 
     if series.empty:
         st.warning("No valid numeric readings are available for this module and metric.")
@@ -4194,7 +4410,9 @@ def render_dashboard(df: pd.DataFrame, params: pd.DataFrame) -> None:
 
     # PI 1601 feed pressure is the operating pressure each reading was taken at.
     # It is plant-level (shared across modules), overlaid on a secondary axis.
-    pressure_by_date = feed_pressure_series(params, selected_group, selected_plant)
+    pressure_by_date = feed_pressure_series(
+        params, selected_group, selected_plant, selected_sr
+    )
 
     ordered = series.sort_values("report_date")
     latest_row = ordered.iloc[-1]
@@ -4258,7 +4476,7 @@ def render_dashboard(df: pd.DataFrame, params: pd.DataFrame) -> None:
         )
         st.dataframe(display, width="stretch", hide_index=True)
 
-    plant_df = df[(df["plant_group"] == selected_group) & (df["plant"] == selected_plant)]
+    plant_df = rows_for_plant(df[df["plant_group"] == selected_group], plant_key)
     render_comparison_section(
         plant_df, selected_module, metric_name, metric_config, pressure_by_date
     )
