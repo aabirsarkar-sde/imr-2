@@ -18,6 +18,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from sqlalchemy import (
+    Boolean,
     Column,
     Date,
     DateTime,
@@ -32,6 +33,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -104,13 +106,6 @@ PARAM_COLUMNS = [
     "value",
     "unit",
 ]
-
-# Feed pressure to the high-pressure membrane array. The standard instrument
-# scheme on these reports tags the array feed as PI 1601. We surface this as the
-# operating pressure at which each flow/conductivity reading was taken. Other
-# pressure tags are ignored for now.
-FEED_TAG = "1601"
-
 
 @dataclass(frozen=True)
 class ReportMeta:
@@ -1303,9 +1298,59 @@ PLANTS_TABLE = Table(
     Column("updated_at", DateTime),
 )
 
+# A plant that did not run at all in a given month. The workbook can't say this —
+# a plant that wasn't running simply sends nothing, which is indistinguishable
+# from a plant that forgot to send. So it's recorded in-app, per (plant, month),
+# and the IMR Tracker moves those plants out of "Missing" into their own list
+# instead of chasing a site for a report it was never going to file.
+PLANT_DOWNTIME_TABLE = Table(
+    "plant_downtime",
+    DB_METADATA,
+    Column("plant_sr_no", Integer, primary_key=True),
+    Column("month", Text, primary_key=True),  # "YYYY-MM"
+    Column("not_running", Boolean),
+    Column("remarks", Text),
+    Column("updated_at", DateTime),
+)
+
+# Why a module was taken offline, and any detail worth keeping. The IMR sheet
+# records only that a module reads "BY PASS" — never who bypassed it — yet that
+# is the difference between our own maintenance decision and the client's, which
+# is exactly what the replacement conversation turns on. Recorded in-app per
+# (plant, stage, module, month), keyed the same way every other per-plant rollup
+# is: on plant_key (the SR), never the display name.
+BYPASS_NOTES_TABLE = Table(
+    "bypass_notes",
+    DB_METADATA,
+    Column("plant_key", Text, primary_key=True),
+    Column("stage_label", Text, primary_key=True),
+    Column("module_label", Text, primary_key=True),
+    Column("month", Text, primary_key=True),  # "YYYY-MM"
+    Column("plant_sr_no", Integer),
+    Column("plant", Text),
+    Column("reason", Text),  # BYPASS_REASON_OPTIONS
+    Column("remarks", Text),
+    Column("updated_at", DateTime),
+)
+
+# The per-stage absolute conductivity limit above which a module is a replacement
+# candidate outright, regardless of how its peers are doing. Editable in-app (the
+# Dashboard page), so it is stored rather than hard-coded; DEFAULT_STAGE_LIMITS
+# is the fallback for any stage nobody has set.
+STAGE_LIMITS_TABLE = Table(
+    "stage_limits",
+    DB_METADATA,
+    Column("stage_key", Text, primary_key=True),
+    Column("limit_us_cm", Float),
+    Column("updated_at", DateTime),
+)
+
 READINGS_COLUMNS = [c.name for c in READINGS_TABLE.columns]
 MIS_COLUMNS = [c.name for c in MIS_TABLE.columns]
 PLANTS_COLUMNS = [c.name for c in PLANTS_TABLE.columns]
+DOWNTIME_COLUMNS = [c.name for c in PLANT_DOWNTIME_TABLE.columns]
+BYPASS_NOTE_COLUMNS = [c.name for c in BYPASS_NOTES_TABLE.columns]
+BYPASS_NOTE_KEY = ["plant_key", "stage_label", "module_label", "month"]
 
 
 def database_url() -> str | None:
@@ -1334,8 +1379,47 @@ def get_engine() -> Engine | None:
     return create_engine(url, pool_pre_ping=True)
 
 
+def create_all_tolerating_races(engine: Engine) -> None:
+    """Create the missing tables, tolerating another process creating them too.
+
+    `create_all()` inspects for a table and THEN creates it, and those two steps
+    are not atomic. Two app processes booting together — two Streamlit sessions,
+    or two replicas — both see a table missing and both issue CREATE TABLE. The
+    loser fails, and on Postgres it fails as a duplicate key on the internal
+    `pg_type_typname_nsp_index`, which reads like a corrupt database but is only
+    this race:
+
+        duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+        DETAIL: Key (typname, typnamespace)=(plant_downtime, 2200) already exists.
+
+    So a failure here is retried table by table (one racing table must not stop the
+    others from being created), and only a table that is STILL absent afterwards is
+    a real error worth surfacing — by which point the winner has committed and the
+    checkfirst pass is a no-op."""
+    try:
+        DB_METADATA.create_all(engine)
+        return
+    except SQLAlchemyError as exc:
+        first_error = exc
+
+    for table in DB_METADATA.sorted_tables:
+        try:
+            table.create(engine, checkfirst=True)
+        except SQLAlchemyError:
+            continue  # created by whoever we raced; the check below is the verdict
+
+    inspector = inspect(engine)
+    missing = sorted(
+        t.name for t in DB_METADATA.sorted_tables if not inspector.has_table(t.name)
+    )
+    if missing:
+        raise RuntimeError(
+            f"Could not create table(s): {', '.join(missing)}"
+        ) from first_error
+
+
 def init_db(engine: Engine) -> None:
-    DB_METADATA.create_all(engine)
+    create_all_tolerating_races(engine)
     migrate_added_columns(engine)
     migrate_renamed_statuses(engine)
 
@@ -1371,7 +1455,12 @@ def migrate_added_columns(engine: Engine) -> None:
     column added to a table that is already live in prod has to be patched on. Adds
     any column the Table definition has and the live table lacks. Portable across
     Postgres and SQLite (neither is given a DEFAULT — the app treats NULL as blank
-    and normalizes on save)."""
+    and normalizes on save).
+
+    Like create_all(), the check-then-ALTER is not atomic: two processes booting at
+    once can both see a column missing and both add it, and the loser errors. That
+    is a race, not a failure, so it's swallowed once the column is confirmed
+    present — the winner has already run the back-fill below."""
     inspector = inspect(engine)
     for name in MIGRATED_TABLES:
         table = DB_METADATA.tables.get(name)
@@ -1382,22 +1471,33 @@ def migrate_added_columns(engine: Engine) -> None:
             if col.name in live:
                 continue
             col_type = col.type.compile(engine.dialect)
-            with engine.begin() as conn:
-                conn.execute(text(f"ALTER TABLE {name} ADD COLUMN {col.name} {col_type}"))
-                # Existing plants predate the type column — seed them to the default
-                # so the register never shows a blank type.
-                if (name, col.name) == ("plants", "plant_type"):
-                    conn.execute(text(
-                        "UPDATE plants SET plant_type = :t WHERE plant_type IS NULL"
-                    ), {"t": DEFAULT_PLANT_TYPE})
-                # A column on an ingest-built table is only filled by re-parsing.
-                # Clearing the hashes makes the startup ingest treat every report
-                # as new, so it re-parses and back-fills. Rows are replaced
-                # DELETE-then-insert per source_file, so this never duplicates —
-                # and a report that can no longer be parsed simply keeps the rows
-                # it already has.
-                if (name, col.name) == ("parameters", "plant_sr_no"):
-                    conn.execute(text("DELETE FROM ingested_files"))
+            try:
+                _add_column(engine, name, col.name, col_type)
+            except SQLAlchemyError:
+                if col.name in {c["name"] for c in inspect(engine).get_columns(name)}:
+                    continue  # someone else added it first
+                raise
+
+
+def _add_column(engine: Engine, name: str, column: str, col_type: str) -> None:
+    """ALTER one column on, plus whatever back-fill that specific column needs, in
+    a single transaction — so a column is never left live but unfilled."""
+    with engine.begin() as conn:
+        conn.execute(text(f"ALTER TABLE {name} ADD COLUMN {column} {col_type}"))
+        # Existing plants predate the type column — seed them to the default
+        # so the register never shows a blank type.
+        if (name, column) == ("plants", "plant_type"):
+            conn.execute(text(
+                "UPDATE plants SET plant_type = :t WHERE plant_type IS NULL"
+            ), {"t": DEFAULT_PLANT_TYPE})
+        # A column on an ingest-built table is only filled by re-parsing.
+        # Clearing the hashes makes the startup ingest treat every report
+        # as new, so it re-parses and back-fills. Rows are replaced
+        # DELETE-then-insert per source_file, so this never duplicates —
+        # and a report that can no longer be parsed simply keeps the rows
+        # it already has.
+        if (name, column) == ("parameters", "plant_sr_no"):
+            conn.execute(text("DELETE FROM ingested_files"))
 
 
 def file_fingerprint(path: Path) -> str:
@@ -1415,6 +1515,80 @@ MAX_PLAUSIBLE_CONDUCTIVITY_US_CM = 50000.0
 # Each RO module houses this many membrane elements; fleet membrane count is this
 # times the module count.
 MEMBRANES_PER_MODULE = 184
+
+# An RO train runs its modules in up to three stages, and the membrane requirement
+# is reported per stage — a plant needing 4 modules in stage III is a different
+# purchase order from one needing 4 in stage I. Sheets spell the stage every way
+# there is ("I STAGE", "1st Stage", "Stage-2", "III"), so every stage-wise rollup
+# folds the raw `stage_label` through `canonical_stage()` first.
+STAGE_ORDER = ["I", "II", "III", "IV"]
+STAGE_DISPLAY = {
+    "I": "1st Stage", "II": "2nd Stage", "III": "3rd Stage", "IV": "4th Stage",
+}
+UNSTAGED_LABEL = "Unstaged"
+
+# Matched highest-first, because the numerals nest: "IV STAGE" contains an "I" and
+# "III STAGE" contains an "II", so testing IV before III before II before I is what
+# keeps them apart. Each alternative is anchored on word boundaries, so "IV" cannot
+# be read as "I" (the trailing V is a word character) and "UNSPECIFIED" names no
+# stage at all.
+_STAGE_PATTERNS = [
+    ("IV", r"\b(?:IV|4|4TH|FOURTH)\b"),
+    ("III", r"\b(?:III|3|3RD|THIRD)\b"),
+    ("II", r"\b(?:II|2|2ND|SECOND)\b"),
+    ("I", r"\b(?:I|1|1ST|FIRST)\b"),
+]
+
+
+def canonical_stage(label: object) -> str | None:
+    """Map a raw stage label to "I" / "II" / "III", or None when it names no stage
+    (a blank, or the "Unspecified" placeholder a sheet with no stage header gets)."""
+    if label is None or (isinstance(label, float) and pd.isna(label)):
+        return None
+    text = re.sub(r"\s+", " ", str(label)).strip().upper()
+    if not text:
+        return None
+    for stage, pattern in _STAGE_PATTERNS:
+        if re.search(pattern, text):
+            return stage
+    return None
+
+
+def stage_display(stage: object) -> str:
+    """"1st Stage" / "2nd Stage" / "3rd Stage" for a canonical stage; anything that
+    resolves to no stage is grouped under one honest bucket."""
+    return STAGE_DISPLAY.get(str(stage), UNSTAGED_LABEL)
+
+
+def stage_keys_present(frame: pd.DataFrame) -> list[str]:
+    """The canonical stages actually present in a status frame, in train order,
+    with the unstaged bucket last (only when something lands in it)."""
+    if frame is None or frame.empty or "stage_key" not in frame:
+        return []
+    present = set(frame["stage_key"].dropna().astype(str))
+    ordered = [s for s in STAGE_ORDER if s in present]
+    if UNSTAGED_LABEL in present:
+        ordered.append(UNSTAGED_LABEL)
+    return ordered
+
+
+def stage_pills(
+    options: list[str], key: str, *, label: str, help: str | None = None
+) -> list[str]:
+    """A row of stage buttons. `st.pills` is the button-y control this wants, but
+    requirements.txt pins no Streamlit version, so fall back to a multiselect on
+    an older runtime rather than crashing the page."""
+    if not options:
+        return []
+    picker = getattr(st, "pills", None)
+    if picker is not None:
+        picked = picker(
+            label, options, selection_mode="multi", default=options, key=key, help=help
+        )
+    else:  # pragma: no cover - older Streamlit
+        picked = st.multiselect(label, options, default=options, key=key, help=help)
+    # An empty selection reads as "no filter", matching the Zones multiselect.
+    return list(picked) if picked else list(options)
 
 
 def normalize_reading_records(records: list[dict[str, object]]) -> pd.DataFrame:
@@ -1787,6 +1961,64 @@ _PLANT_TYPE_ALIASES = {
 }
 
 
+# Who took a bypassed module offline. Blank means nobody has said yet — that is a
+# real state (the sheet arrives with the bypass but no explanation), so it is left
+# blank rather than defaulted to either party.
+BYPASS_REASON_OPTIONS = ["Bypassed by ROCHEM", "Bypassed by Client"]
+_BYPASS_REASON_ALIASES = {
+    "rochem": "Bypassed by ROCHEM",
+    "by rochem": "Bypassed by ROCHEM",
+    "bypassed by rochem": "Bypassed by ROCHEM",
+    "bypass by rochem": "Bypassed by ROCHEM",
+    "by pass by rochem": "Bypassed by ROCHEM",
+    "client": "Bypassed by Client",
+    "by client": "Bypassed by Client",
+    "bypassed by client": "Bypassed by Client",
+    "bypass by client": "Bypassed by Client",
+    "by pass by client": "Bypassed by Client",
+    "customer": "Bypassed by Client",
+    "bypassed by customer": "Bypassed by Client",
+}
+
+
+# Starting limits, in uS/cm, from the Jul-Aug 2026 fleet (28.5k readings). Anchored
+# at roughly 4x each stage's own median permeate conductivity, which is what the
+# fleet's plant-stage medians (I ~400, II ~700, III ~900) support — the train gets
+# saltier stage by stage, so one fleet-wide number would flag 38% of stage I and 62%
+# of stage III for the same value.
+#
+# Stage IV is the weakest of these: only 6 plants run one, and their medians are
+# split between healthy (~120) and spent (~3500), so 3500 is a placeholder more than
+# a finding.
+#
+# UNSTAGED_LABEL deliberately gets NO limit. It is not a stage — it is the bucket for
+# blocks whose header carries no numeral, and in this fleet that is two sheets:
+# Alivus 1748's third block reads "-STAGE" (a mangled "III"), and Superform 2479's
+# two blocks read "STAGE (ST)" / "STAGE (PT)", which are two separate RO trains on
+# one sheet, not stage 1 and stage 2. Assigning either a stage spec would be a guess,
+# so they are reported as unassessed and left for someone to fix at the workbook.
+DEFAULT_STAGE_LIMITS: dict[str, float] = {
+    "I": 1500.0,
+    "II": 3000.0,
+    "III": 3000.0,
+    "IV": 3500.0,
+}
+
+
+def canonical_bypass_reason(reason: object) -> str | None:
+    """Map a stored/typed bypass reason to one of BYPASS_REASON_OPTIONS, or None
+    for a blank or unrecognized one (blank is the honest default — see above)."""
+    if reason is None or (isinstance(reason, float) and pd.isna(reason)):
+        return None
+    key = re.sub(r"\s+", " ", str(reason)).strip().lower()
+    if not key:
+        return None
+    for option in BYPASS_REASON_OPTIONS:
+        if key == option.lower():
+            return option
+    return _BYPASS_REASON_ALIASES.get(key)
+
+
 def canonical_plant_type(plant_type: object) -> str | None:
     """Map a raw plant type to one of PLANT_TYPE_OPTIONS, or None for a blank or
     unrecognized value (the caller decides whether to fall back to the default)."""
@@ -1941,6 +2173,317 @@ def add_plant(
             "updated_at": datetime.now(timezone.utc),
         }]).reindex(columns=PLANTS_COLUMNS)
         row.to_sql("plants", conn, if_exists="append", index=False)
+
+
+def month_key(value: object) -> str | None:
+    """A report date (or an already-formatted key) as the "YYYY-MM" string the
+    per-month tables key on. Reading months are month-end timestamps, so the
+    period is what makes a note written against Aug 2026 line up with the reading
+    dated 31 Aug 2026."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    stamp = pd.to_datetime(value, errors="coerce")
+    if pd.isna(stamp):
+        text_value = re.sub(r"\s+", "", str(value))
+        return text_value if re.fullmatch(r"\d{4}-\d{2}", text_value) else None
+    return stamp.to_period("M").strftime("%Y-%m")
+
+
+@st.cache_data(show_spinner="Loading plant downtime...")
+def load_downtime() -> pd.DataFrame:
+    """Every (plant, month) marked not-running. One row per marked month; a plant
+    with no row simply ran (or nobody has said otherwise)."""
+    engine = get_engine()
+    if engine is None:
+        return pd.DataFrame(columns=DOWNTIME_COLUMNS)
+    df = pd.read_sql("SELECT * FROM plant_downtime", engine)
+    if df.empty:
+        return pd.DataFrame(columns=DOWNTIME_COLUMNS)
+    df["plant_sr_no"] = pd.to_numeric(df["plant_sr_no"], errors="coerce")
+    df = df.dropna(subset=["plant_sr_no"])
+    df["plant_sr_no"] = df["plant_sr_no"].astype(int)
+    df["month"] = df["month"].map(month_key)
+    df = df.dropna(subset=["month"])
+    # SQLite hands booleans back as 0/1, Postgres as True/False — normalize both.
+    df["not_running"] = df["not_running"].fillna(False).astype(bool)
+    return df.reindex(columns=DOWNTIME_COLUMNS).reset_index(drop=True)
+
+
+def save_downtime(engine: Engine, month: str, edited: pd.DataFrame) -> int:
+    """Persist the not-running marks for ONE month.
+
+    Scoped to the plants that were on screen: their rows for `month` are replaced,
+    so unticking a plant clears its mark and every plant the editor didn't show is
+    left alone. Only ticked rows are stored — an absent row IS "was running", so
+    there is nothing to keep for the rest. Returns the number of marks stored."""
+    key = month_key(month)
+    if key is None:
+        return 0
+    clean = edited.copy()
+    clean["plant_sr_no"] = pd.to_numeric(clean.get("plant_sr_no"), errors="coerce")
+    clean = clean.dropna(subset=["plant_sr_no"])
+    clean["plant_sr_no"] = clean["plant_sr_no"].astype(int)
+    clean = clean.drop_duplicates("plant_sr_no", keep="last")
+    scope = clean["plant_sr_no"].tolist()
+
+    flag = clean.get("not_running")
+    clean["not_running"] = (
+        pd.Series(flag, index=clean.index).fillna(False).astype(bool)
+        if flag is not None else False
+    )
+    remarks = clean.get("remarks")
+    clean["remarks"] = (
+        pd.Series(remarks, index=clean.index).map(
+            lambda v: None if pd.isna(v) else (str(v).strip() or None)
+        )
+        if remarks is not None else None
+    )
+    marked = clean[clean["not_running"]].copy()
+    marked["month"] = key
+    marked["updated_at"] = datetime.now(timezone.utc)
+    marked = marked.reindex(columns=DOWNTIME_COLUMNS)
+
+    with engine.begin() as conn:
+        for sr in scope:
+            conn.execute(
+                text("DELETE FROM plant_downtime WHERE plant_sr_no = :s AND month = :m"),
+                {"s": int(sr), "m": key},
+            )
+        if not marked.empty:
+            marked.to_sql("plant_downtime", conn, if_exists="append", index=False,
+                          method="multi", chunksize=500)
+    return len(marked)
+
+
+@st.cache_data(show_spinner="Loading bypass notes...")
+def load_bypass_notes() -> pd.DataFrame:
+    """Every recorded bypass reason / remark, one row per (plant, stage, module,
+    month). Joined onto the fleet status by `attach_bypass_notes()`."""
+    engine = get_engine()
+    if engine is None:
+        return pd.DataFrame(columns=BYPASS_NOTE_COLUMNS)
+    df = pd.read_sql("SELECT * FROM bypass_notes", engine)
+    if df.empty:
+        return pd.DataFrame(columns=BYPASS_NOTE_COLUMNS)
+    for col in BYPASS_NOTE_KEY:
+        df[col] = df[col].fillna("").astype(str)
+    df["month"] = df["month"].map(month_key).fillna("")
+    df["reason"] = df["reason"].map(canonical_bypass_reason)
+    # The key is the table's PK, but a legacy/hand-edited row could still double up
+    # and a duplicated index would break the lookup join.
+    df = df.drop_duplicates(BYPASS_NOTE_KEY, keep="last")
+    return df.reindex(columns=BYPASS_NOTE_COLUMNS).reset_index(drop=True)
+
+
+def save_bypass_notes(engine: Engine, edited: pd.DataFrame) -> int:
+    """Persist bypass reasons/remarks for the modules that were on screen.
+
+    Every shown row's stored note is replaced, so clearing both fields deletes the
+    note rather than leaving a stale reason behind. Returns the number of notes kept."""
+    clean = edited.copy()
+    for col in BYPASS_NOTE_KEY:
+        if col not in clean:
+            return 0
+        clean[col] = clean[col].fillna("").astype(str).str.strip()
+    clean["month"] = clean["month"].map(month_key).fillna("")
+    clean = clean[(clean[BYPASS_NOTE_KEY] != "").all(axis=1)]
+    if clean.empty:
+        return 0
+    clean = clean.drop_duplicates(BYPASS_NOTE_KEY, keep="last")
+
+    clean["reason"] = (
+        clean["reason"].map(canonical_bypass_reason) if "reason" in clean else None
+    )
+    clean["remarks"] = (
+        clean["remarks"].map(lambda v: None if pd.isna(v) else (str(v).strip() or None))
+        if "remarks" in clean else None
+    )
+    clean["plant_sr_no"] = (
+        pd.to_numeric(clean["plant_sr_no"], errors="coerce").astype("Int64")
+        if "plant_sr_no" in clean else pd.NA
+    )
+    clean["updated_at"] = datetime.now(timezone.utc)
+    kept = clean[clean["reason"].notna() | clean["remarks"].notna()].reindex(
+        columns=BYPASS_NOTE_COLUMNS
+    )
+
+    with engine.begin() as conn:
+        for _, row in clean.iterrows():
+            conn.execute(
+                text(
+                    "DELETE FROM bypass_notes WHERE plant_key = :p AND stage_label = :s "
+                    "AND module_label = :mo AND month = :m"
+                ),
+                {"p": row["plant_key"], "s": row["stage_label"],
+                 "mo": row["module_label"], "m": row["month"]},
+            )
+        if not kept.empty:
+            kept.to_sql("bypass_notes", conn, if_exists="append", index=False,
+                        method="multi", chunksize=500)
+    return len(kept)
+
+
+@st.cache_data(show_spinner="Loading stage limits...")
+def load_stage_limits() -> dict[str, float]:
+    """The per-stage absolute conductivity limit, as {stage_key: uS/cm}.
+
+    DEFAULT_STAGE_LIMITS is the floor: a stage nobody has set keeps its default, so
+    the page works before anything is saved and a newly-added stage (IV arrived this
+    way) picks up a sane value instead of dropping out of the count."""
+    limits = dict(DEFAULT_STAGE_LIMITS)
+    engine = get_engine()
+    if engine is None:
+        return limits
+    stored = pd.read_sql("SELECT * FROM stage_limits", engine)
+    for _, row in stored.iterrows():
+        value = pd.to_numeric(row.get("limit_us_cm"), errors="coerce")
+        key = str(row.get("stage_key") or "").strip()
+        if key and pd.notna(value) and value > 0:
+            limits[key] = float(value)
+    return limits
+
+
+def save_stage_limits(engine: Engine, limits: dict[str, float]) -> int:
+    """Persist the edited limits — one row per stage, replaced in place.
+
+    A limit equal to its default is still written: "the admin looked at this and
+    agreed" is worth keeping, and it costs one row."""
+    clean = {
+        str(k).strip(): float(v)
+        for k, v in limits.items()
+        if str(k).strip() and pd.notna(v) and float(v) > 0
+    }
+    if not clean:
+        return 0
+    frame = pd.DataFrame(
+        [
+            {"stage_key": k, "limit_us_cm": v, "updated_at": datetime.now(timezone.utc)}
+            for k, v in clean.items()
+        ]
+    )
+    with engine.begin() as conn:
+        for key in clean:
+            conn.execute(
+                text("DELETE FROM stage_limits WHERE stage_key = :k"), {"k": key}
+            )
+        frame.to_sql("stage_limits", conn, if_exists="append", index=False)
+    return len(frame)
+
+
+def evaluate_absolute_limits(
+    snapshot: pd.DataFrame, limits: dict[str, float]
+) -> pd.DataFrame:
+    """Flag every module at or over its own stage's absolute conductivity limit.
+
+    This is a LEVEL test, deliberately independent of the Portfolio's peer-outlier
+    and month-over-month signals. Those two are relative — they ask whether a module
+    stands out from its neighbours or from its own past — and both go quiet when a
+    whole stage degrades together, which is exactly when the stage most needs
+    replacing. A fixed limit is the only test that still fires there.
+
+    Adds `stage_limit`, `over_limit`, `replace` and `times_limit`. A bypassed module
+    counts as a replacement regardless of limit: it has no reading (it is already
+    offline), and being taken out of service is the strongest signal there is."""
+    out = snapshot.copy()
+    if out.empty:
+        for col in ("stage_limit", "times_limit"):
+            out[col] = pd.Series(dtype=float)
+        for col in ("over_limit", "replace"):
+            out[col] = pd.Series(dtype=bool)
+        return out
+
+    out["stage_limit"] = out["stage_key"].map(limits).astype(float)
+    out["over_limit"] = (
+        (out["status"] == "active")
+        & out["conductivity"].notna()
+        & out["stage_limit"].notna()
+        & (out["conductivity"] > out["stage_limit"])
+    )
+    out["replace"] = (out["status"] == "bypass") | out["over_limit"]
+    # How far over — the ranking key for "worst first", and it makes a module at
+    # 12x its limit legible next to one that is barely over.
+    out["times_limit"] = out["conductivity"] / out["stage_limit"]
+    return out
+
+
+def build_limit_stage_table(
+    evaluated: pd.DataFrame, limits: dict[str, float]
+) -> pd.DataFrame:
+    """Per-stage rollup of the absolute-limit verdict: what each stage costs in
+    modules and membranes at the limit currently set for it."""
+    rows: list[dict[str, object]] = []
+    for key in stage_keys_present(evaluated):
+        sub = evaluated[evaluated["stage_key"] == key]
+        modules = len(sub)
+        replace = int(sub["replace"].sum())
+        readings = sub["conductivity"].notna().sum()
+        rows.append(
+            {
+                "stage_key": key,
+                "Stage": stage_display(key),
+                "Limit (uS/cm)": limits.get(key, float("nan")),
+                "Modules": modules,
+                "Bypassed": int((sub["status"] == "bypass").sum()),
+                "Over Limit": int(sub["over_limit"].sum()),
+                "To Replace": replace,
+                "Membranes": replace * MEMBRANES_PER_MODULE,
+                "% of Stage": round(replace / modules * 100, 1) if modules else 0.0,
+                "Median Cond": (
+                    round(float(sub["conductivity"].median()), 0) if readings else np.nan
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def limit_sensitivity(
+    evaluated: pd.DataFrame, stage_key: str, limit: float
+) -> pd.DataFrame:
+    """Modules over the limit across a sweep around the current setting, so the
+    admin can see how sharply the count moves before committing to a number."""
+    sub = evaluated[
+        (evaluated["stage_key"] == stage_key) & evaluated["conductivity"].notna()
+    ]
+    if sub.empty or not limit or pd.isna(limit):
+        return pd.DataFrame(columns=["limit", "modules", "membranes"])
+    cond = sub["conductivity"]
+    steps = sorted({round(limit * m) for m in (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0)})
+    return pd.DataFrame(
+        [
+            {
+                "limit": step,
+                "modules": int((cond > step).sum()),
+                "membranes": int((cond > step).sum()) * MEMBRANES_PER_MODULE,
+            }
+            for step in steps
+        ]
+    )
+
+
+def attach_bypass_notes(rows: pd.DataFrame, notes: pd.DataFrame) -> pd.DataFrame:
+    """Add `bypass_reason` / `bypass_remarks` to fleet-status rows.
+
+    Always returns both columns (blank where nothing is recorded) so every caller
+    can render them without checking whether any note exists yet."""
+    out = rows.copy()
+    out["month_key"] = out["report_date"].map(month_key)
+    out["note_key"] = out["plant_key"].astype(str)
+    out["bypass_reason"] = ""
+    out["bypass_remarks"] = ""
+    if notes is None or notes.empty or out.empty:
+        return out
+
+    lookup = notes.set_index(BYPASS_NOTE_KEY)
+    index = pd.MultiIndex.from_arrays([
+        out["note_key"],
+        out["stage_label"].fillna("").astype(str),
+        out["module_label"].fillna("").astype(str),
+        out["month_key"].fillna("").astype(str),
+    ])
+    for column, source in (("bypass_reason", "reason"), ("bypass_remarks", "remarks")):
+        values = lookup[source].reindex(index)
+        out[column] = pd.Series(values.to_numpy(), index=out.index).fillna("")
+    return out
 
 
 @dataclass
@@ -2213,43 +2756,6 @@ def apply_register_authority(mis: pd.DataFrame, plants: pd.DataFrame) -> pd.Data
     return pd.concat([base, reg_rows], ignore_index=True)
 
 
-def feed_pressure_series(
-    params: pd.DataFrame, plant_group: str, plant: str, plant_sr_no: int | None = None
-) -> pd.DataFrame:
-    """The plant's PI 1601 feed pressure per month.
-
-    Matched on Plant SR No wherever we have one: a site's two RO trains share a
-    display name (so the name alone overlaid one train's pressure on the other's
-    readings), and a renamed plant's older rows carry a name the caller never
-    passes. Rows ingested before `parameters` carried an SR have none to match on,
-    so the name lookup stays as the fallback."""
-    pressures = params[params["kind"] == "pressure"]
-    by_sr = pressures.iloc[0:0]
-    if plant_sr_no is not None and "plant_sr_no" in pressures.columns:
-        by_sr = pressures[pressures["plant_sr_no"] == plant_sr_no]
-    pressures = (
-        by_sr
-        if not by_sr.empty
-        else pressures[
-            (pressures["plant_group"] == plant_group) & (pressures["plant"] == plant)
-        ]
-    )
-    if pressures.empty:
-        return pd.DataFrame(columns=["report_date", "value"])
-
-    rows: list[dict[str, object]] = []
-    for report_date, group in pressures.groupby("report_date"):
-        feed = group[group["tag"].str.contains(FEED_TAG, regex=False)]["value"]
-        if feed.empty:
-            continue
-        rows.append({"report_date": report_date, "value": float(feed.iloc[0])})
-
-    series = pd.DataFrame(rows)
-    if series.empty:
-        return pd.DataFrame(columns=["report_date", "value"])
-    return series.sort_values("report_date").reset_index(drop=True)
-
-
 def format_module_number(value: object) -> str:
     number = pd.to_numeric(value, errors="coerce")
     if pd.isna(number):
@@ -2257,100 +2763,6 @@ def format_module_number(value: object) -> str:
     if float(number).is_integer():
         return str(int(number))
     return f"{number:g}"
-
-
-def aggregate_series(df: pd.DataFrame, metric_col: str) -> pd.DataFrame:
-    metric_df = df.dropna(subset=[metric_col]).copy()
-    if metric_df.empty:
-        return metric_df
-
-    grouped = (
-        metric_df.groupby("report_date", as_index=False)
-        .agg(
-            value=(metric_col, "mean"),
-            install_date=("install_date", "first"),
-            source_file=("source_file", "first"),
-            stage=("stage", "first"),
-        )
-        .sort_values("report_date")
-    )
-    return grouped
-
-
-# Teal, distinct from the blue reading line, so the operating-pressure context
-# reads clearly on its own right-hand axis.
-PRESSURE_LINE_COLOR = "#0d9488"
-
-
-def add_feed_pressure_axis(fig: go.Figure, pressure: pd.DataFrame | None) -> None:
-    """Overlay PI 1601 feed pressure as a dashed line on a secondary right-hand axis.
-
-    Shared by the single-module and comparison charts so the operating pressure
-    each reading was taken at is visible at a glance, not just on hover. Pressure
-    is a plant-level series, so in the comparison view this is one shared line
-    behind all the module lines.
-    """
-    if pressure is None or pressure.empty:
-        return
-    ordered = pressure.dropna(subset=["value"]).sort_values("report_date")
-    if ordered.empty:
-        return
-    fig.add_trace(
-        go.Scatter(
-            x=ordered["report_date"],
-            y=ordered["value"],
-            mode="lines+markers",
-            name="Feed pressure (PI 1601)",
-            yaxis="y2",
-            line={"color": PRESSURE_LINE_COLOR, "width": 2, "dash": "dot"},
-            marker={"size": 6, "symbol": "diamond"},
-            hovertemplate="Feed pressure (PI 1601)<br>%{x|%d %b %Y}<br>%{y:,.2f} bar<extra></extra>",
-        )
-    )
-    fig.update_layout(
-        yaxis2={
-            "title": "Feed Pressure (bar, PI 1601)",
-            "overlaying": "y",
-            "side": "right",
-            "showgrid": False,
-            "automargin": True,
-        }
-    )
-
-
-def make_chart(
-    series: pd.DataFrame,
-    *,
-    metric_name: str,
-    metric_config: dict[str, object],
-    pressure: pd.DataFrame | None = None,
-) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=series["report_date"],
-            y=series["value"],
-            mode="lines+markers",
-            name="Historical Reading",
-            line={"color": "#2563eb", "width": 3},
-            marker={"size": 8},
-            hovertemplate="%{x|%d %b %Y}<br>%{y:,.2f}<extra></extra>",
-        )
-    )
-
-    add_feed_pressure_axis(fig, pressure)
-
-    fig.update_layout(
-        title=f"{metric_name} History",
-        xaxis_title="Report Date",
-        yaxis_title=str(metric_config["axis_label"]),
-        hovermode="x unified",
-        margin={"l": 20, "r": 20, "t": 60, "b": 20},
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1},
-        template="plotly_white",
-        height=470,
-    )
-    return fig
 
 
 def plant_no_column(values: pd.Series) -> pd.Series:
@@ -2431,35 +2843,6 @@ def rerun_app() -> None:
         st.rerun()
     else:
         st.experimental_rerun()
-
-
-def sidebar_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str, str, str]:
-    st.sidebar.header("Filters")
-
-    plant_groups = sorted(df["plant_group"].dropna().unique())
-    if len(plant_groups) > 1:
-        selected_group = st.sidebar.selectbox("Plant Group", plant_groups)
-    else:
-        selected_group = plant_groups[0]
-        st.sidebar.caption(f"Plant group: {selected_group}")
-
-    group_df = df[df["plant_group"] == selected_group]
-    plant_key, selected_plant, selected_sr = select_plant(group_df, key="dash_plant")
-
-    plant_df = rows_for_plant(group_df, plant_key)
-    module_labels = sorted(
-        plant_df["module_label"].dropna().unique(),
-        key=lambda item: pd.to_numeric(item, errors="coerce"),
-    )
-    selected_module = st.sidebar.selectbox("Module Number", module_labels)
-
-    metric_name = st.sidebar.radio("View Metric", list(METRICS), horizontal=False)
-
-    filtered = plant_df[plant_df["module_label"] == selected_module].copy()
-    return (
-        filtered, selected_group, plant_key, selected_plant, selected_sr,
-        selected_module, metric_name,
-    )
 
 
 def plant_options(frame: pd.DataFrame) -> list[tuple[object, str, int | None]]:
@@ -2662,147 +3045,6 @@ def render_staged_review(engine: Engine) -> None:
             if no_col.button("Discard", key=f"discard_{name}"):
                 staged.pop(name, None)
                 rerun_app()
-
-
-def module_series_map(
-    plant_df: pd.DataFrame, module_labels: list[str], metric_col: str
-) -> dict[str, pd.DataFrame]:
-    series_map: dict[str, pd.DataFrame] = {}
-    for module_label in module_labels:
-        module_df = plant_df[plant_df["module_label"] == module_label]
-        series = aggregate_series(module_df, metric_col)
-        if not series.empty:
-            series_map[module_label] = series
-    return series_map
-
-
-def make_comparison_chart(
-    series_map: dict[str, pd.DataFrame],
-    *,
-    metric_config: dict[str, object],
-    average: pd.DataFrame | None,
-    pressure: pd.DataFrame | None = None,
-) -> go.Figure:
-    fig = go.Figure()
-    for module_label, series in series_map.items():
-        ordered = series.sort_values("report_date")
-        fig.add_trace(
-            go.Scatter(
-                x=ordered["report_date"],
-                y=ordered["value"],
-                mode="lines+markers",
-                name=f"Module {module_label}",
-                marker={"size": 7},
-                hovertemplate=f"Module {module_label}<br>%{{x|%d %b %Y}}<br>%{{y:,.2f}}<extra></extra>",
-            )
-        )
-
-    if average is not None and not average.empty:
-        ordered = average.sort_values("report_date")
-        fig.add_trace(
-            go.Scatter(
-                x=ordered["report_date"],
-                y=ordered["value"],
-                mode="lines",
-                name="Plant average",
-                line={"color": "#475569", "width": 2, "dash": "dash"},
-                hovertemplate="Plant average<br>%{x|%d %b %Y}<br>%{y:,.2f}<extra></extra>",
-            )
-        )
-
-    add_feed_pressure_axis(fig, pressure)
-
-    fig.update_layout(
-        title="Module Comparison",
-        xaxis_title="Report Date",
-        yaxis_title=str(metric_config["axis_label"]),
-        hovermode="x unified",
-        margin={"l": 20, "r": 20, "t": 60, "b": 20},
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1},
-        template="plotly_white",
-        height=470,
-    )
-    return fig
-
-
-def build_comparison_table(
-    series_map: dict[str, pd.DataFrame], metric_config: dict[str, object]
-) -> pd.DataFrame:
-    unit = str(metric_config["unit"])
-    rows: list[dict[str, object]] = []
-
-    for module_label, series in series_map.items():
-        ordered = series.sort_values("report_date")
-        latest_row = ordered.iloc[-1]
-        latest = float(latest_row["value"])
-        rows.append(
-            {
-                "Module": module_label,
-                "Latest": f"{latest:,.2f} {unit}",
-                "Latest Date": pd.Timestamp(latest_row["report_date"]).strftime("%d %b %Y"),
-                "_sort": pd.to_numeric(module_label, errors="coerce"),
-            }
-        )
-
-    table = pd.DataFrame(rows)
-    if table.empty:
-        return table
-    return table.sort_values("_sort").drop(columns="_sort").reset_index(drop=True)
-
-
-def render_comparison_section(
-    plant_df: pd.DataFrame,
-    selected_module: str,
-    metric_name: str,
-    metric_config: dict[str, object],
-    pressure: pd.DataFrame | None = None,
-) -> None:
-    module_labels = sorted(
-        plant_df["module_label"].dropna().unique(),
-        key=lambda item: pd.to_numeric(item, errors="coerce"),
-    )
-    if len(module_labels) < 2:
-        return
-
-    st.markdown("---")
-    st.subheader("Compare Modules")
-    st.caption(
-        f"Overlay multiple modules for {metric_name.lower()} to spot outliers against their peers. "
-        "The dashed teal line (right axis) is the shared plant feed pressure (PI 1601) "
-        "all modules were operating at."
-    )
-
-    default_selection = [selected_module] if selected_module in module_labels else module_labels[:1]
-    chosen = st.multiselect(
-        "Modules to compare",
-        options=module_labels,
-        default=default_selection,
-        key="compare_modules",
-    )
-    show_average = st.checkbox("Show plant average", value=True, key="compare_average")
-
-    if not chosen:
-        st.info("Select at least one module to compare.")
-        return
-
-    metric_col = str(metric_config["column"])
-    series_map = module_series_map(plant_df, chosen, metric_col)
-    if not series_map:
-        st.warning("No valid readings for the selected modules and metric.")
-        return
-
-    average = aggregate_series(plant_df, metric_col) if show_average else None
-
-    st.plotly_chart(
-        make_comparison_chart(
-            series_map, metric_config=metric_config, average=average, pressure=pressure
-        ),
-        width="stretch",
-    )
-
-    table = build_comparison_table(series_map, metric_config)
-    if not table.empty:
-        st.dataframe(table, width="stretch", hide_index=True)
 
 
 # The replacement page offers two ways to flag a membrane. "Peer outlier" is
@@ -3185,7 +3427,7 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
     flow_col = str(METRICS["Flow Rate"]["column"])
     columns = [
         "plant_group", "plant", "plant_sr_no", "plant_key", "zone", "stage_label",
-        "module_label", "report_date", "conductivity", "prev_conductivity",
+        "stage_key", "module_label", "report_date", "conductivity", "prev_conductivity",
         "flow", "prev_flow", "install_date", "status", "degraded_iqr",
         "degraded_mom", "degraded", "need", "cutoff", "source_file",
     ]
@@ -3252,6 +3494,9 @@ def compute_fleet_status(readings: pd.DataFrame, mis: pd.DataFrame) -> pd.DataFr
                     "plant_key": plant_key,
                     "zone": zone,
                     "stage_label": stage_label,
+                    # Sheets spell the stage every way there is, so the stage-wise
+                    # membrane requirement rolls up on this, not the raw label.
+                    "stage_key": canonical_stage(stage_label) or UNSTAGED_LABEL,
                     "module_label": row["module_label"],
                     "report_date": report_date,
                     "conductivity": row["conductivity"],
@@ -3534,6 +3779,9 @@ def build_plant_ranking(snapshot: pd.DataFrame, latest: pd.Timestamp) -> pd.Data
     """One row per PLANT — keyed on plant_key (the Plant SR No), so a site running
     two RO trains under one sheet name ranks as the two plants it is, each with its
     own Plant No, instead of one merged row stamped with an arbitrary SR."""
+    # Stage-wise columns are added only for the stages actually on screen, so a
+    # single-stage fleet (or a stage-filtered page) doesn't grow three empty ones.
+    stage_keys = stage_keys_present(snapshot)
     rows: list[dict[str, object]] = []
     for plant_key, pdf in snapshot.groupby("plant_key"):
         plant = current_plant_name(pdf)
@@ -3545,21 +3793,29 @@ def build_plant_ranking(snapshot: pd.DataFrame, latest: pd.Timestamp) -> pd.Data
         ages = (
             pd.Timestamp(latest) - pd.to_datetime(pdf["install_date"], errors="coerce")
         ).dt.days / 365.25
-        rows.append(
+        row = {
+            "Plant": plant,
+            "Plant No": plant_no_column(pdf["plant_sr_no"]).iloc[0],
+            "plant_key": plant_key,
+            "Zone": pdf["zone"].iloc[0],
+            "Modules": module_count,
+            "Bypassed": bypassed,
+            "Degraded": degraded,
+            "Need": need,
+        }
+        for key in stage_keys:
+            row[f"Need {stage_display(key)}"] = int(
+                pdf.loc[pdf["stage_key"] == key, "need"].sum()
+            )
+        row.update(
             {
-                "Plant": plant,
-                "Plant No": plant_no_column(pdf["plant_sr_no"]).iloc[0],
-                "plant_key": plant_key,
-                "Zone": pdf["zone"].iloc[0],
-                "Modules": module_count,
-                "Bypassed": bypassed,
-                "Degraded": degraded,
-                "Need": need,
+                "Membranes": need * MEMBRANES_PER_MODULE,
                 "Need %": round(need / module_count * 100, 1) if module_count else 0.0,
                 "Avg Cond (uS/cm)": round(float(avg_cond), 0) if pd.notna(avg_cond) else np.nan,
                 "Median Age (yrs)": round(float(ages.median()), 1) if ages.notna().any() else np.nan,
             }
         )
+        rows.append(row)
     ranking = pd.DataFrame(rows)
     if ranking.empty:
         return ranking
@@ -3750,16 +4006,39 @@ def flag_reason(row: pd.Series) -> str:
     return " + ".join(tags) if tags else "Degraded"
 
 
-def build_flagged_detail_table(rows: pd.DataFrame, latest: pd.Timestamp) -> pd.DataFrame:
+def build_flagged_detail_table(
+    rows: pd.DataFrame, latest: pd.Timestamp, *, with_bypass_notes: bool = False
+) -> pd.DataFrame:
     """Every number behind a flag, one row per module, so a drill-down list can be
     read and exported without opening the workbook. Bypassed modules have no flow or
-    conductivity by definition — those cells read "—" rather than being dropped."""
+    conductivity by definition — those cells read "—" rather than being dropped.
+
+    `with_bypass_notes` adds the recorded bypass reason/remarks; pass it for a list
+    of bypassed modules, where they are the point, and leave it off for degraded
+    ones, where they would be two permanently empty columns."""
     def num(series: pd.Series, fmt: str) -> pd.Series:
         return series.map(lambda v: format(v, fmt) if pd.notna(v) else "—")
 
     install = pd.to_datetime(rows["install_date"], errors="coerce")
     age_years = (pd.Timestamp(latest) - install).dt.days / 365.25
     delta = rows["conductivity"] - rows["prev_conductivity"]
+
+    notes: dict[str, object] = {}
+    if with_bypass_notes:
+        blank = pd.Series("", index=rows.index)
+        is_bypass = rows["status"] == "bypass"
+        # "Not recorded" only makes sense for a module that IS bypassed; a degraded
+        # one was never taken offline, so it reads blank.
+        notes = {
+            "Bypassed By": np.where(
+                is_bypass,
+                rows.get("bypass_reason", blank).fillna("").replace("", "Not recorded"),
+                "",
+            ),
+            "Bypass Remarks": np.where(
+                is_bypass, rows.get("bypass_remarks", blank).fillna(""), ""
+            ),
+        }
 
     return pd.DataFrame(
         {
@@ -3769,6 +4048,7 @@ def build_flagged_detail_table(rows: pd.DataFrame, latest: pd.Timestamp) -> pd.D
             "Stage": rows["stage_label"],
             "Module": rows["module_label"],
             "Reason": rows.apply(flag_reason, axis=1),
+            **notes,
             "Conductivity (uS/cm)": num(rows["conductivity"], ",.0f"),
             "Prev Month (uS/cm)": num(rows["prev_conductivity"], ",.0f"),
             "Δ Conductivity": delta.map(lambda v: f"{v:+,.0f}" if pd.notna(v) else "—"),
@@ -3782,14 +4062,94 @@ def build_flagged_detail_table(rows: pd.DataFrame, latest: pd.Timestamp) -> pd.D
     )
 
 
+def render_bypass_notes_editor(rows: pd.DataFrame, *, key: str) -> None:
+    """Record WHO bypassed each module, plus any detail worth keeping.
+
+    The IMR sheet only ever says "BY PASS" — it has no field for who decided it —
+    so the reason is captured here and stored per (plant, stage, module, month).
+    Kept in an expander under the read-only list so scanning stays the default and
+    editing is a deliberate step."""
+    if rows.empty:
+        return
+    engine = get_engine()
+    if engine is None:
+        return
+
+    rows = rows.reset_index(drop=True)
+    recorded = int((rows.get("bypass_reason", pd.Series("", index=rows.index)) != "").sum())
+    with st.expander(
+        f"✏️ Bypass reason & remarks — {recorded:,}/{len(rows):,} recorded"
+    ):
+        st.caption(
+            "Pick who took each module offline and add any detail. Clearing both "
+            "fields removes the note; a blank reason means nobody has recorded it yet."
+        )
+        blank = pd.Series("", index=rows.index)
+        editable = pd.DataFrame(
+            {
+                "Plant": rows["plant"].astype(str),
+                "Plant No": plant_no_column(rows["plant_sr_no"]),
+                "Stage": rows["stage_label"].fillna("").astype(str),
+                "Module": rows["module_label"].fillna("").astype(str),
+                # SelectboxColumn shows an empty cell for None, not for "".
+                "Reason": rows.get("bypass_reason", blank).replace("", None),
+                "Remarks": rows.get("bypass_remarks", blank).fillna(""),
+            }
+        )
+        edited = st.data_editor(
+            editable,
+            width="stretch",
+            hide_index=True,
+            height=min(440, 80 + 36 * len(editable)),
+            key=f"bypass_notes_editor::{key}",
+            disabled=["Plant", "Plant No", "Stage", "Module"],
+            column_config={
+                "Reason": st.column_config.SelectboxColumn(
+                    "Bypassed by",
+                    options=BYPASS_REASON_OPTIONS,
+                    width="medium",
+                    help="Who took this module offline — us, or the client.",
+                ),
+                "Remarks": st.column_config.TextColumn(
+                    "Remarks", width="large",
+                    help="Anything else worth keeping about this bypass.",
+                ),
+            },
+        )
+        if st.button(
+            "💾 Save bypass notes", type="primary", key=f"bypass_notes_save::{key}"
+        ):
+            payload = pd.DataFrame(
+                {
+                    # Keyed on plant_key (the SR), like every other per-plant join —
+                    # two RO trains can share one display name.
+                    "plant_key": rows["plant_key"].astype(str),
+                    "stage_label": rows["stage_label"].fillna("").astype(str),
+                    "module_label": rows["module_label"].fillna("").astype(str),
+                    "month": rows["report_date"].map(month_key),
+                    "plant_sr_no": rows["plant_sr_no"],
+                    "plant": rows["plant"].astype(str),
+                    "reason": edited["Reason"].to_numpy(),
+                    "remarks": edited["Remarks"].to_numpy(),
+                }
+            )
+            kept = save_bypass_notes(engine, payload)
+            load_bypass_notes.clear()
+            st.success(f"Saved — {kept:,} module(s) now carry a bypass note.")
+            rerun_app()
+
+
 def render_flagged_module_list(
-    snapshot: pd.DataFrame, latest: pd.Timestamp, month_text: str, *, bypassed: bool
+    snapshot: pd.DataFrame, latest: pd.Timestamp, month_text: str, *, bypassed: bool,
+    peer_only: bool = False,
 ) -> None:
     """The full fleet-wide list behind the Degraded / Bypassed KPI cards.
 
     `bypassed=True` lists offline modules; otherwise the degraded (still-active)
     ones. Sorted worst-first by conductivity for degraded, and by plant for
-    bypassed (which have no reading to rank on).
+    bypassed (which have no reading to rank on). `peer_only` only changes the
+    degraded list's caption — the rows themselves already respect the toggle,
+    because `snapshot` carries the re-derived verdict.
     """
     if bypassed:
         rows = snapshot[snapshot["status"] == "bypass"]
@@ -3804,6 +4164,9 @@ def render_flagged_module_list(
         rows = snapshot[snapshot["degraded"]]
         title, anchor = "Degraded modules", "degraded-modules"
         caption = (
+            "Every still-active module that is a peer outlier against its own stage "
+            "(IQR). Month-over-month jumps are excluded."
+            if peer_only else
             "Every still-active module flagged this month — either a peer outlier "
             "against its own stage (IQR) or an unusual month-over-month jump."
         )
@@ -3819,7 +4182,7 @@ def render_flagged_module_list(
     st.caption(f"{len(rows):,} module(s). {caption}")
     # Sort the source frame so a selected row index still points at the same module.
     rows = rows.sort_values(order, ascending=ascending).reset_index(drop=True)
-    table = build_flagged_detail_table(rows, latest)
+    table = build_flagged_detail_table(rows, latest, with_bypass_notes=bypassed)
 
     st.caption("Select a row to open the IMR that module's reading came from.")
     key = "bypassed" if bypassed else "degraded"
@@ -3835,6 +4198,9 @@ def render_flagged_module_list(
     picked = event.selection.get("rows", []) if event else []
     if picked:
         render_open_imr_button(rows.iloc[picked[0]], key=f"{key}_list")
+
+    if bypassed:
+        render_bypass_notes_editor(rows, key="fleet")
 
     st.download_button(
         f"Download {title.lower()} (CSV)",
@@ -3877,11 +4243,20 @@ def render_plant_flagged_modules(
     flagged = flagged.sort_values(
         ["status", "conductivity"], ascending=[True, False]
     ).reset_index(drop=True)
+    blank = pd.Series("", index=flagged.index)
     detail = pd.DataFrame(
         {
             "Stage": flagged["stage_label"],
             "Module": flagged["module_label"],
             "Reason": flagged.apply(flag_reason, axis=1),
+            # Only meaningful on the bypassed rows; a degraded module has no
+            # "bypassed by", so it reads blank rather than "Not recorded".
+            "Bypassed By": np.where(
+                flagged["status"] == "bypass",
+                flagged.get("bypass_reason", blank).fillna("").replace("", "Not recorded"),
+                "",
+            ),
+            "Bypass Remarks": flagged.get("bypass_remarks", blank).fillna(""),
             "Conductivity (uS/cm)": flagged["conductivity"].map(
                 lambda v: f"{v:,.0f}" if pd.notna(v) else "—"
             ),
@@ -3909,6 +4284,9 @@ def render_plant_flagged_modules(
     detail_rows = detail_event.selection.get("rows", []) if detail_event else []
     if detail_rows:
         render_open_imr_button(flagged.iloc[detail_rows[0]], key=f"flagged::{plant}")
+    render_bypass_notes_editor(
+        flagged[flagged["status"] == "bypass"], key=f"plant::{plant_key}"
+    )
     st.download_button(
         "Download flagged modules (CSV)",
         detail.to_csv(index=False).encode("utf-8"),
@@ -3918,19 +4296,138 @@ def render_plant_flagged_modules(
     )
 
 
+def apply_degradation_signals(status: pd.DataFrame, *, peer_only: bool) -> pd.DataFrame:
+    """Re-derive `degraded` / `need` for the chosen degradation signal(s).
+
+    `compute_fleet_status()` flags a module degraded if EITHER signal fires: the
+    peer-outlier (IQR) test, or the month-over-month conductivity jump. The two are
+    not equally conservative — the MoM test fires on a single month's rise, against
+    the module's own history rather than its peers, so it can flag a module that is
+    still well inside its stage's normal spread. `peer_only` drops it and counts
+    only peer outliers.
+
+    Both raw signals stay on the frame either way: they are the evidence for *why*
+    a module is flagged, so the Reason column can still say that a peer outlier
+    ALSO jumped. Only the verdict columns change, and every count on the page —
+    hero, KPIs, stage requirement, ranking, trend, zone rollup, lists — is derived
+    from those two, so they all move together."""
+    if not peer_only:
+        return status
+    out = status.copy()
+    out["degraded"] = out["degraded_iqr"]
+    out["need"] = (out["status"] == "bypass") | out["degraded"]
+    return out
+
+
+def mom_only_count(frame: pd.DataFrame) -> int:
+    """Active modules the month-over-month jump flags and the peer test does not —
+    i.e. exactly what the "peer outliers only" toggle adds or removes."""
+    if frame.empty:
+        return 0
+    return int(
+        (frame["degraded_mom"] & ~frame["degraded_iqr"] & (frame["status"] != "bypass")).sum()
+    )
+
+
+def build_stage_requirement(snapshot: pd.DataFrame) -> pd.DataFrame:
+    """Modules and membranes to replace, one row per stage of the RO train.
+
+    The membrane requirement is raised per stage — `MEMBRANES_PER_MODULE` elements
+    for every module needing replacement in that stage — because 4 modules in the
+    third stage is a different order from 4 in the first. Rows run down the train
+    (1st -> 2nd -> 3rd), with anything whose sheet named no stage last."""
+    rows: list[dict[str, object]] = []
+    for key in stage_keys_present(snapshot):
+        sub = snapshot[snapshot["stage_key"] == key]
+        modules = len(sub)
+        need = int(sub["need"].sum())
+        rows.append(
+            {
+                "stage_key": key,
+                "Stage": stage_display(key),
+                "Modules": modules,
+                "Bypassed": int((sub["status"] == "bypass").sum()),
+                "Degraded": int(sub["degraded"].sum()),
+                "Modules to Replace": need,
+                "Membranes Required": need * MEMBRANES_PER_MODULE,
+                "Need %": round(need / modules * 100, 1) if modules else 0.0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def render_stage_requirement(month_snapshot: pd.DataFrame, month_text: str) -> None:
+    """The stage-wise membrane requirement for the picked month and zones.
+
+    Deliberately fed the month's FULL snapshot rather than the stage-filtered one:
+    this section is the breakdown the stage buttons are read against, so it has to
+    keep showing every stage no matter which button is pressed."""
+    st.markdown("---")
+    st.subheader(
+        f"Membrane requirement by stage — {month_text}", anchor="stage-requirement"
+    )
+    table = build_stage_requirement(month_snapshot)
+    if table.empty:
+        st.info("No modules in the selected zones this month.")
+        return
+
+    st.caption(
+        f"{MEMBRANES_PER_MODULE} membranes per module, raised per stage. Covers "
+        "every stage regardless of the stage buttons above."
+    )
+    cards = st.columns(len(table))
+    for column, (_, row) in zip(cards, table.iterrows()):
+        with column:
+            metric_card(
+                str(row["Stage"]),
+                f"{int(row['Membranes Required']):,}",
+                f"{int(row['Modules to Replace']):,} of {int(row['Modules']):,} modules "
+                f"({int(row['Bypassed']):,} bypassed + {int(row['Degraded']):,} degraded)",
+                "#2563eb" if int(row["Modules to Replace"]) else "#0f172a",
+            )
+
+    st.markdown("")
+    display = table.drop(columns=["stage_key"])
+    total = {
+        "Stage": "Total",
+        "Modules": int(display["Modules"].sum()),
+        "Bypassed": int(display["Bypassed"].sum()),
+        "Degraded": int(display["Degraded"].sum()),
+        "Modules to Replace": int(display["Modules to Replace"].sum()),
+        "Membranes Required": int(display["Membranes Required"].sum()),
+        "Need %": round(
+            display["Modules to Replace"].sum() / display["Modules"].sum() * 100, 1
+        ) if display["Modules"].sum() else 0.0,
+    }
+    display = pd.concat([display, pd.DataFrame([total])], ignore_index=True)
+    st.dataframe(display, width="stretch", hide_index=True)
+    st.download_button(
+        "Download stage-wise requirement (CSV)",
+        display.to_csv(index=False).encode("utf-8"),
+        file_name=f"membrane_requirement_by_stage_{month_text.replace(' ', '_')}.csv",
+        mime="text/csv",
+        key="portfolio_stage_requirement_csv",
+    )
+
+
 def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFrame) -> None:
     st.title("Fleet Portfolio")
     st.caption(
         "Fleet-wide membrane health across every plant — no plant selection needed. "
         "A module needs attention if it is bypassed, or degraded — an active module "
         "that is a peer outlier in its stage (Q3 + 1.5·IQR around the stage median) "
-        "or shows an unusually high month-over-month jump in conductivity."
+        "or shows an unusually high month-over-month jump in conductivity. The "
+        "**Peer outliers only** toggle drops the month-over-month signal."
     )
 
     status = compute_fleet_status(df, mis)
     if status.empty:
         st.info("No readings are available to build the fleet view.")
         return
+    # Bypass reasons/remarks live outside the cached status (they are edited in-app,
+    # not parsed from a workbook), so they are joined on here — every downstream
+    # slice of `status` then carries them.
+    status = attach_bypass_notes(status, load_bypass_notes())
 
     # Month + zone slicers — the whole page renders for the chosen month and the
     # chosen zones, defaulting to the most recent month and all zones. Every
@@ -3951,8 +4448,67 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
     selected = months[month_labels.index(picked)]
     month_text = picked
     active_zones = selected_zones or zones  # empty selection = all zones
-    status_zoned = status[status["zone"].isin(active_zones)]
+    zone_mask = status["zone"].isin(active_zones)
+    # Which stages exist is a property of the data, not of the degradation signal,
+    # so the stage buttons can be built before the toggle below is applied.
+    stage_source = status[zone_mask & (status["report_date"] == selected)]
+    stage_options = [stage_display(s) for s in stage_keys_present(stage_source)]
+
+    # ----- Stage buttons + the degradation-signal toggle -----
+    stage_col, signal_col = st.columns([3, 2])
+    with stage_col:
+        picked_stage_labels = stage_pills(
+            stage_options,
+            key="portfolio_stages",
+            label="Stages",
+            help="Narrow the whole page to one or more stages — the modules-to-replace "
+                 "and membranes-to-replace figures then read as that stage's "
+                 "requirement. The by-stage breakdown below always covers every stage.",
+        )
+    with signal_col:
+        peer_only = st.toggle(
+            "Peer outliers only",
+            key="portfolio_peer_only",
+            help="A module counts as degraded when it is a peer outlier in its stage "
+                 "(IQR) OR when its conductivity jumped month-over-month. Turn this on "
+                 "to drop the month-over-month signal and count peer outliers only — "
+                 "every figure on the page recounts, including the membrane "
+                 "requirement. Bypassed modules are unaffected either way.",
+        )
+
+    # Applied BEFORE any frame is derived, so every count on the page — hero, KPIs,
+    # stage requirement, ranking, fleet trend, zone rollup, and both flagged lists —
+    # is built from the same verdict.
+    status = apply_degradation_signals(status, peer_only=peer_only)
+    status_zoned = status[zone_mask]
+    # Every stage of the picked month, before the stage buttons narrow the page —
+    # the stage-wise membrane requirement below always reports the full train, so
+    # filtering to one stage can never hide what the other two need.
+    month_snapshot = status_zoned[status_zoned["report_date"] == selected]
+
+    active_stages = {
+        key for key in stage_keys_present(month_snapshot)
+        if stage_display(key) in set(picked_stage_labels)
+    }
+    stage_filtered = bool(active_stages) and len(active_stages) < len(stage_options)
+    status_zoned = (
+        status_zoned[status_zoned["stage_key"].isin(active_stages)]
+        if active_stages else status_zoned
+    )
     snapshot = status_zoned[status_zoned["report_date"] == selected]
+    stage_note = (
+        f" · {', '.join(sorted(picked_stage_labels))}" if stage_filtered else ""
+    )
+    # What the toggle is adding or withholding, for the captions below.
+    mom_only = mom_only_count(snapshot)
+    signal_caption = (
+        f"Counting **peer outliers only** — {mom_only:,} module(s) flagged solely by a "
+        "month-over-month jump are excluded from every figure below."
+        if peer_only else
+        f"Counting **peer outliers + month-over-month jumps** — {mom_only:,} module(s) "
+        "are flagged by the month-over-month jump alone."
+    )
+    st.caption(signal_caption)
 
     # Counted on plant_key: a site running two RO trains under one sheet name is
     # two plants, and the name would count it as one.
@@ -3988,7 +4544,7 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
         hero_card(
             "Modules to Replace",
             f"{need:,}",
-            f"{month_text} — {degraded:,} degraded + {bypassed:,} bypassed "
+            f"{month_text}{stage_note} — {degraded:,} degraded + {bypassed:,} bypassed "
             f"across {total_plants:,} plants ({need_pct:.1f}% of {total_modules:,} modules)",
         )
     with mem_col:
@@ -4015,7 +4571,10 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
         metric_card("Active Modules", f"{active_modules:,}", f"{total_modules:,} total this month")
     with kpis[2]:
         metric_card(
-            "Degraded", f"{degraded:,}", "click for the full list", "#d97706",
+            "Degraded", f"{degraded:,}",
+            f"peer outliers only · {mom_only:,} MoM-only excluded" if peer_only
+            else f"incl. {mom_only:,} MoM-only · click for the list",
+            "#d97706",
             anchor="degraded-modules",
         )
     with kpis[3]:
@@ -4044,10 +4603,14 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
                 delta_color,
             )
 
+    # ----- 2b. Stage-wise membrane requirement -----
+    render_stage_requirement(month_snapshot, month_text)
+
     # ----- Jump navigation: clickable cards that scroll to each section -----
     st.markdown("")
     jump_nav(
         [
+            ("Requirement by stage", "stage-requirement", "1st / 2nd / 3rd"),
             ("Plant ranking", "plant-ranking", "per-plant attention"),
             ("Degraded modules", "degraded-modules", "full list"),
             ("Bypassed modules", "bypassed-modules", "full list"),
@@ -4097,7 +4660,9 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
         )
 
     # ----- 2b. The lists behind the Degraded / Bypassed KPI cards -----
-    render_flagged_module_list(snapshot, selected, month_text, bypassed=False)
+    render_flagged_module_list(
+        snapshot, selected, month_text, bypassed=False, peer_only=peer_only
+    )
     render_flagged_module_list(snapshot, selected, month_text, bypassed=True)
 
     # ----- 3. Fleet trend -----
@@ -4392,93 +4957,363 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
             )
 
 
-def render_dashboard(df: pd.DataFrame, params: pd.DataFrame) -> None:
-    (
-        filtered, selected_group, plant_key, selected_plant, selected_sr,
-        selected_module, metric_name,
-    ) = sidebar_filters(df)
-    metric_config = METRICS[metric_name]
-    metric_col = str(metric_config["column"])
-    series = aggregate_series(filtered, metric_col)
+def render_dashboard(df: pd.DataFrame, mis: pd.DataFrame) -> None:
+    """Fleet replacement demand judged purely on absolute conductivity limits.
 
-    st.title("RO Plant Membrane Health Dashboard")
-    st.caption(f"{selected_group} | {plant_label_with_sr(selected_plant, selected_sr)}")
+    The Portfolio answers "what stands out?" — peer outliers and month-over-month
+    jumps, both relative tests. This page answers "what is over spec?", which is the
+    question that survives a whole stage degrading in lockstep, and it is the one a
+    purchase order is actually written against. The stage limits are the only filter,
+    and they are editable here so the number can be argued about with the counts in
+    view. (Kept under the "Dashboard" name it has always had in the nav.)"""
+    st.title("Dashboard")
+    st.caption(
+        "Replacement demand measured against a fixed conductivity limit per stage, "
+        "not against a module's neighbours. A module is a replacement candidate if it "
+        "is **bypassed**, or its conductivity is **over its stage's limit**. Peer-"
+        "outlier and month-over-month signals are deliberately not used here — they "
+        "go quiet exactly when a whole stage has degraded together."
+    )
 
-    if series.empty:
-        st.warning("No valid numeric readings are available for this module and metric.")
+    status = compute_fleet_status(df, mis)
+    if status.empty:
+        st.info("No readings are available to measure against a limit.")
         return
 
-    # PI 1601 feed pressure is the operating pressure each reading was taken at.
-    # It is plant-level (shared across modules), overlaid on a secondary axis.
-    pressure_by_date = feed_pressure_series(
-        params, selected_group, selected_plant, selected_sr
-    )
-
-    ordered = series.sort_values("report_date")
-    latest_row = ordered.iloc[-1]
-    first_row = ordered.iloc[0]
-    latest = float(latest_row["value"])
-    first = float(first_row["value"])
-    unit = str(metric_config["unit"])
-    latest_date = pd.Timestamp(latest_row["report_date"]).strftime("%d %b %Y")
-
-    change = latest - first
-    if first:
-        change_subtitle = f"{change / first * 100:+,.1f}% since {pd.Timestamp(first_row['report_date']).strftime('%b %Y')}"
-    else:
-        change_subtitle = f"since {pd.Timestamp(first_row['report_date']).strftime('%b %Y')}"
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        metric_card("Latest Reading", f"{latest:,.2f} {unit}", latest_date)
-    with col2:
-        metric_card("Change Since First", f"{change:+,.2f} {unit}", change_subtitle)
-    with col3:
-        metric_card("Readings on Record", str(len(ordered)), "report months")
-
-    st.plotly_chart(
-        make_chart(
-            series,
-            metric_name=metric_name,
-            metric_config=metric_config,
-            pressure=pressure_by_date,
-        ),
-        width="stretch",
-    )
-
-    with st.expander("Cleaned readings"):
-        display = filtered[
-            [
-                "source_file",
-                "report_date",
-                "plant",
-                "plant_sr_no",
-                "stage",
-                "module_label",
-                "install_date",
-                "flow_lph",
-                "conductivity_us_cm",
-            ]
-        ].assign(
-            plant_sr_no=lambda d: plant_no_column(d["plant_sr_no"])
-        ).rename(
-            columns={
-                "source_file": "Source File",
-                "report_date": "Report Date",
-                "plant": "Plant",
-                "plant_sr_no": "Plant No",
-                "stage": "Stage",
-                "module_label": "Module Number",
-                "install_date": "Install Date",
-                "flow_lph": "Total flow liter/hr.",
-                "conductivity_us_cm": "Cond. us/cm",
-            }
+    months = sorted(status["report_date"].dropna().unique(), reverse=True)
+    month_labels = [pd.Timestamp(m).strftime("%b %Y") for m in months]
+    zones = sorted(status["zone"].dropna().astype(str).unique().tolist())
+    picker_col, zone_col = st.columns([1, 2])
+    with picker_col:
+        picked = st.selectbox("Report month", month_labels, index=0, key="limits_month")
+    with zone_col:
+        selected_zones = st.multiselect(
+            "Zones", zones, default=zones, key="limits_zones",
+            help="Filter the whole page to one or more zones. Clear the box to show all.",
         )
-        st.dataframe(display, width="stretch", hide_index=True)
+    selected = months[month_labels.index(picked)]
+    month_text = picked
+    active_zones = selected_zones or zones
+    snapshot = status[
+        status["zone"].isin(active_zones) & (status["report_date"] == selected)
+    ]
+    if snapshot.empty:
+        st.info(f"No modules in the selected zones for {month_text}.")
+        return
 
-    plant_df = rows_for_plant(df[df["plant_group"] == selected_group], plant_key)
-    render_comparison_section(
-        plant_df, selected_module, metric_name, metric_config, pressure_by_date
+    # ----- 1. The filter: one absolute limit per stage -----
+    st.markdown("---")
+    st.subheader("Stage limits", anchor="stage-limits")
+    stored = load_stage_limits()
+    present = stage_keys_present(snapshot)
+    st.caption(
+        "Conductivity above which a module in that stage is a replacement candidate. "
+        "Defaults come from the Jul–Aug 2026 fleet at roughly 4x each stage's own "
+        "median. Change a number to see every figure below recount; **Save** makes it "
+        "the fleet-wide setting for everyone."
+    )
+    # Only real stages get a limit — the unstaged bucket is not a stage (see
+    # DEFAULT_STAGE_LIMITS), so it gets no input and is reported as unassessed below.
+    limitable = [k for k in present if k in STAGE_ORDER]
+    edited: dict[str, float] = {}
+    cols = st.columns(max(len(limitable), 1))
+    for column, key in zip(cols, limitable):
+        with column:
+            edited[key] = float(
+                st.number_input(
+                    f"{stage_display(key)} (uS/cm)",
+                    min_value=1.0,
+                    max_value=float(MAX_PLAUSIBLE_CONDUCTIVITY_US_CM),
+                    value=float(stored.get(key, DEFAULT_STAGE_LIMITS.get(key, 3000.0))),
+                    step=250.0,
+                    key=f"limit_input_{key}",
+                    help=f"Default {DEFAULT_STAGE_LIMITS.get(key, 3000.0):,.0f}. "
+                         f"Applies to every module whose sheet names this stage.",
+                )
+            )
+    # Limits for stages not on screen (filtered out by zone/month) must survive a
+    # save, so the stored map is the base and only the edited stages overwrite it.
+    limits = {**stored, **edited}
+
+    save_col, reset_col, _ = st.columns([1, 1, 3])
+    engine = get_engine()
+    if save_col.button("💾 Save limits", type="primary", key="limits_save"):
+        if engine is None:
+            st.error("No database is configured, so limits cannot be saved.")
+        else:
+            save_stage_limits(engine, limits)
+            load_stage_limits.clear()
+            st.success("Saved — these limits now apply for everyone.")
+            rerun_app()
+    if reset_col.button("↺ Reset to defaults", key="limits_reset"):
+        for key in present:
+            st.session_state.pop(f"limit_input_{key}", None)
+        if engine is not None:
+            save_stage_limits(engine, DEFAULT_STAGE_LIMITS)
+            load_stage_limits.clear()
+        rerun_app()
+
+    unstaged = evaluate_absolute_limits(snapshot, limits)
+    unstaged = unstaged[
+        (unstaged["stage_key"] == UNSTAGED_LABEL)
+        & (unstaged["status"] == "active")
+        & unstaged["conductivity"].notna()
+    ]
+    if not unstaged.empty:
+        names = ", ".join(sorted(unstaged["plant"].astype(str).unique())[:3])
+        st.warning(
+            f"**{len(unstaged):,} module(s) have no readable stage**, so no limit "
+            f"applies and they are not counted below — {names}. Their sheet's stage "
+            "header carries no numeral (e.g. \"-STAGE\", \"STAGE (PT)\"), which "
+            "either needs fixing in the workbook, or means the blocks are separate RO "
+            "trains rather than stages. Bypassed modules among them still count."
+        )
+
+    changed = {
+        k: v for k, v in edited.items()
+        if abs(v - float(stored.get(k, DEFAULT_STAGE_LIMITS.get(k, 3000.0)))) > 1e-9
+    }
+    if changed:
+        st.info(
+            "Unsaved: "
+            + " · ".join(
+                f"{stage_display(k)} {stored.get(k, DEFAULT_STAGE_LIMITS.get(k, 0)):,.0f} "
+                f"→ {v:,.0f}" for k, v in changed.items()
+            )
+            + ". The figures below already use these; press Save to keep them."
+        )
+
+    evaluated = evaluate_absolute_limits(snapshot, limits)
+    total_modules = len(evaluated)
+    bypassed = int((evaluated["status"] == "bypass").sum())
+    over = int(evaluated["over_limit"].sum())
+    replace = int(evaluated["replace"].sum())
+    membranes = replace * MEMBRANES_PER_MODULE
+    plants_hit = int(evaluated.loc[evaluated["replace"], "plant_key"].nunique())
+    total_plants = int(evaluated["plant_key"].nunique())
+
+    # ----- 2. Headline -----
+    st.markdown("---")
+    hero_col, mem_col = st.columns([3, 1])
+    with hero_col:
+        hero_card(
+            "Modules to Replace",
+            f"{replace:,}",
+            f"{month_text} — {over:,} over limit + {bypassed:,} bypassed, across "
+            f"{plants_hit:,} of {total_plants:,} plants "
+            f"({replace / total_modules * 100:.1f}% of {total_modules:,} modules)",
+        )
+    with mem_col:
+        st.markdown(
+            f"""
+            <div class="hero-card" style="border-color:#bfdbfe;
+                 background:linear-gradient(180deg,#eff6ff 0%,#ffffff 70%);height:100%;">
+                <div class="hero-title">Membranes Required</div>
+                <div class="hero-value" style="color:#2563eb;
+                     font-size:clamp(1.9rem,3.5vw,3rem);">{membranes:,}</div>
+                <div class="hero-subtitle">{MEMBRANES_PER_MODULE} x {replace:,} modules</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("")
+    kpis = st.columns(5)
+    with kpis[0]:
+        metric_card("Modules", f"{total_modules:,}", f"across {total_plants:,} plants")
+    with kpis[1]:
+        metric_card("Over limit", f"{over:,}", "active, above stage limit", "#d97706")
+    with kpis[2]:
+        metric_card("Bypassed", f"{bypassed:,}", "already offline", "#dc2626")
+    with kpis[3]:
+        metric_card("Plants affected", f"{plants_hit:,}", f"of {total_plants:,} reporting")
+    with kpis[4]:
+        readings = int(evaluated["conductivity"].notna().sum())
+        metric_card(
+            "No reading", f"{total_modules - readings - bypassed:,}",
+            "active but blank — not counted",
+        )
+
+    jump_nav(
+        [
+            ("Stage limits", "stage-limits", "the filter"),
+            ("By stage", "limit-by-stage", "modules & membranes"),
+            ("Sensitivity", "limit-sensitivity", "how the count moves"),
+            ("Plants", "limit-plants", "worst first"),
+            ("Modules", "limit-modules", "the full list"),
+        ]
+    )
+
+    # ----- 3. By stage -----
+    st.markdown("---")
+    st.subheader(f"By stage — {month_text}", anchor="limit-by-stage")
+    table = build_limit_stage_table(evaluated, limits)
+    cards = st.columns(len(table)) if len(table) else []
+    for column, (_, row) in zip(cards, table.iterrows()):
+        with column:
+            metric_card(
+                str(row["Stage"]),
+                f"{int(row['Membranes']):,}",
+                f"{int(row['To Replace']):,} of {int(row['Modules']):,} modules "
+                f"· limit {row['Limit (uS/cm)']:,.0f}",
+                "#2563eb" if int(row["To Replace"]) else "#0f172a",
+            )
+    st.markdown("")
+    display = table.drop(columns=["stage_key"])
+    total_row = {
+        "Stage": "Total",
+        "Limit (uS/cm)": np.nan,
+        "Modules": int(display["Modules"].sum()),
+        "Bypassed": int(display["Bypassed"].sum()),
+        "Over Limit": int(display["Over Limit"].sum()),
+        "To Replace": int(display["To Replace"].sum()),
+        "Membranes": int(display["Membranes"].sum()),
+        "% of Stage": round(
+            display["To Replace"].sum() / display["Modules"].sum() * 100, 1
+        ) if display["Modules"].sum() else 0.0,
+        "Median Cond": np.nan,
+    }
+    display = pd.concat([display, pd.DataFrame([total_row])], ignore_index=True)
+    st.dataframe(display, width="stretch", hide_index=True)
+    st.download_button(
+        "Download by-stage (CSV)",
+        display.to_csv(index=False).encode("utf-8"),
+        file_name=f"limits_by_stage_{month_text.replace(' ', '_')}.csv",
+        mime="text/csv",
+        key="limits_stage_csv",
+    )
+
+    # ----- 4. Sensitivity: how hard is this number to get right? -----
+    st.markdown("---")
+    st.subheader("Sensitivity", anchor="limit-sensitivity")
+    st.caption(
+        "Modules over the limit as the limit moves, per stage. A curve that is flat "
+        "around the current setting means the number is not critical; a steep one "
+        "means a small change moves the demand a lot."
+    )
+    fig = go.Figure()
+    for key in stage_keys_present(evaluated):
+        sens = limit_sensitivity(evaluated, key, limits.get(key, np.nan))
+        if sens.empty:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=sens["limit"], y=sens["modules"], mode="lines+markers",
+                name=stage_display(key),
+                hovertemplate="limit %{x:,.0f} uS/cm<br>%{y:,} modules<extra>"
+                              + stage_display(key) + "</extra>",
+            )
+        )
+        current = limits.get(key)
+        if current and pd.notna(current):
+            hit = int((evaluated.loc[evaluated["stage_key"] == key, "conductivity"] > current).sum())
+            fig.add_trace(
+                go.Scatter(
+                    x=[current], y=[hit], mode="markers",
+                    marker={"size": 13, "symbol": "circle-open", "line": {"width": 3}},
+                    name=f"{stage_display(key)} — set",
+                    hovertemplate=f"current limit %{{x:,.0f}}<br>%{{y:,}} modules"
+                                  f"<extra>{stage_display(key)}</extra>",
+                    showlegend=False,
+                )
+            )
+    fig.update_layout(
+        template="plotly_white", height=380,
+        xaxis_title="Absolute limit (uS/cm)", yaxis_title="Modules over limit",
+        margin={"l": 10, "r": 10, "t": 10, "b": 10},
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    # ----- 5. Plants, worst first -----
+    st.markdown("---")
+    st.subheader(f"Plants — {month_text}", anchor="limit-plants")
+    rows: list[dict[str, object]] = []
+    for plant_key, pdf in evaluated.groupby("plant_key"):
+        n_replace = int(pdf["replace"].sum())
+        if not n_replace:
+            continue
+        row = {
+            "Plant": current_plant_name(pdf),
+            "Plant No": plant_no_column(pdf["plant_sr_no"]).iloc[0],
+            "Zone": pdf["zone"].iloc[0],
+            "Modules": len(pdf),
+            "Over Limit": int(pdf["over_limit"].sum()),
+            "Bypassed": int((pdf["status"] == "bypass").sum()),
+            "To Replace": n_replace,
+        }
+        for key in stage_keys_present(evaluated):
+            row[stage_display(key)] = int(pdf.loc[pdf["stage_key"] == key, "replace"].sum())
+        row["Membranes"] = n_replace * MEMBRANES_PER_MODULE
+        row["Worst x Limit"] = (
+            round(float(pdf["times_limit"].max()), 1)
+            if pdf["times_limit"].notna().any() else np.nan
+        )
+        rows.append(row)
+    plants = pd.DataFrame(rows)
+    if plants.empty:
+        st.success(f"No module is over its stage limit in {month_text}.")
+    else:
+        plants = plants.sort_values("To Replace", ascending=False).reset_index(drop=True)
+        st.caption(
+            f"{len(plants):,} plant(s) have at least one module to replace. "
+            f"The top 10 hold {int(plants.head(10)['To Replace'].sum()):,} of "
+            f"{replace:,} — replacement demand is usually concentrated in a few sites."
+        )
+        st.dataframe(plants, width="stretch", hide_index=True, height=440)
+        st.download_button(
+            "Download plants (CSV)",
+            plants.to_csv(index=False).encode("utf-8"),
+            file_name=f"limits_by_plant_{month_text.replace(' ', '_')}.csv",
+            mime="text/csv",
+            key="limits_plants_csv",
+        )
+
+    # ----- 6. The module list -----
+    st.markdown("---")
+    st.subheader(f"Modules to replace — {month_text}", anchor="limit-modules")
+    flagged = evaluated[evaluated["replace"]].copy()
+    if flagged.empty:
+        st.success("Nothing over limit and nothing bypassed this month.")
+        return
+    flagged = flagged.sort_values(
+        ["times_limit", "conductivity"], ascending=False, na_position="last"
+    ).reset_index(drop=True)
+    detail = pd.DataFrame(
+        {
+            "Plant": flagged["plant"],
+            "Plant No": plant_no_column(flagged["plant_sr_no"]),
+            "Zone": flagged["zone"],
+            "Stage": flagged["stage_label"],
+            "Module": flagged["module_label"],
+            "Reason": np.where(flagged["status"] == "bypass", "Bypassed", "Over limit"),
+            "Conductivity (uS/cm)": flagged["conductivity"].map(
+                lambda v: f"{v:,.0f}" if pd.notna(v) else "—"
+            ),
+            "Stage Limit": flagged["stage_limit"].map(
+                lambda v: f"{v:,.0f}" if pd.notna(v) else "—"
+            ),
+            "x Limit": flagged["times_limit"].map(
+                lambda v: f"{v:,.1f}x" if pd.notna(v) else "—"
+            ),
+            "Install Date": pd.to_datetime(flagged["install_date"], errors="coerce")
+            .dt.strftime("%d %b %Y").fillna("Unknown"),
+            "Report": flagged["source_file"],
+        }
+    )
+    st.caption("Select a row to open the IMR that reading came from.")
+    event = st.dataframe(
+        detail, width="stretch", hide_index=True, height=460,
+        on_select="rerun", selection_mode="single-row", key="limits_module_list",
+    )
+    picked_rows = event.selection.get("rows", []) if event else []
+    if picked_rows:
+        render_open_imr_button(flagged.iloc[picked_rows[0]], key="limits_list")
+    st.download_button(
+        "Download modules (CSV)",
+        detail.to_csv(index=False).encode("utf-8"),
+        file_name=f"limits_modules_{month_text.replace(' ', '_')}.csv",
+        mime="text/csv",
+        key="limits_modules_csv",
     )
 
 
@@ -5775,12 +6610,88 @@ def render_plant_register(engine: Engine) -> None:
         ))
 
 
+def render_downtime_editor(roster: pd.DataFrame, month: str, month_label: str) -> None:
+    """Tick the plants that were not running in `month`.
+
+    Only the plants that sent nothing are offered: a site whose IMR is already in
+    was demonstrably running, so marking it idle would contradict its own reading.
+    Saving replaces the marks for exactly the plants listed here, so unticking one
+    puts it straight back on the missing list."""
+    engine = get_engine()
+    if engine is None:
+        return
+
+    # Missing + already-marked: the marked ones must stay on screen or there would
+    # be no way to undo a mark.
+    candidates = roster[~roster["received"]].sort_values(["zone", "site"]).reset_index(
+        drop=True
+    )
+    with st.expander(f"✏️ Mark plants not running in {month_label}"):
+        if candidates.empty:
+            st.success(
+                f"Every registered site submitted an IMR for {month_label} — there "
+                "is nothing to mark."
+            )
+            return
+        st.caption(
+            "Tick a plant that was shut down or idle this month and it stops "
+            "counting as missing — for this month only. Untick to put it back."
+        )
+        editable = pd.DataFrame(
+            {
+                "Zone": candidates["zone"],
+                "Site": candidates["site"],
+                "SR No": candidates["plant_sr_no"],
+                "Last submitted": candidates["last_submitted"],
+                "Not running": candidates["not_running"],
+                "Remarks": candidates["downtime_remarks"],
+            }
+        )
+        edited = st.data_editor(
+            editable,
+            width="stretch",
+            hide_index=True,
+            height=min(480, 80 + 36 * len(editable)),
+            key=f"downtime_editor::{month}",
+            disabled=["Zone", "Site", "SR No", "Last submitted"],
+            column_config={
+                "SR No": st.column_config.NumberColumn("SR No", format="%d", width="small"),
+                "Not running": st.column_config.CheckboxColumn(
+                    "Not running", width="small",
+                    help=f"This plant did not run in {month_label}.",
+                ),
+                "Remarks": st.column_config.TextColumn(
+                    "Remarks", width="large",
+                    help="Why it wasn't running — shutdown, maintenance, no feed…",
+                ),
+            },
+        )
+        if st.button(
+            "💾 Save not-running marks", type="primary", key=f"downtime_save::{month}"
+        ):
+            saved = save_downtime(
+                engine,
+                month,
+                pd.DataFrame(
+                    {
+                        "plant_sr_no": edited["SR No"],
+                        "not_running": edited["Not running"],
+                        "remarks": edited["Remarks"],
+                    }
+                ),
+            )
+            load_downtime.clear()
+            st.success(f"Saved — {saved:,} plant(s) marked not running in {month_label}.")
+            rerun_app()
+
+
 def render_input_tracker(df: pd.DataFrame, plants: pd.DataFrame) -> None:
     st.title("IMR Input Tracker")
     st.caption(
         "Who has sent their IMR each month, by zone — the plant register checked "
         "against the readings actually received. Use it to chase the sites that "
-        "haven't reported yet. Edit the roster on the Plant Register page."
+        "haven't reported yet. Mark the ones that weren't running so they stop "
+        "counting as missing. Edit the roster on the Plant Register page."
     )
 
     roster = build_submission_roster(plants)
@@ -5801,6 +6712,25 @@ def render_input_tracker(df: pd.DataFrame, plants: pd.DataFrame) -> None:
     received_sr = set(grid.index[grid[picked]]) if picked in grid.columns else set()
     roster = roster.copy()
     roster["received"] = roster["plant_sr_no"].isin(received_sr)
+
+    # A plant that wasn't running sends nothing — indistinguishable from one that
+    # simply didn't file — so the not-running months are recorded in-app and
+    # subtracted here. A plant that DID send an IMR was plainly running, so a stale
+    # mark can never remove a site that actually reported.
+    downtime = load_downtime()
+    month_down = downtime[downtime["month"] == picked] if not downtime.empty else downtime
+    down_sr = (
+        set(month_down.loc[month_down["not_running"], "plant_sr_no"])
+        if not month_down.empty else set()
+    )
+    down_remarks = (
+        month_down.set_index("plant_sr_no")["remarks"].to_dict()
+        if not month_down.empty else {}
+    )
+    roster["not_running"] = roster["plant_sr_no"].isin(down_sr) & ~roster["received"]
+    roster["downtime_remarks"] = (
+        roster["plant_sr_no"].map(down_remarks).fillna("").astype(str)
+    )
 
     # Display name: prefer the readings sheet name, else the MIS site name.
     name_by_sr = (
@@ -5825,35 +6755,56 @@ def render_input_tracker(df: pd.DataFrame, plants: pd.DataFrame) -> None:
         return "Never"
     roster["last_submitted"] = roster["plant_sr_no"].map(last_submitted)
 
-    expected = len(roster)
-    got = int(roster["received"].sum())
+    # Every plant that was actually expected to file this month — the register
+    # roster minus the ones marked not running. All the completion maths below
+    # runs on this, so an idle plant never counts against a zone.
+    reporting = roster[~roster["not_running"]]
+    idle = roster[roster["not_running"]]
+
+    not_running = len(idle)
+    expected = len(reporting)
+    got = int(reporting["received"].sum())
     missing = expected - got
     pct = got / expected * 100 if expected else 0.0
-    zone_grp = roster.groupby("zone")
-    zones_total = roster["zone"].nunique()
-    zones_done = int((zone_grp["received"].mean() == 1).sum())
+    zone_grp = reporting.groupby("zone") if expected else None
+    zones_total = reporting["zone"].nunique()
+    zones_done = int((zone_grp["received"].mean() == 1).sum()) if zone_grp is not None else 0
 
     # ----- 1. Headline + KPIs -----
     hero_card(
         "Missing IMRs",
         f"{missing:,}",
-        f"{picked_label} — {got}/{expected} sites received ({pct:.0f}%)",
+        f"{picked_label} — {got}/{expected} sites received ({pct:.0f}%)"
+        + (f" · {not_running} not running" if not_running else ""),
         color="#16a34a" if missing == 0 else "#dc2626",
     )
     st.markdown("")
-    k = st.columns(4)
+    k = st.columns(5)
     with k[0]:
-        metric_card("Sites expected", f"{expected:,}", "in the register")
+        metric_card("Sites expected", f"{expected:,}", f"of {len(roster):,} in the register")
     with k[1]:
         metric_card("Received", f"{got:,}", f"{pct:.0f}% this month", "#16a34a")
     with k[2]:
         metric_card("Missing", f"{missing:,}", "not yet received", "#dc2626")
     with k[3]:
+        metric_card(
+            "Not running", f"{not_running:,}", "excluded from expected", "#64748b"
+        )
+    with k[4]:
         metric_card("Zones complete", f"{zones_done}/{zones_total}", "all sites in")
+
+    if expected == 0:
+        st.info(
+            f"Every registered site is marked not running in {picked_label}, so "
+            "there is nothing to chase. Unmark a plant below to put it back."
+        )
 
     # ----- 2. By zone -----
     st.markdown("---")
     st.subheader(f"By zone — {picked_label}")
+    if zone_grp is None:
+        st.info("No sites were expected to report this month.")
+        return
     zs = (
         zone_grp.agg(expected=("plant_sr_no", "count"), received=("received", "sum"))
         .reset_index()
@@ -5897,7 +6848,7 @@ def render_input_tracker(df: pd.DataFrame, plants: pd.DataFrame) -> None:
     # ----- 3. Missing this month (the actionable list) -----
     st.markdown("---")
     st.subheader(f"Missing this month — {picked_label}")
-    miss = roster[~roster["received"]].sort_values(["zone", "site"])
+    miss = reporting[~reporting["received"]].sort_values(["zone", "site"])
     if miss.empty:
         st.success("Every registered site has submitted this month. 🎉")
     else:
@@ -5929,22 +6880,63 @@ def render_input_tracker(df: pd.DataFrame, plants: pd.DataFrame) -> None:
             mime="text/csv",
         )
 
+    # ----- 3b. Not running this month + the editor that sets it -----
+    st.markdown("---")
+    st.subheader(f"Not running this month — {picked_label}")
+    if idle.empty:
+        st.caption(
+            "No plant is marked as not running this month. Use the editor below "
+            "for any site that was shut down or idle — it then drops out of the "
+            "missing list and out of every completion figure above."
+        )
+    else:
+        idle_out = pd.DataFrame(
+            {
+                "Zone": idle["zone"],
+                "Site": idle["site"],
+                "SR No": idle["plant_sr_no"],
+                "Last submitted": idle["last_submitted"],
+                "Remarks": idle["downtime_remarks"],
+            }
+        ).sort_values(["Zone", "Site"])
+        st.caption(
+            f"{len(idle):,} plant(s) did not run in {picked_label}, so they are not "
+            "counted as missing. They stay in the register and in every other month."
+        )
+        st.dataframe(idle_out, width="stretch", hide_index=True)
+
+    render_downtime_editor(roster, picked, picked_label)
+
     # ----- 4. Submission history matrix -----
     st.markdown("---")
     st.subheader("Submission history")
-    st.caption("✓ received · ✗ missing, by zone. Most recent 8 months.")
+    st.caption("✓ received · ✗ missing · — not running, by zone. Most recent 8 months.")
     zones = sorted(roster["zone"].unique())
     sel_zones = st.multiselect("Zones", zones, default=zones, key="tracker_zones")
     recent = months[:8][::-1]  # oldest -> newest for left-to-right reading
     month_cols = [pd.Period(m).strftime("%b %y") for m in recent]
     view = roster[roster["zone"].isin(sel_zones or zones)].sort_values(["zone", "site"])
+    # Every month's marks, not just the picked one — a "✗" for a month the plant
+    # was known to be idle would read as a chase-up that was never owed.
+    idle_months = (
+        set(
+            zip(
+                downtime.loc[downtime["not_running"], "plant_sr_no"],
+                downtime.loc[downtime["not_running"], "month"],
+            )
+        )
+        if not downtime.empty else set()
+    )
     rows = []
     for _, r in view.iterrows():
         sr = r["plant_sr_no"]
         row = {"Zone": r["zone"], "Site": r["site"]}
         for m, label in zip(recent, month_cols):
             received_here = bool(grid.loc[sr, m]) if (sr in grid.index and m in grid.columns) else False
-            row[label] = "✓" if received_here else "✗"
+            if received_here:
+                row[label] = "✓"
+            else:
+                row[label] = "—" if (sr, m) in idle_months else "✗"
         rows.append(row)
     mat = pd.DataFrame(rows)
     if mat.empty:
@@ -5955,6 +6947,8 @@ def render_input_tracker(df: pd.DataFrame, plants: pd.DataFrame) -> None:
                 return "color:#16a34a;font-weight:700"
             if v == "✗":
                 return "color:#dc2626;font-weight:700"
+            if v == "—":
+                return "color:#94a3b8;font-weight:700"
             return ""
         styler = mat.style
         styler = (styler.map if hasattr(styler, "map") else styler.applymap)(
@@ -6687,7 +7681,7 @@ def main() -> None:
                 url_path="scan",
             ),
             st.Page(
-                lambda: render_dashboard(df, params),
+                lambda: render_dashboard(df, mis),
                 title="Dashboard",
                 icon="📊",
                 url_path="dashboard",

@@ -30,9 +30,12 @@ runs on Postgres (prod) and SQLite (tests).
 ## Pages (st.navigation, in `main()`)
 
 1. **Portfolio** (default landing) — fleet-wide across ALL plants, no plant selection.
-   KPI cards, plant ranking, fleet trend, zone rollup, worst-25 modules, age profile.
+   KPI cards, stage-wise membrane requirement, plant ranking, fleet trend, zone rollup,
+   worst-25 modules, age profile.
 2. **Dashboard** — per-plant/module flow & conductivity history (pick plant in sidebar).
 3. **Replacement Candidates** — per-plant, per-stage outlier/absolute-limit flagging.
+4. **IMR Tracker** — who has submitted each month, by zone; hosts the "not running this
+   month" marks.
 
 ## Data flow (ingest → DB → render)
 
@@ -75,6 +78,19 @@ runs on Postgres (prod) and SQLite (tests).
   `ingested_files`). `READINGS_COLUMNS` / `MIS_COLUMNS` derive from the table definitions,
   and the normalizers `reindex(columns=...)` to them — **add a column to the `Table` and it
   flows through automatically.**
+- **Two tables hold facts no workbook can carry**, edited in-app rather than parsed, so
+  ingest never touches them and a re-parse never clears them:
+  - `plant_downtime` (plant_sr_no, month "YYYY-MM", not_running, remarks) — a plant that
+    wasn't running that month. A plant that didn't run sends nothing, which is
+    indistinguishable from one that just didn't file, so the IMR Tracker subtracts these
+    from "expected" instead of chasing them. Set on the Tracker; `save_downtime()` is
+    scoped to the plants shown, so unticking clears a mark and hidden plants are untouched.
+    A plant that DID submit overrides a stale mark.
+  - `bypass_notes` (plant_key, stage_label, module_label, month, reason, remarks) — WHO
+    bypassed a module. The sheet only ever says "BY PASS"; `BYPASS_REASON_OPTIONS` is
+    ROCHEM vs Client, and blank ("Not recorded") is a real state, never defaulted.
+    `attach_bypass_notes()` joins them onto the fleet-status frame in the Portfolio;
+    clearing both fields deletes the note.
 - **`init_db()` calls `create_all()`, which creates MISSING tables but does NOT ALTER
   existing ones.** So adding a column to an existing table needs a one-time migration
   against the live DB. The established pattern (used for `status`, `plant_sr_no`, `n_mis`):
@@ -119,9 +135,28 @@ mislabels their Plant SR No. `readings` and `parameters` both carry `plant_sr_no
 - **Zones are data-driven** — read from the MIS `zone` column (never hardcoded). Readings
   inherit a zone by joining `readings.plant_sr_no` (the trailing `(NNNN)` parsed from the
   plant sheet name, via `plant_sr_no_from_name()`) to `mis.plant_sr_no`; missing → "Unknown".
-- **Degraded definition** is shared: `evaluate_stage_readings()` (absolute-limit method).
-  The Portfolio uses stage-aware cutoffs `STAGE_CONDUCTIVITY_CUTOFFS` (I>1000, II>1500,
-  III>2000 µS/cm via `stage_cutoff()`); the Replacement page lets the user pick the method.
+- **Degraded definition** is shared: `evaluate_stage_readings()` (peer-IQR or
+  absolute-limit); the Replacement page lets the user pick the method.
+- **Two degradation signals, and the Portfolio can drop one.** `compute_fleet_status()`
+  sets `degraded_iqr` (peer outlier in its stage) and `degraded_mom` (month-over-month
+  conductivity jump) and ORs them into `degraded`/`need`. The Portfolio's **Peer outliers
+  only** toggle re-derives those two verdict columns via `apply_degradation_signals()`,
+  applied *before* any zone/stage filtering so every count on the page moves together.
+  It never clears `degraded_iqr`/`degraded_mom` — those stay as the evidence behind the
+  Reason column, so a peer outlier that also jumped still says so. `mom_only_count()` is
+  what the toggle adds or withholds. **Anything new that counts modules must read
+  `degraded`/`need` off the frame, never re-OR the two raw signals** — that would ignore
+  the toggle.
+- **Stages are canonicalized, never compared raw.** Sheets spell the stage every way there
+  is ("I STAGE", "1st Stage", "Stage-2"), so `canonical_stage()` folds a `stage_label` to
+  `"I"/"II"/"III"` (or None → `UNSTAGED_LABEL`) and `compute_fleet_status()` stamps it as
+  `stage_key`. **Every stage-wise rollup groups on `stage_key`** — the membrane requirement
+  is raised per stage, so grouping on the raw label would split one stage into three.
+  `stage_display()` renders it as "1st/2nd/3rd Stage"; `stage_pills()` is the button row
+  (falls back to a multiselect on a Streamlit without `st.pills`).
+- The Portfolio's stage buttons filter the whole page, but `render_stage_requirement()` is
+  deliberately fed the month's **unfiltered** snapshot — the breakdown must keep showing
+  every stage no matter which button is pressed.
 - **When changing extraction logic, account for *both* reading extractors** — a fix in the
   block parser usually needs a mirror in the structured-table parser.
 - Styling: reuse `metric_card()` and the `plotly_white` Plotly theme.
