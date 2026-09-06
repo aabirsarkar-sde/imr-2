@@ -1295,6 +1295,7 @@ PLANTS_TABLE = Table(
     Column("installed_capacity", Text),
     Column("status", Text),  # "active" (expected to report) / "inactive" (shut down)
     Column("plant_type", Text),  # PLANT_TYPE_OPTIONS; defaults to "PT"
+    Column("client", Text),  # CLIENT_OPTIONS; defaults to "ROCHEM"
     Column("updated_at", DateTime),
 )
 
@@ -1422,12 +1423,22 @@ def init_db(engine: Engine) -> None:
     create_all_tolerating_races(engine)
     migrate_added_columns(engine)
     migrate_renamed_statuses(engine)
+    # After migrate_added_columns, which is what guarantees `plant_type` exists.
+    migrate_status_types(engine)
 
 
 # Register statuses that have been relabelled. Reads all go through
 # `canonical_status()`, which still resolves the old spellings, so this is only to
 # stop the retired label from lingering in the stored data.
 _RENAMED_STATUSES = {"STRO": "STPT RO"}
+
+# Statuses that were really a plant TYPE, and the type each becomes. Run once per
+# boot against whatever is still stored under the old vocabulary — including the
+# legacy "STRO" spelling, which `_RENAMED_STATUSES` would otherwise rewrite into a
+# status that no longer exists.
+_STATUS_TO_TYPE = {
+    "STPT RO": "STPT", "STRO": "STPT", "SPRO": "SP", "UF RO": "UF",
+}
 
 
 def migrate_renamed_statuses(engine: Engine) -> None:
@@ -1439,6 +1450,35 @@ def migrate_renamed_statuses(engine: Engine) -> None:
             conn.execute(
                 text("UPDATE plants SET status = :new WHERE status = :old"),
                 {"new": new, "old": old},
+            )
+
+
+def migrate_status_types(engine: Engine) -> None:
+    """Move the three type-shaped statuses onto `plant_type`.
+
+    The type is only written where nothing has been said yet (NULL, or the default
+    PT) — somebody who has already picked a type for the plant knows better than a
+    status we're retiring. The status itself becomes Active either way: the plant
+    is running unless someone marks it otherwise, and it stays out of the IMR
+    Tracker on its type now (see `type_is_reporting`), not on its status."""
+    inspector = inspect(engine)
+    if not inspector.has_table("plants"):
+        return
+    columns = {c["name"] for c in inspector.get_columns("plants")}
+    if "plant_type" not in columns:
+        return
+    with engine.begin() as conn:
+        for old, plant_type in _STATUS_TO_TYPE.items():
+            conn.execute(
+                text(
+                    "UPDATE plants SET plant_type = :t "
+                    "WHERE status = :old AND (plant_type IS NULL OR plant_type = :default)"
+                ),
+                {"t": plant_type, "old": old, "default": DEFAULT_PLANT_TYPE},
+            )
+            conn.execute(
+                text("UPDATE plants SET status = 'Active' WHERE status = :old"),
+                {"old": old},
             )
 
 
@@ -1490,6 +1530,12 @@ def _add_column(engine: Engine, name: str, column: str, col_type: str) -> None:
             conn.execute(text(
                 "UPDATE plants SET plant_type = :t WHERE plant_type IS NULL"
             ), {"t": DEFAULT_PLANT_TYPE})
+        # Same for the client column: every plant already in the register predates
+        # it and is ours until somebody says otherwise.
+        if (name, column) == ("plants", "client"):
+            conn.execute(text(
+                "UPDATE plants SET client = :c WHERE client IS NULL"
+            ), {"c": DEFAULT_CLIENT})
         # A column on an ingest-built table is only filled by re-parsing.
         # Clearing the hashes makes the startup ingest treat every report
         # as new, so it re-parses and back-fills. Rows are replaced
@@ -1909,24 +1955,23 @@ def known_zones(plants: pd.DataFrame) -> list[str]:
     return sorted(zs) if zs else list(DEFAULT_ZONES)
 
 
-# A plant's register status. "Active" (or a blank status) = a normal RO plant
-# expected to submit a monthly IMR. Every other value marks an exception — a
-# non-operating state or a non-module RO type — that is NOT expected to report, so
-# it's excluded from the IMR Tracker's roster. (SPRO = spiral RO, UF RO =
-# ultrafiltration RO: these report differently, not as per-module IMRs.)
+# A plant's register status: whether it is running, and whether we're the ones
+# running it. "Active" (or a blank status) = a normal plant expected to submit a
+# monthly IMR; every other value marks an exception that is NOT expected to
+# report, so it's excluded from the IMR Tracker's roster.
+#
+# STPT RO / SPRO / UF RO used to sit in this list too. They describe the KIND of
+# system installed, not what state it is in — a plant is a spiral-RO plant whether
+# it is running or shut down — so holding them here forced one field to answer two
+# questions, and a shut-down SPRO could only be recorded as one of the two. They
+# live on `plant_type` now (SP / UF / STPT), and `migrate_status_types()` moves
+# the rows already stored under them.
 PLANT_STATUS_OPTIONS = [
-    "Active", "Inactive", "STPT RO", "SPRO", "UF RO",
-    "Stand By RO", "Not in Rochem Scope", "Plant Shutdown",
+    "Active", "Inactive", "Stand By RO", "Not in Rochem Scope", "Plant Shutdown",
 ]
 _STATUS_ALIASES = {
     "active": "Active",
     "inactive": "Inactive",
-    # "STRO" was the old label for this status; rows already stored under it (and
-    # workbooks that spell it either way) still resolve to the current one.
-    "stpt ro": "STPT RO", "stptro": "STPT RO", "stpt": "STPT RO",
-    "stro": "STPT RO", "st ro": "STPT RO", "st-ro": "STPT RO",
-    "spro": "SPRO", "spiral ro": "SPRO", "sp ro": "SPRO",
-    "uf ro": "UF RO", "ufro": "UF RO",
     "stand by ro": "Stand By RO", "standby ro": "Stand By RO", "standby": "Stand By RO",
     "not in rochem scope": "Not in Rochem Scope", "out of scope": "Not in Rochem Scope",
     "plant shutdown": "Plant Shutdown", "shutdown": "Plant Shutdown",
@@ -1955,10 +2000,39 @@ _PLANT_TYPE_BY_KEY = {t.lower(): t for t in PLANT_TYPE_OPTIONS}
 _PLANT_TYPE_ALIASES = {
     "hybrid": "Hybrid RO", "hybridro": "Hybrid RO", "hybrid r o": "Hybrid RO",
     "st pt": "STPT", "st-pt": "STPT",
+    # The spellings these used to carry as a *status*, so an old value typed or
+    # imported under the previous vocabulary still resolves to the right type.
+    "stpt ro": "STPT", "stptro": "STPT", "stro": "STPT", "st ro": "STPT",
+    "spro": "SP", "sp ro": "SP", "spiral ro": "SP",
     "uf ro": "UF", "ufro": "UF",
     "chemicals": "Chemical", "chem": "Chemical",
     "utilities": "Utility",
 }
+
+
+# Who the plant runs under commercially — which of our entities holds it, or
+# whether it is a rental. Everything starts as ROCHEM (the default) until someone
+# marks the exceptions, exactly like plant_type: a register-wide default that is
+# right for most rows beats a blank nobody fills in.
+CLIENT_OPTIONS = ["ROCHEM", "ROSERVE", "RENT"]
+DEFAULT_CLIENT = "ROCHEM"
+_CLIENT_BY_KEY = {c.lower(): c for c in CLIENT_OPTIONS}
+_CLIENT_ALIASES = {
+    "ro chem": "ROCHEM", "rochem ro": "ROCHEM",
+    "ro serve": "ROSERVE", "roserv": "ROSERVE", "ros": "ROSERVE",
+    "rental": "RENT", "rented": "RENT", "on rent": "RENT", "rent ro": "RENT",
+}
+
+
+def canonical_client(client: object) -> str | None:
+    """Map a raw client to one of CLIENT_OPTIONS, or None for a blank or
+    unrecognized value (the caller decides whether to fall back to the default)."""
+    if client is None or (isinstance(client, float) and pd.isna(client)):
+        return None
+    key = re.sub(r"\s+", " ", str(client)).strip().lower()
+    if not key:
+        return None
+    return _CLIENT_BY_KEY.get(key) or _CLIENT_ALIASES.get(key)
 
 
 # Who took a bypassed module offline. Blank means nobody has said yet — that is a
@@ -2031,11 +2105,27 @@ def canonical_plant_type(plant_type: object) -> str | None:
 
 
 def status_is_reporting(status: object) -> bool:
-    """True if the plant is expected to submit a monthly IMR — i.e. Active (or a
-    blank status). Every exception flag (Inactive, shutdown, standby, out-of-scope,
-    non-module RO type) is not expected to report."""
+    """True if the plant is in a state where a monthly IMR is expected — i.e.
+    Active (or a blank status). Every exception flag (Inactive, shutdown, standby,
+    out-of-scope) is not expected to report.
+
+    This answers "is it running for us", not "what kind of plant is it" — the
+    second question is `type_is_reporting()`. The roster asks both."""
     canon = canonical_status(status)
     return canon is None or canon == "Active"
+
+
+# The kinds of system that don't file a per-module IMR at all: a spiral RO, a UF
+# RO and an STPT train each report differently. That is a property of the plant,
+# not of its current state, which is why it reads off `plant_type` — these were
+# statuses until the two ideas were separated.
+NON_IMR_PLANT_TYPES = {"SP", "UF", "STPT"}
+
+
+def type_is_reporting(plant_type: object) -> bool:
+    """True if this kind of plant files a per-module IMR."""
+    canon = canonical_plant_type(plant_type) or DEFAULT_PLANT_TYPE
+    return canon not in NON_IMR_PLANT_TYPES
 
 
 def seed_plants_if_empty(engine: Engine, data_dir: str) -> int:
@@ -2083,6 +2173,7 @@ def seed_plants_if_empty(engine: Engine, data_dir: str) -> int:
     frame = pd.DataFrame({r["plant_sr_no"]: r for r in rows}.values())  # de-dupe by SR
     frame["status"] = "active"
     frame["plant_type"] = DEFAULT_PLANT_TYPE
+    frame["client"] = DEFAULT_CLIENT
     frame["updated_at"] = datetime.now(timezone.utc)
     frame = frame.reindex(columns=PLANTS_COLUMNS)
     frame.to_sql("plants", engine, if_exists="append", index=False, method="multi", chunksize=500)
@@ -2116,6 +2207,11 @@ def save_plants(
     clean["plant_type"] = pd.Series(ptype, index=clean.index).map(
         lambda v: canonical_plant_type(v) or DEFAULT_PLANT_TYPE
     )
+    # And the client: blank/unrecognized -> the default (ROCHEM).
+    client = clean["client"] if "client" in clean else None
+    clean["client"] = pd.Series(client, index=clean.index).map(
+        lambda v: canonical_client(v) or DEFAULT_CLIENT
+    )
     for col in ("site_name", "installed_capacity"):
         if col in clean:
             clean[col] = clean[col].map(lambda v: None if pd.isna(v) else (str(v).strip() or None))
@@ -2144,6 +2240,7 @@ def add_plant(
     installed_capacity: str | None,
     status: str | None,
     plant_type: str | None = None,
+    client: str | None = None,
 ) -> None:
     """Insert one new plant into the register (onboarding a new client's plant).
 
@@ -2170,6 +2267,7 @@ def add_plant(
             ),
             "status": canonical_status(status) or "Active",
             "plant_type": canonical_plant_type(plant_type) or DEFAULT_PLANT_TYPE,
+            "client": canonical_client(client) or DEFAULT_CLIENT,
             "updated_at": datetime.now(timezone.utc),
         }]).reindex(columns=PLANTS_COLUMNS)
         row.to_sql("plants", conn, if_exists="append", index=False)
@@ -2701,6 +2799,9 @@ def load_plants() -> pd.DataFrame:
         df["plant_type"] = df["plant_type"].map(
             lambda v: canonical_plant_type(v) or DEFAULT_PLANT_TYPE
         )
+    if "client" in df:
+        # Same for the client column — blank reads as the default (ROCHEM).
+        df["client"] = df["client"].map(lambda v: canonical_client(v) or DEFAULT_CLIENT)
     return df.sort_values(["zone", "plant_sr_no"], na_position="last").reset_index(drop=True)
 
 
@@ -6344,16 +6445,22 @@ def render_scan_page(engine: Engine) -> None:
 
 
 def build_submission_roster(plants: pd.DataFrame) -> pd.DataFrame:
-    """The roster of plants expected to report: every register plant with a normal
-    (blank) status. A plant flagged with any exception status (Plant Shutdown,
-    Stand By RO, Not in Rochem Scope, STRO/SPRO/UF RO) is not expected to submit an
-    IMR, so it's excluded here — but kept in the register for history."""
+    """The roster of plants expected to report: every register plant that is both
+    in a reporting STATE and of a reporting KIND.
+
+    Excluded, but kept in the register for history: a plant flagged with an
+    exception status (Plant Shutdown, Stand By RO, Not in Rochem Scope, Inactive),
+    and a plant whose type doesn't file a per-module IMR at all (SP / UF / STPT —
+    NON_IMR_PLANT_TYPES). The second used to be a status too; splitting it out is
+    what lets a spiral-RO plant also be marked shut down."""
     cols = ["plant_sr_no", "zone", "site_name"]
     if plants is None or plants.empty:
         return pd.DataFrame(columns=cols)
     active = plants.dropna(subset=["plant_sr_no"]).copy()
     if "status" in active:
         active = active[active["status"].map(status_is_reporting)]
+    if "plant_type" in active:
+        active = active[active["plant_type"].map(type_is_reporting)]
     if active.empty:
         return pd.DataFrame(columns=cols)
     active["plant_sr_no"] = active["plant_sr_no"].astype(int)
@@ -6432,7 +6539,13 @@ def render_plant_register(engine: Engine) -> None:
                 help="The kind of system at this plant. Leave as the default (PT) if "
                      "you're not sure — it can be changed in the table any time.",
             )
-            new_status = st.selectbox("Status", options=PLANT_STATUS_OPTIONS, index=0)
+            c1, c2 = st.columns(2)
+            new_status = c1.selectbox("Status", options=PLANT_STATUS_OPTIONS, index=0)
+            new_client = c2.selectbox(
+                "Client", options=CLIENT_OPTIONS,
+                index=CLIENT_OPTIONS.index(DEFAULT_CLIENT),
+                help="Who the plant runs under — ROCHEM, ROSERVE, or a rental (RENT).",
+            )
             submitted = st.form_submit_button("Add plant", type="primary")
         if submitted:
             if new_sr is None:
@@ -6442,7 +6555,7 @@ def render_plant_register(engine: Engine) -> None:
             else:
                 try:
                     add_plant(engine, int(new_sr), new_site, new_zone_pick,
-                              new_capacity, new_status, new_type)
+                              new_capacity, new_status, new_type, new_client)
                 except ValueError as exc:
                     st.error(str(exc))
                 else:
@@ -6504,6 +6617,7 @@ def render_plant_register(engine: Engine) -> None:
                 f"SR {int(hit['plant_sr_no'])} · {hit.get('site_name') or 'unnamed'} · "
                 f"{hit.get('zone') or 'no zone'} · "
                 f"{canonical_plant_type(hit.get('plant_type')) or DEFAULT_PLANT_TYPE} · "
+                f"{canonical_client(hit.get('client')) or DEFAULT_CLIENT} · "
                 f"{canonical_status(hit.get('status')) or 'Active'}"
                 + (f" · {hit['installed_capacity']}" if hit.get("installed_capacity") else "")
             )
@@ -6519,7 +6633,8 @@ def render_plant_register(engine: Engine) -> None:
         view = view.loc[key.sort_values(na_position="last").index]
 
     GRID_COLUMNS = [
-        "plant_sr_no", "site_name", "zone", "installed_capacity", "plant_type", "status",
+        "plant_sr_no", "site_name", "zone", "installed_capacity", "plant_type",
+        "client", "status",
     ]
     grid = view.reindex(columns=GRID_COLUMNS)
     if grid.empty:
@@ -6530,6 +6645,8 @@ def render_plant_register(engine: Engine) -> None:
     grid["plant_type"] = grid["plant_type"].map(
         lambda v: canonical_plant_type(v) or DEFAULT_PLANT_TYPE
     )
+    # Everything is ROCHEM until someone marks the ROSERVE and rental plants.
+    grid["client"] = grid["client"].map(lambda v: canonical_client(v) or DEFAULT_CLIENT)
 
     # The editor keys its pending edits by row POSITION, so re-filtering would reapply
     # them to the wrong plants. Fold the filter and the search into the key: changing
@@ -6548,8 +6665,16 @@ def render_plant_register(engine: Engine) -> None:
             "installed_capacity": st.column_config.TextColumn("Capacity", width="small"),
             "plant_type": st.column_config.SelectboxColumn(
                 "Type", options=PLANT_TYPE_OPTIONS, width="small", required=True,
-                help="The kind of system installed at this plant. Everything starts as "
-                     "PT — change the ones that aren't.",
+                help="The kind of system installed at this plant. Everything starts "
+                     "as PT — change the ones that aren't. SP, UF and STPT plants "
+                     "don't file a per-module IMR, so they drop out of the IMR "
+                     "Tracker's expected list (their status still says whether "
+                     "they're running).",
+            ),
+            "client": st.column_config.SelectboxColumn(
+                "Client", options=CLIENT_OPTIONS, width="small", required=True,
+                help="Who the plant runs under commercially. Everything starts as "
+                     "ROCHEM — change the ROSERVE ones and the rentals.",
             ),
             "status": st.column_config.SelectboxColumn(
                 "Status", options=PLANT_STATUS_OPTIONS, width="medium",
@@ -6607,6 +6732,15 @@ def render_plant_register(engine: Engine) -> None:
         )
         st.caption("Types · " + " · ".join(
             f"{t}: {int(types[t])}" for t in PLANT_TYPE_OPTIONS if types.get(t, 0) > 0
+        ))
+        clients = (
+            plants.get("client", pd.Series(dtype=object))
+            .reindex(plants.index)
+            .map(lambda v: canonical_client(v) or DEFAULT_CLIENT)
+            .value_counts()
+        )
+        st.caption("Clients · " + " · ".join(
+            f"{c}: {int(clients[c])}" for c in CLIENT_OPTIONS if clients.get(c, 0) > 0
         ))
 
 

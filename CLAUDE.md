@@ -135,6 +135,24 @@ mislabels their Plant SR No. `readings` and `parameters` both carry `plant_sr_no
 - **Zones are data-driven** — read from the MIS `zone` column (never hardcoded). Readings
   inherit a zone by joining `readings.plant_sr_no` (the trailing `(NNNN)` parsed from the
   plant sheet name, via `plant_sr_no_from_name()`) to `mis.plant_sr_no`; missing → "Unknown".
+- **The register carries three per-plant facts, each with its own field and its own
+  default.** `plant_type` (PLANT_TYPE_OPTIONS, default PT) is the system installed;
+  `client` (CLIENT_OPTIONS — ROCHEM / ROSERVE / RENT, default ROCHEM) is who it runs
+  under commercially; `status` is the state below. Each has a `canonical_*()` that maps
+  a raw value to the option list or None, and every write (`save_plants`, `add_plant`,
+  `seed_plants_if_empty`, `load_plants`) falls back to the default rather than storing
+  a blank. `plants` is in `MIGRATED_TABLES`, so a new column ALTERs itself in at boot —
+  pair it with a back-fill in `_add_column` when blank isn't an acceptable start.
+- **A plant's status is a state; its type is a kind.** `PLANT_STATUS_OPTIONS` answers
+  whether the plant is running for us (Active / Inactive / Stand By RO / Not in Rochem
+  Scope / Plant Shutdown); `PLANT_TYPE_OPTIONS` answers what system is installed.
+  STPT RO / SPRO / UF RO were statuses once, which made one field answer both questions
+  (a shut-down SPRO had to pick one) — `migrate_status_types()` moves any row still
+  stored under them onto `plant_type`, but only where no type was chosen, and sets the
+  status Active. **The IMR Tracker's roster asks both questions**:
+  `build_submission_roster()` keeps a plant only if `status_is_reporting()` AND
+  `type_is_reporting()` — `NON_IMR_PLANT_TYPES` (SP / UF / STPT) don't file a per-module
+  IMR at all, so a new non-module system belongs in that set, not in the status list.
 - **Degraded definition** is shared: `evaluate_stage_readings()` (peer-IQR or
   absolute-limit); the Replacement page lets the user pick the method.
 - **Two degradation signals, and the Portfolio can drop one.** `compute_fleet_status()`
