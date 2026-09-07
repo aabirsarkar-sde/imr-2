@@ -1380,6 +1380,30 @@ def get_engine() -> Engine | None:
     return create_engine(url, pool_pre_ping=True)
 
 
+@st.cache_resource(show_spinner="Preparing the database...")
+def bootstrap_schema(url: str) -> bool:
+    """Create and migrate the schema ONCE per process, not once per rerun.
+
+    Streamlit re-executes the whole script on every click, and `init_db()` +
+    `seed_plants_if_empty()` are ~30 statements — table reflection for every
+    table, a column diff for the migrated ones, and the status back-fills — each
+    one a network round trip to a remote Postgres (plus a `pool_pre_ping`
+    SELECT 1 per connection checkout). Paid per interaction that is seconds of
+    latency on every widget; paid per process it is nothing.
+
+    Schema work is exactly what may be cached this way: it is idempotent, and it
+    cannot come out differently on the second run of the same process. Keyed on
+    the connection URL, so pointing the app at another database re-runs it, and a
+    new deploy (a new process) re-runs it too. Data-level work — `ingest_reports`
+    — deliberately stays out of here: it has to see files that arrive later."""
+    engine = get_engine()
+    if engine is None:
+        return False
+    init_db(engine)
+    seed_plants_if_empty(engine, str(APP_DIR))
+    return True
+
+
 def create_all_tolerating_races(engine: Engine) -> None:
     """Create the missing tables, tolerating another process creating them too.
 
@@ -8371,8 +8395,9 @@ def main() -> None:
         return
 
     try:
-        init_db(engine)
-        seeded = seed_plants_if_empty(engine, str(APP_DIR))
+        # Once per process (see bootstrap_schema); the ingest below still runs
+        # every rerun, because a report can land at any time.
+        bootstrap_schema(database_url() or "")
         summary = ingest_reports(engine, str(APP_DIR))
         # Rebuild from durable bytes anything whose derived rows went missing
         # (e.g. Cloud restart wiped disk but report_files survived). Usually a no-op.
@@ -8385,7 +8410,7 @@ def main() -> None:
 
     # New/changed reports were parsed this run — drop the cached query results so
     # the fresh rows show up. Seeding the register also affects the folded-in zones.
-    if summary["ingested"] or seeded:
+    if summary["ingested"]:
         load_readings.clear()
         load_parameters.clear()
         load_plants.clear()
