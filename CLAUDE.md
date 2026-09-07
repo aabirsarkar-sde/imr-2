@@ -36,6 +36,9 @@ runs on Postgres (prod) and SQLite (tests).
 3. **Replacement Candidates** — per-plant, per-stage outlier/absolute-limit flagging.
 4. **IMR Tracker** — who has submitted each month, by zone; hosts the "not running this
    month" marks.
+5. **Module History** — one plant, every module, month by month: a module × month
+   conductivity heatmap, per-stage trend lines, and a first→latest summary per module.
+   The only page whose unit of analysis is a *slope* rather than a month.
 
 ## Data flow (ingest → DB → render)
 
@@ -175,6 +178,18 @@ mislabels their Plant SR No. `readings` and `parameters` both carry `plant_sr_no
 - The Portfolio's stage buttons filter the whole page, but `render_stage_requirement()` is
   deliberately fed the month's **unfiltered** snapshot — the breakdown must keep showing
   every stage no matter which button is pressed.
+- **Every other page reads one month; Module History reads a window.**
+  `module_history_frame()` takes the last N months **that plant actually reported**
+  (not calendar months, so a skipped IMR doesn't shorten the comparison) and
+  `build_module_history_summary()` reduces each module to first → latest, % change and
+  a least-squares `history_slope()` in units per month — fitted against the dates, so a
+  reporting gap doesn't read as a steeper climb. `history_verdict()` ranks the outcome
+  Bypassed > Over stage limit > Rising/Improving > Stable, where the direction needs a
+  move of `HISTORY_TREND_PCT` against the module's OWN first reading (stages sit at
+  different levels, so a fleet-wide threshold would just re-flag every third stage).
+  The heatmap's `relative` toggle re-bases each row the same way. Conductivity here is
+  as-measured — no normalization for feed or temperature — so the page says out loud
+  that a step can be a cleaning or a feed change, not only membrane loss.
 - **When changing extraction logic, account for *both* reading extractors** — a fix in the
   block parser usually needs a mirror in the structured-table parser.
 - Styling: reuse `metric_card()` and the `plotly_white` Plotly theme.

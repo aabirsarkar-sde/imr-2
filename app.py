@@ -5418,6 +5418,638 @@ def render_dashboard(df: pd.DataFrame, mis: pd.DataFrame) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Module History — one plant's modules tracked month over month
+# ---------------------------------------------------------------------------
+
+# How far a module's conductivity has to move across the window before it is
+# called a trend rather than noise. Percent of its OWN first reading: a module
+# that starts at 300 and one that starts at 3000 are each judged against
+# themselves, because a stage's normal level is not the question here.
+HISTORY_TREND_PCT = 20.0
+# The windows offered on the page. Six months is the default because that is the
+# span a replacement conversation is usually held over.
+HISTORY_WINDOWS: dict[str, int | None] = {
+    "Last 3 months": 3, "Last 6 months": 6, "Last 12 months": 12, "All history": None,
+}
+DEFAULT_HISTORY_WINDOW = "Last 6 months"
+HISTORY_VERDICT_COLORS = {
+    "Bypassed": "#dc2626",
+    "Over stage limit": "#b45309",
+    "Rising": "#d97706",
+    "Improving": "#16a34a",
+    "Stable": "#0f172a",
+    "One reading": "#94a3b8",
+}
+
+
+def module_sort_key(label: object) -> tuple[float, str]:
+    """Modules ordered the way the sheet numbers them (2 before 10), with any
+    label carrying no number last."""
+    text_value = str(label).strip()
+    match = re.search(r"\d+(?:\.\d+)?", text_value)
+    return (float(match.group()) if match else float("inf"), text_value)
+
+
+def module_history_frame(
+    status: pd.DataFrame, plant_key: object, window: int | None
+) -> pd.DataFrame:
+    """One plant's module readings over the last `window` months, oldest first.
+
+    The window is counted in months that PLANT actually reported, not calendar
+    months — a site that skipped August still gets six readings to compare, which
+    is what the trend is read off."""
+    rows = status[status["plant_key"] == plant_key].copy()
+    if rows.empty:
+        return rows
+    months = sorted(pd.Series(rows["report_date"].dropna().unique()).tolist())
+    if window:
+        months = months[-window:]
+    rows = rows[rows["report_date"].isin(months)].copy()
+    rows["month_label"] = rows["report_date"].map(
+        lambda v: pd.Timestamp(v).strftime("%b %Y")
+    )
+    rows["module_sort"] = rows["module_label"].map(module_sort_key)
+    rows["stage_rank"] = rows["stage_key"].map(
+        lambda k: STAGE_ORDER.index(k) if k in STAGE_ORDER else len(STAGE_ORDER)
+    )
+    return rows.sort_values(
+        ["stage_rank", "module_sort", "report_date"]
+    ).reset_index(drop=True)
+
+
+def history_slope(rows: pd.DataFrame, column: str) -> float:
+    """Least-squares trend in units per month, or NaN if there is nothing to fit.
+
+    Fitted against the actual dates rather than the reading index, so a gap in
+    reporting doesn't read as a steeper climb than it was."""
+    data = rows.dropna(subset=[column])
+    if len(data) < 2:
+        return float("nan")
+    dates = pd.to_datetime(data["report_date"])
+    days = (dates - dates.iloc[0]).dt.days.to_numpy(dtype=float)
+    if float(np.ptp(days)) == 0:
+        return float("nan")
+    slope_per_day = float(
+        np.polyfit(days, data[column].to_numpy(dtype=float), 1)[0]
+    )
+    return slope_per_day * 30.44  # per average month
+
+
+def history_verdict(
+    *, bypass_now: bool, over_limit: bool, pct_change: float, readings: int
+) -> str:
+    """One word for where a module is heading, most serious first.
+
+    Bypass wins outright (it is already offline), then being over its stage's
+    absolute limit — a module can sit flat and still be past spec — and only then
+    the direction of travel."""
+    if bypass_now:
+        return "Bypassed"
+    if readings < 2:
+        return "One reading"
+    if over_limit:
+        return "Over stage limit"
+    if pd.notna(pct_change) and pct_change >= HISTORY_TREND_PCT:
+        return "Rising"
+    if pd.notna(pct_change) and pct_change <= -HISTORY_TREND_PCT:
+        return "Improving"
+    return "Stable"
+
+
+def build_module_history_summary(
+    hist: pd.DataFrame, limits: dict[str, float]
+) -> pd.DataFrame:
+    """Per module: where it started, where it is now, and which way it is going."""
+    columns = [
+        "stage_key", "module_label", "stage_rank", "module_sort", "readings",
+        "first_month", "last_month", "first_cond", "last_cond", "delta", "pct_change",
+        "slope", "first_flow", "last_flow", "flow_pct", "limit", "over_limit",
+        "bypass_now", "ever_bypass", "install_date", "verdict",
+    ]
+    if hist.empty:
+        return pd.DataFrame(columns=columns)
+
+    records: list[dict[str, object]] = []
+    for (stage_key, module_label), rows in hist.groupby(
+        ["stage_key", "module_label"], sort=False
+    ):
+        rows = rows.sort_values("report_date")
+        cond = rows.dropna(subset=["conductivity"])
+        flow = rows.dropna(subset=["flow"])
+        first_cond = float(cond["conductivity"].iloc[0]) if not cond.empty else np.nan
+        last_cond = float(cond["conductivity"].iloc[-1]) if not cond.empty else np.nan
+        delta = last_cond - first_cond if len(cond) >= 2 else np.nan
+        pct = (delta / first_cond * 100) if len(cond) >= 2 and first_cond else np.nan
+        first_flow = float(flow["flow"].iloc[0]) if not flow.empty else np.nan
+        last_flow = float(flow["flow"].iloc[-1]) if not flow.empty else np.nan
+        flow_pct = (
+            (last_flow - first_flow) / first_flow * 100
+            if len(flow) >= 2 and first_flow else np.nan
+        )
+        limit = limits.get(stage_key)
+        over_limit = bool(pd.notna(last_cond) and limit and last_cond > float(limit))
+        bypass_now = str(rows["status"].iloc[-1]) == "bypass"
+        install = rows["install_date"].dropna()
+        records.append(
+            {
+                "stage_key": stage_key,
+                "module_label": module_label,
+                "stage_rank": int(rows["stage_rank"].iloc[0]),
+                "module_sort": rows["module_sort"].iloc[0],
+                "readings": int(len(cond)),
+                "first_month": (
+                    pd.Timestamp(cond["report_date"].iloc[0]).strftime("%b %Y")
+                    if not cond.empty else "—"
+                ),
+                "last_month": (
+                    pd.Timestamp(cond["report_date"].iloc[-1]).strftime("%b %Y")
+                    if not cond.empty else "—"
+                ),
+                "first_cond": first_cond,
+                "last_cond": last_cond,
+                "delta": delta,
+                "pct_change": pct,
+                "slope": history_slope(rows, "conductivity"),
+                "first_flow": first_flow,
+                "last_flow": last_flow,
+                "flow_pct": flow_pct,
+                "limit": float(limit) if limit else np.nan,
+                "over_limit": over_limit,
+                "bypass_now": bypass_now,
+                "ever_bypass": bool((rows["status"] == "bypass").any()),
+                "install_date": install.iloc[0] if not install.empty else pd.NaT,
+                "verdict": history_verdict(
+                    bypass_now=bypass_now, over_limit=over_limit,
+                    pct_change=pct, readings=int(len(cond)),
+                ),
+            }
+        )
+    frame = pd.DataFrame(records, columns=columns)
+    return frame.sort_values(["stage_rank", "module_sort"]).reset_index(drop=True)
+
+
+def history_row_label(stage_key: object, module_label: object) -> str:
+    """The row name in the heatmap: which stage, which module.
+
+    Carries the stage because module numbers restart in every stage — "Mo 3" alone
+    names three different modules. A label with no number keeps its own text
+    rather than collapsing to "Unknown", which would merge two rows into one."""
+    number = format_module_number(module_label)
+    if number == "Unknown":
+        number = str(module_label).strip() or "Unknown"
+    return f"{stage_display(stage_key)} · Mo {number}"
+
+
+def make_module_heatmap(hist: pd.DataFrame, *, relative: bool) -> go.Figure:
+    """Every module (rows) against every month (columns), coloured by conductivity.
+
+    This is the view the page exists for: a whole plant's six months on one
+    screen, where a single module climbing away from its neighbours and a whole
+    stage drifting up together look completely different — the second is what a
+    month-by-month table of one module at a time hides.
+
+    `relative` re-bases each row on its OWN first reading, which is the honest way
+    to compare a 300 uS/cm first stage with a 3,000 uS/cm third."""
+    order = (
+        hist.drop_duplicates(["stage_key", "module_label"])
+        .sort_values(["stage_rank", "module_sort"])
+    )
+    months = sorted(pd.Series(hist["report_date"].dropna().unique()).tolist())
+    index = pd.MultiIndex.from_frame(order[["stage_key", "module_label"]])
+    pivot = hist.pivot_table(
+        index=["stage_key", "module_label"], columns="report_date",
+        values="conductivity", aggfunc="mean",
+    ).reindex(index=index, columns=months)
+
+    values = pivot.to_numpy(dtype=float)
+    if relative:
+        # First non-null reading per row is the baseline; a row with none stays blank.
+        base = np.full(len(values), np.nan)
+        for row_index, row in enumerate(values):
+            seen = row[~np.isnan(row)]
+            if seen.size:
+                base[row_index] = seen[0]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            z = (values - base[:, None]) / base[:, None] * 100
+        text = np.where(np.isnan(z), "", np.vectorize(lambda v: f"{v:+,.0f}%")(
+            np.nan_to_num(z)
+        ))
+        colorscale, zmid, bar_title = "RdBu_r", 0.0, "% vs first month"
+    else:
+        z = values
+        text = np.where(np.isnan(z), "", np.vectorize(lambda v: f"{v:,.0f}")(
+            np.nan_to_num(z)
+        ))
+        colorscale, zmid, bar_title = "YlOrRd", None, "uS/cm"
+
+    y_labels = [history_row_label(s, m) for s, m in index]
+    x_labels = [pd.Timestamp(m).strftime("%b %Y") for m in months]
+    fig = go.Figure(
+        go.Heatmap(
+            z=z, x=x_labels, y=y_labels, text=text, texttemplate="%{text}",
+            textfont={"size": 10}, colorscale=colorscale, zmid=zmid,
+            hovertemplate="%{y}<br>%{x}<br>%{text}<extra></extra>",
+            colorbar={"title": bar_title},
+            xgap=2, ygap=2,
+        )
+    )
+
+    # Bypassed months carry no reading, so they are a hole in the grid rather than
+    # a value — mark them, because an empty cell otherwise reads as "not reported".
+    bypass = hist[hist["status"] == "bypass"]
+    if not bypass.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=bypass["month_label"],
+                y=[history_row_label(s, m) for s, m in
+                   zip(bypass["stage_key"], bypass["module_label"])],
+                mode="markers+text", text=["BP"] * len(bypass),
+                textfont={"size": 9, "color": "#ffffff"},
+                marker={"symbol": "square", "size": 22, "color": "#475569"},
+                hovertemplate="%{y}<br>%{x}<br>Bypassed<extra></extra>",
+                showlegend=False,
+            )
+        )
+
+    fig.update_layout(
+        template="plotly_white",
+        height=max(240, 90 + 26 * len(y_labels)),
+        margin={"l": 20, "r": 20, "t": 30, "b": 20},
+        xaxis={"side": "top", "type": "category"},
+        yaxis={"autorange": "reversed", "type": "category"},
+    )
+    return fig
+
+
+def make_module_trend_chart(
+    hist: pd.DataFrame, *, metric: str, stage_key: str, limit: float | None
+) -> go.Figure:
+    """One line per module over the window, for a single stage.
+
+    Kept to one stage per chart because the stages sit at different levels by
+    design — drawing a first and a third stage on one axis makes the third look
+    alarming and flattens everything in the first."""
+    config = METRICS[metric]
+    # compute_fleet_status renames the two reading columns, so the METRICS entry
+    # supplies the label and unit while the frame's own name supplies the data.
+    column = "conductivity" if metric == "Conductivity" else "flow"
+    unit = str(config["unit"])
+    stage_rows = hist[hist["stage_key"] == stage_key]
+    fig = go.Figure()
+    for module_label, rows in stage_rows.groupby("module_label", sort=False):
+        rows = rows.sort_values("report_date").dropna(subset=[column])
+        if rows.empty:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=rows["month_label"], y=rows[column], mode="lines+markers",
+                name=f"Mo {format_module_number(module_label)}",
+                hovertemplate=(
+                    f"Mo {format_module_number(module_label)}"
+                    "<br>%{x}<br>%{y:,.0f} " + unit + "<extra></extra>"
+                ),
+            )
+        )
+
+    # The stage's own median each month: the line that says whether one module is
+    # pulling away from its peers or the whole stage is moving together.
+    median = (
+        stage_rows.dropna(subset=[column])
+        .groupby(["report_date", "month_label"], sort=True)[column]
+        .median()
+        .reset_index()
+        .sort_values("report_date")
+    )
+    if not median.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=median["month_label"], y=median[column], mode="lines",
+                name="Stage median", line={"color": "#0f172a", "width": 3, "dash": "dot"},
+                hovertemplate="Stage median<br>%{x}<br>%{y:,.0f} " + unit + "<extra></extra>",
+            )
+        )
+    if limit and metric == "Conductivity":
+        fig.add_hline(
+            y=float(limit), line_dash="dash", line_color="#dc2626",
+            annotation_text=f"Stage limit {float(limit):,.0f}",
+            annotation_position="top left",
+        )
+
+    fig.update_layout(
+        title=f"{stage_display(stage_key)} — {metric.lower()} by module",
+        template="plotly_white", height=420,
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
+        xaxis_title="Month", yaxis_title=str(config["axis_label"]),
+        hovermode="x unified",
+        legend={"orientation": "h", "y": -0.2},
+    )
+    fig.update_xaxes(type="category")
+    return fig
+
+
+def build_history_display_table(summary: pd.DataFrame) -> pd.DataFrame:
+    """The per-module summary, formatted for the screen and the CSV."""
+    if summary.empty:
+        return pd.DataFrame()
+    def number(value: object, suffix: str = "") -> str:
+        return "—" if pd.isna(value) else f"{value:,.0f}{suffix}"
+
+    def signed(value: object, suffix: str = "") -> str:
+        if pd.isna(value):
+            return "—"
+        # Round-to-zero must read as "+0", never "-0" — a flat module has not
+        # gone down.
+        return f"{0.0 if abs(value) < 0.5 else value:+,.0f}{suffix}"
+
+    return pd.DataFrame(
+        {
+            "Stage": summary["stage_key"].map(stage_display),
+            "Module": summary["module_label"].map(format_module_number),
+            "Months": summary["readings"],
+            "First": summary.apply(
+                lambda r: f"{number(r['first_cond'])} ({r['first_month']})", axis=1
+            ),
+            "Latest": summary.apply(
+                lambda r: f"{number(r['last_cond'])} ({r['last_month']})", axis=1
+            ),
+            "Change": summary["delta"].map(lambda v: signed(v)),
+            "Change %": summary["pct_change"].map(lambda v: signed(v, "%")),
+            "Trend/month": summary["slope"].map(lambda v: signed(v)),
+            "Flow now": summary["last_flow"].map(lambda v: number(v)),
+            "Flow %": summary["flow_pct"].map(lambda v: signed(v, "%")),
+            "Stage limit": summary["limit"].map(lambda v: number(v)),
+            "Verdict": summary["verdict"],
+        }
+    )
+
+
+def render_module_history_page(df: pd.DataFrame, mis: pd.DataFrame) -> None:
+    """One plant, every module, month by month.
+
+    The other pages all answer a question about a single month — what stands out
+    this month, what is over spec this month. Degradation is a slope, though, and
+    a slope needs more than one point: this page holds the plant still and lets
+    time run, so a module that has doubled since March is visible even while it
+    sits inside its stage's spread today."""
+    st.title("Module History")
+    st.caption(
+        "How each module of one plant has moved over the months — the trend behind "
+        "the snapshot. Conductivity is the tracked signal (it rises as a membrane "
+        "passes more salt); flow is available alongside it. Readings are as-measured, "
+        "so a step change can also be a cleaning, a feed-water change or a re-membrane "
+        "— read a jump with the plant's own history in mind."
+    )
+
+    status = compute_fleet_status(df, mis)
+    if status.empty:
+        st.info("No readings are available to build a history.")
+        return
+
+    options = plant_options(status)
+    if not options:
+        st.info("No plant has readings yet.")
+        return
+
+    pick_col, window_col = st.columns([3, 1])
+    with pick_col:
+        picked = st.selectbox(
+            "Plant", options,
+            format_func=lambda option: plant_option_label(option, options),
+            key="history_plant",
+        )
+    with window_col:
+        window_label = st.selectbox(
+            "Window", list(HISTORY_WINDOWS),
+            index=list(HISTORY_WINDOWS).index(DEFAULT_HISTORY_WINDOW),
+            key="history_window",
+            help="Counted in months this plant actually reported, so a skipped "
+                 "month doesn't shorten the comparison.",
+        )
+    plant_key, plant_name, plant_sr_no = picked
+    hist = module_history_frame(status, plant_key, HISTORY_WINDOWS[window_label])
+    if hist.empty:
+        st.info(f"No readings for {plant_name} in this window.")
+        return
+
+    months = sorted(pd.Series(hist["report_date"].dropna().unique()).tolist())
+    span = (
+        f"{pd.Timestamp(months[0]).strftime('%b %Y')} → "
+        f"{pd.Timestamp(months[-1]).strftime('%b %Y')}"
+    )
+    st.caption(
+        f"**{plant_label_with_sr(plant_name, plant_sr_no)}** · {span} · "
+        f"{len(months)} month(s) of readings"
+    )
+    if len(months) < 2:
+        st.warning(
+            "Only one month of readings is in this window, so there is no trend to "
+            "read yet — widen the window, or wait for the next IMR."
+        )
+
+    limits = load_stage_limits()
+    limits = {**DEFAULT_STAGE_LIMITS, **limits}
+    summary = build_module_history_summary(hist, limits)
+
+    # ----- Stage filter: the whole page narrows to the chosen stage(s) -----
+    stage_options = [stage_display(s) for s in stage_keys_present(hist)]
+    picked_stages = stage_pills(
+        stage_options, key="history_stages", label="Stages",
+        help="Narrow every section below to one or more stages.",
+    )
+    chosen = {
+        key for key in stage_keys_present(hist)
+        if stage_display(key) in set(picked_stages)
+    }
+    if chosen and len(chosen) < len(stage_options):
+        hist = hist[hist["stage_key"].isin(chosen)]
+        summary = summary[summary["stage_key"].isin(chosen)]
+        if hist.empty:
+            st.info("No modules in the selected stage(s).")
+            return
+
+    # ----- KPI cards -----
+    rising = int((summary["verdict"] == "Rising").sum())
+    improving = int((summary["verdict"] == "Improving").sum())
+    over = int(summary["over_limit"].sum())
+    bypassed = int(summary["bypass_now"].sum())
+    median_first = float(summary["first_cond"].median(skipna=True))
+    median_last = float(summary["last_cond"].median(skipna=True))
+    median_delta = median_last - median_first
+
+    st.markdown("")
+    cards = st.columns(5)
+    with cards[0]:
+        metric_card(
+            "Modules tracked", f"{len(summary):,}",
+            f"{len(months)} month(s) · {summary['readings'].max():,} max readings",
+        )
+    with cards[1]:
+        metric_card(
+            "Rising", f"{rising:,}",
+            f"up {HISTORY_TREND_PCT:.0f}%+ since {pd.Timestamp(months[0]).strftime('%b')}",
+            "#d97706" if rising else "#0f172a",
+        )
+    with cards[2]:
+        metric_card(
+            "Over stage limit", f"{over:,}", "latest reading above spec",
+            "#b45309" if over else "#0f172a",
+        )
+    with cards[3]:
+        metric_card(
+            "Bypassed now", f"{bypassed:,}", "offline in the latest month",
+            "#dc2626" if bypassed else "#0f172a",
+        )
+    with cards[4]:
+        metric_card(
+            "Plant median", f"{median_last:,.0f}",
+            (f"{median_delta:+,.0f} uS/cm vs {pd.Timestamp(months[0]).strftime('%b %Y')}"
+             if pd.notna(median_delta) else "no comparison"),
+            "#dc2626" if pd.notna(median_delta) and median_delta > 0 else "#16a34a",
+        )
+    if improving:
+        st.caption(
+            f"{improving:,} module(s) have come DOWN by {HISTORY_TREND_PCT:.0f}% or more "
+            "over the window — usually a clean or a re-membrane, worth confirming "
+            "against the plant's maintenance record."
+        )
+
+    jump_nav(
+        [
+            ("Heatmap", "history-heatmap", "every module × month"),
+            ("Trends", "history-trends", "lines per stage"),
+            ("Module table", "history-table", "first → latest"),
+            ("Compare", "history-compare", "pick modules"),
+        ]
+    )
+
+    # ----- 1. Heatmap -----
+    st.markdown("---")
+    st.subheader("Every module, month by month", anchor="history-heatmap")
+    relative = st.toggle(
+        "Show change vs each module's first month",
+        key="history_relative",
+        help="Off: the reading itself (uS/cm). On: each module against its OWN "
+             "starting point, which is how a first stage and a third stage can be "
+             "compared on one scale.",
+    )
+    st.caption(
+        "One row per module, one column per month, newest on the right. "
+        + ("Blue is below where the module started, red is above. "
+           if relative else "Darker is a higher conductivity. ")
+        + "A grey **BP** cell is a month the module was bypassed — no reading, not a "
+        "missing report."
+    )
+    st.plotly_chart(make_module_heatmap(hist, relative=relative), width="stretch")
+
+    # ----- 2. Trend lines, one chart per stage -----
+    st.markdown("---")
+    st.subheader("Trends", anchor="history-trends")
+    metric = st.radio(
+        "Metric", list(METRICS), horizontal=True, key="history_metric",
+        help="Conductivity rises as a membrane degrades; flow falls.",
+    )
+    for stage_key in stage_keys_present(hist):
+        st.plotly_chart(
+            make_module_trend_chart(
+                hist, metric=metric, stage_key=stage_key,
+                limit=limits.get(stage_key),
+            ),
+            width="stretch",
+        )
+
+    # ----- 3. Per-module table -----
+    st.markdown("---")
+    st.subheader("Module by module", anchor="history-table")
+    st.caption(
+        f"First and latest reading per module, with the least-squares trend per "
+        f"month. \"Rising\"/\"Improving\" is a move of {HISTORY_TREND_PCT:.0f}% or more "
+        "against the module's own first reading; \"Over stage limit\" is the latest "
+        "reading above its stage's limit (set on the Dashboard page)."
+    )
+    display = build_history_display_table(summary)
+    st.dataframe(display, width="stretch", hide_index=True)
+    verdicts = summary["verdict"].value_counts()
+    st.caption(" · ".join(
+        f"{name}: {int(verdicts[name])}" for name in HISTORY_VERDICT_COLORS
+        if verdicts.get(name, 0) > 0
+    ))
+    st.download_button(
+        "Download module history (CSV)",
+        display.to_csv(index=False).encode("utf-8"),
+        file_name=(
+            f"module_history_{str(plant_name).replace(' ', '_')}_"
+            f"{window_label.replace(' ', '_')}.csv"
+        ),
+        mime="text/csv",
+        key="history_table_csv",
+    )
+
+    # ----- 4. Spotlight: a few modules, both metrics, month by month -----
+    st.markdown("---")
+    st.subheader("Compare modules", anchor="history-compare")
+    labels = {
+        history_row_label(row.stage_key, row.module_label): (row.stage_key, row.module_label)
+        for row in summary.itertuples()
+    }
+    # Default to the modules that have moved most — the ones worth looking at.
+    movers = (
+        summary.dropna(subset=["pct_change"])
+        .sort_values("pct_change", ascending=False)
+        .head(3)
+    )
+    default = [history_row_label(r.stage_key, r.module_label) for r in movers.itertuples()]
+    chosen_labels = st.multiselect(
+        "Modules", list(labels), default=default, key="history_compare",
+        help="Two or three at a time reads best. Defaults to the biggest risers.",
+    )
+    if not chosen_labels:
+        st.info("Pick a module to chart it.")
+        return
+    wanted = {labels[name] for name in chosen_labels}
+    subset = hist[
+        hist.apply(lambda r: (r["stage_key"], r["module_label"]) in wanted, axis=1)
+    ]
+    for metric_name in METRICS:
+        st.plotly_chart(
+            make_module_compare_chart(subset, metric=metric_name),
+            width="stretch",
+        )
+
+
+def make_module_compare_chart(subset: pd.DataFrame, *, metric: str) -> go.Figure:
+    """The picked modules on one axis, labelled by stage as well as number —
+    across stages the numbers repeat, so "Mo 3" alone is ambiguous."""
+    config = METRICS[metric]
+    column = "conductivity" if metric == "Conductivity" else "flow"
+    unit = str(config["unit"])
+    fig = go.Figure()
+    for (stage_key, module_label), rows in subset.groupby(
+        ["stage_key", "module_label"], sort=False
+    ):
+        rows = rows.sort_values("report_date").dropna(subset=[column])
+        if rows.empty:
+            continue
+        name = history_row_label(stage_key, module_label)
+        fig.add_trace(
+            go.Scatter(
+                x=rows["month_label"], y=rows[column], mode="lines+markers", name=name,
+                hovertemplate=name + "<br>%{x}<br>%{y:,.0f} " + unit + "<extra></extra>",
+            )
+        )
+    fig.update_layout(
+        title=f"{metric} — picked modules",
+        template="plotly_white", height=380,
+        margin={"l": 20, "r": 20, "t": 60, "b": 20},
+        xaxis_title="Month", yaxis_title=str(config["axis_label"]),
+        hovermode="x unified",
+        legend={"orientation": "h", "y": -0.2},
+    )
+    fig.update_xaxes(type="category")
+    return fig
+
+
+
 def render_data_manager(engine: Engine) -> None:
     """Sidebar admin panel: upload reports through a validation gate, review the
     pending queue, and permanently remove a bad report. Shown on every page."""
@@ -7825,6 +8457,12 @@ def main() -> None:
                 title="Replacement Candidates",
                 icon="🛠️",
                 url_path="replacement",
+            ),
+            st.Page(
+                lambda: render_module_history_page(df, mis),
+                title="Module History",
+                icon="📈",
+                url_path="history",
             ),
         ]
     )
