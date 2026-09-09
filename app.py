@@ -6446,6 +6446,24 @@ def _hit_output_ceiling(response: object) -> bool:
 # vision model (one that accepts an image_url content part).
 GROQ_MODEL = "qwen/qwen3.6-27b"
 
+# Qwen3.6 is a REASONING model, and on Groq the deliberation is charged against
+# max_tokens like any other output. At its default effort it spends the entire
+# budget thinking, returns EMPTY content, and json_object mode then rejects the
+# reply with a 400 `json_validate_failed` ("Failed to validate JSON. Please adjust
+# your prompt. See 'failed_generation'" — whose failed_generation comes back empty).
+# It reads like a prompt problem and is not one: no rewording fixes it, because
+# there is no generation to validate. Reasoning has to be OFF for JSON mode to work.
+# This is why the Groq backup never once succeeded — every fallback died here.
+GROQ_REASONING_EFFORT = "none"
+
+# The free tier caps OUTPUT tokens per minute (OTPM) at 1000, and Groq rejects a
+# request up front on the max_tokens it is ASKED for, not what it would have used —
+# so max_tokens=16384 was a hard 429 ("Request too large ... Limit 1000, Requested
+# 4005") before the model ever ran. Stay under the cap. A dense form's JSON will not
+# fit in 900, but overflowing raises that same json_validate_failed 400, which
+# `_looks_like_overflow` already routes into the per-page pass.
+GROQ_MAX_TOKENS = 900
+
 
 def _to_images(files: list[tuple[bytes, str]]) -> list[tuple[bytes, str]]:
     """Expand any PDFs into per-page PNG images; pass real images through. Used
@@ -6485,7 +6503,8 @@ def extract_imr_via_groq(files: list[tuple[bytes, str]], api_key: str) -> dict:
         messages=[{"role": "user", "content": content}],
         response_format={"type": "json_object"},
         temperature=0,
-        max_tokens=16384,  # headroom so a long report's JSON isn't cut off
+        max_tokens=GROQ_MAX_TOKENS,
+        reasoning_effort=GROQ_REASONING_EFFORT,
     )
     return _coerce_extracted(json.loads(response.choices[0].message.content or "{}"))
 
@@ -6606,7 +6625,13 @@ def extract_imr(
             data = _extract_paged(lambda imgs: extract_imr_via_groq(imgs, groq_key), files)
             return data, "Groq (Qwen3.6)"
         except Exception as exc:  # noqa: BLE001
-            notes.append(f"Groq error: {str(exc)[:120]}")
+            text = str(exc)
+            if "rate_limit_exceeded" in text or re.search(r"\b429\b", text):
+                notes.append(
+                    "Groq hit its free-tier output cap (1000 tokens/min) — wait a minute"
+                )
+            else:
+                notes.append(f"Groq error: {text[:120]}")
     if not gemini_key and not groq_key:
         notes.append("no API key configured")
     raise ExtractionFailed(" → ".join(notes))
