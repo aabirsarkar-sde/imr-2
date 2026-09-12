@@ -2533,28 +2533,35 @@ def build_limit_stage_table(
 ) -> pd.DataFrame:
     """Per-stage rollup of the absolute-limit verdict: what each stage costs in
     modules and membranes at the limit currently set for it."""
+    clients = clients_present(evaluated)
     rows: list[dict[str, object]] = []
     for key in stage_keys_present(evaluated):
         sub = evaluated[evaluated["stage_key"] == key]
         modules = len(sub)
         replace = int(sub["replace"].sum())
         readings = sub["conductivity"].notna().sum()
-        rows.append(
-            {
-                "stage_key": key,
-                "Stage": stage_display(key),
-                "Limit (uS/cm)": limits.get(key, float("nan")),
-                "Modules": modules,
-                "Bypassed": int((sub["status"] == "bypass").sum()),
-                "Over Limit": int(sub["over_limit"].sum()),
-                "To Replace": replace,
-                "Membranes": replace * MEMBRANES_PER_MODULE,
-                "% of Stage": round(replace / modules * 100, 1) if modules else 0.0,
-                "Median Cond": (
-                    round(float(sub["conductivity"].median()), 0) if readings else np.nan
-                ),
-            }
+        row = {
+            "stage_key": key,
+            "Stage": stage_display(key),
+            "Limit (uS/cm)": limits.get(key, float("nan")),
+            "Modules": modules,
+            "Bypassed": int((sub["status"] == "bypass").sum()),
+            "Over Limit": int(sub["over_limit"].sum()),
+            "To Replace": replace,
+            "Membranes": replace * MEMBRANES_PER_MODULE,
+        }
+        # Split on the same verdict this page runs on (`replace`), so the per-client
+        # columns are a breakdown of the Membranes column beside them.
+        by_client = modules_by_client(sub, "replace", clients)
+        for client in clients:
+            row[client_membrane_column(client)] = (
+                by_client.get(client, 0) * MEMBRANES_PER_MODULE
+            )
+        row["% of Stage"] = round(replace / modules * 100, 1) if modules else 0.0
+        row["Median Cond"] = (
+            round(float(sub["conductivity"].median()), 0) if readings else np.nan
         )
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -3923,6 +3930,9 @@ def build_plant_ranking(snapshot: pd.DataFrame, latest: pd.Timestamp) -> pd.Data
             "Plant No": plant_no_column(pdf["plant_sr_no"]).iloc[0],
             "plant_key": plant_key,
             "Zone": pdf["zone"].iloc[0],
+            # Which entity supplies this plant's membranes — the per-plant half of
+            # the ROCHEM/ROSERVE split in the requirement above.
+            "Client": pdf["client"].iloc[0] if "client" in pdf else UNASSIGNED_CLIENT,
             "Modules": module_count,
             "Bypassed": bypassed,
             "Degraded": degraded,
@@ -4454,30 +4464,157 @@ def mom_only_count(frame: pd.DataFrame) -> int:
     )
 
 
+# --------------------------------------------------------------------------- #
+# The membrane requirement, split by the entity that supplies it
+#
+# Every plant runs under one of CLIENT_OPTIONS (ROCHEM / ROSERVE / RENT) — a fact
+# of the plant register, not of any workbook — so the requirement a month raises
+# splits by joining the register's `client` onto the fleet-status rows. Nothing is
+# keyed in anywhere: the split moves with the modules that raised the demand.
+# --------------------------------------------------------------------------- #
+
+# A plant the register doesn't hold. Kept as its own bucket rather than folded
+# into the ROCHEM default: the point of the split is that each entity's number is
+# only its own, and a stranger's membranes billed to ROCHEM is the one error the
+# split exists to prevent.
+UNASSIGNED_CLIENT = "Unassigned"
+
+# The two entities every split reports, even at zero — the question this answers is
+# "how many from ROCHEM, how many from ROSERVE", and a column that vanishes at zero
+# reads as an unanswered question rather than as "none".
+REPORTED_CLIENTS = ["ROCHEM", "ROSERVE"]
+
+
+def build_client_by_sr(plants: pd.DataFrame) -> dict[object, str]:
+    """plant_sr_no -> client, from the plant register. A register row with a blank
+    client reads as the register-wide default, exactly as `load_plants()` shows it."""
+    if plants is None or plants.empty or "client" not in plants:
+        return {}
+    reg = plants.dropna(subset=["plant_sr_no"])
+    return {
+        int(sr): canonical_client(client) or DEFAULT_CLIENT
+        for sr, client in zip(reg["plant_sr_no"], reg["client"])
+    }
+
+
+def attach_client(rows: pd.DataFrame, plants: pd.DataFrame) -> pd.DataFrame:
+    """Add `client` to fleet-status rows, joined on plant_sr_no.
+
+    Always returns the column (UNASSIGNED_CLIENT where the register has nothing to
+    say) so every caller can split on it without checking the register is seeded."""
+    out = rows.copy()
+    if out.empty:
+        out["client"] = pd.Series(dtype=object)
+        return out
+    lookup = build_client_by_sr(plants)
+    out["client"] = out["plant_sr_no"].map(
+        lambda sr: lookup.get(int(sr), UNASSIGNED_CLIENT)
+        if pd.notna(sr) else UNASSIGNED_CLIENT
+    )
+    return out
+
+
+def clients_present(frame: pd.DataFrame) -> list[str]:
+    """The clients a split reports: ROCHEM and ROSERVE always, then whatever else
+    the rows actually carry (RENT, or plants missing from the register), so the
+    per-client figures always add back up to the total beside them."""
+    if frame is None or frame.empty or "client" not in frame:
+        return list(REPORTED_CLIENTS)
+    extra = sorted(
+        c for c in frame["client"].dropna().astype(str).unique()
+        if c not in REPORTED_CLIENTS
+    )
+    return list(REPORTED_CLIENTS) + extra
+
+
+def modules_by_client(
+    frame: pd.DataFrame, flag_column: str = "need", clients: list[str] | None = None
+) -> dict[str, int]:
+    """client -> flagged modules in `frame`. `flag_column` is whichever verdict the
+    page runs on ("need" on the Portfolio, "replace" on the limit page), so the
+    split is always a breakdown of the same count the page's headline shows."""
+    keys = clients if clients is not None else clients_present(frame)
+    counts = {client: 0 for client in keys}
+    if frame is None or frame.empty or "client" not in frame or flag_column not in frame:
+        return counts
+    flagged = frame[frame[flag_column].fillna(False).astype(bool)]
+    for client, modules in flagged.groupby("client").size().items():
+        counts[str(client)] = counts.get(str(client), 0) + int(modules)
+    return counts
+
+
+def client_membrane_column(client: str) -> str:
+    """Header for a client's membrane count in a by-stage / by-plant table."""
+    return f"Membranes — {client}"
+
+
+def client_split_caption(counts: dict[str, int]) -> str:
+    """"ROCHEM 4,968 · ROSERVE 1,104" — the split as a card subtitle, in membranes."""
+    return " · ".join(
+        f"{client} {modules * MEMBRANES_PER_MODULE:,}" for client, modules in counts.items()
+    )
+
+
+def render_client_requirement(frame: pd.DataFrame, flag_column: str = "need") -> None:
+    """A card per supplying entity: the membranes this month's requirement needs
+    from ROCHEM, from ROSERVE, and from anything else the rows carry."""
+    clients = clients_present(frame)
+    counts = modules_by_client(frame, flag_column, clients)
+    plants_hit = {
+        client: int(
+            frame.loc[
+                (frame["client"] == client) & frame[flag_column].fillna(False).astype(bool),
+                "plant_key",
+            ].nunique()
+        )
+        if not frame.empty and "client" in frame else 0
+        for client in clients
+    }
+    cards = st.columns(len(clients))
+    for column, client in zip(cards, clients):
+        modules = counts.get(client, 0)
+        with column:
+            metric_card(
+                f"From {client}",
+                f"{modules * MEMBRANES_PER_MODULE:,}",
+                f"{modules:,} module(s) · {plants_hit.get(client, 0):,} plant(s)",
+                "#2563eb" if modules else "#0f172a",
+            )
+
+
 def build_stage_requirement(snapshot: pd.DataFrame) -> pd.DataFrame:
     """Modules and membranes to replace, one row per stage of the RO train.
 
     The membrane requirement is raised per stage — `MEMBRANES_PER_MODULE` elements
     for every module needing replacement in that stage — because 4 modules in the
     third stage is a different order from 4 in the first. Rows run down the train
-    (1st -> 2nd -> 3rd), with anything whose sheet named no stage last."""
+    (1st -> 2nd -> 3rd), with anything whose sheet named no stage last.
+
+    Each stage's requirement is then split by the entity that supplies it — one
+    `Membranes — <client>` column per client, columns fixed across every row so a
+    stage where only ROCHEM needs anything still shows ROSERVE at zero."""
+    clients = clients_present(snapshot)
     rows: list[dict[str, object]] = []
     for key in stage_keys_present(snapshot):
         sub = snapshot[snapshot["stage_key"] == key]
         modules = len(sub)
         need = int(sub["need"].sum())
-        rows.append(
-            {
-                "stage_key": key,
-                "Stage": stage_display(key),
-                "Modules": modules,
-                "Bypassed": int((sub["status"] == "bypass").sum()),
-                "Degraded": int(sub["degraded"].sum()),
-                "Modules to Replace": need,
-                "Membranes Required": need * MEMBRANES_PER_MODULE,
-                "Need %": round(need / modules * 100, 1) if modules else 0.0,
-            }
-        )
+        row = {
+            "stage_key": key,
+            "Stage": stage_display(key),
+            "Modules": modules,
+            "Bypassed": int((sub["status"] == "bypass").sum()),
+            "Degraded": int(sub["degraded"].sum()),
+            "Modules to Replace": need,
+            "Membranes Required": need * MEMBRANES_PER_MODULE,
+        }
+        by_client = modules_by_client(sub, "need", clients)
+        for client in clients:
+            row[client_membrane_column(client)] = (
+                by_client.get(client, 0) * MEMBRANES_PER_MODULE
+            )
+        row["Need %"] = round(need / modules * 100, 1) if modules else 0.0
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -4500,6 +4637,19 @@ def render_stage_requirement(month_snapshot: pd.DataFrame, month_text: str) -> N
         f"{MEMBRANES_PER_MODULE} membranes per module, raised per stage. Covers "
         "every stage regardless of the stage buttons above."
     )
+
+    # Who supplies them. Read off the plant register's `client`, so a plant moving
+    # between entities moves its membranes with it — nothing to key in here.
+    st.markdown("**Required from**")
+    render_client_requirement(month_snapshot, "need")
+    st.caption(
+        "The same requirement, split by the entity each plant runs under "
+        "(Plant Register → Client). Every plant counts once, so these add up to "
+        "the total below."
+    )
+
+    st.markdown("")
+    st.markdown("**By stage**")
     cards = st.columns(len(table))
     for column, (_, row) in zip(cards, table.iterrows()):
         with column:
@@ -4513,17 +4663,16 @@ def render_stage_requirement(month_snapshot: pd.DataFrame, month_text: str) -> N
 
     st.markdown("")
     display = table.drop(columns=["stage_key"])
-    total = {
-        "Stage": "Total",
-        "Modules": int(display["Modules"].sum()),
-        "Bypassed": int(display["Bypassed"].sum()),
-        "Degraded": int(display["Degraded"].sum()),
-        "Modules to Replace": int(display["Modules to Replace"].sum()),
-        "Membranes Required": int(display["Membranes Required"].sum()),
-        "Need %": round(
-            display["Modules to Replace"].sum() / display["Modules"].sum() * 100, 1
-        ) if display["Modules"].sum() else 0.0,
-    }
+    # Every numeric column sums down the train, including the per-client ones, so
+    # the total row is built from the columns present rather than a fixed list.
+    total = {"Stage": "Total"}
+    for column in display.columns:
+        if column == "Stage" or column == "Need %":
+            continue
+        total[column] = int(display[column].sum())
+    total["Need %"] = round(
+        display["Modules to Replace"].sum() / display["Modules"].sum() * 100, 1
+    ) if display["Modules"].sum() else 0.0
     display = pd.concat([display, pd.DataFrame([total])], ignore_index=True)
     st.dataframe(display, width="stretch", hide_index=True)
     st.download_button(
@@ -4553,14 +4702,19 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
     # not parsed from a workbook), so they are joined on here — every downstream
     # slice of `status` then carries them.
     status = attach_bypass_notes(status, load_bypass_notes())
+    # Which entity each plant runs under (ROCHEM / ROSERVE / RENT) is a register
+    # fact, not a workbook one, so it is joined on here too — it is what splits the
+    # membrane requirement by supplier below.
+    status = attach_client(status, load_plants())
 
-    # Month + zone slicers — the whole page renders for the chosen month and the
-    # chosen zones, defaulting to the most recent month and all zones. Every
-    # downstream section keys off `snapshot`/`selected`/`status_zoned`.
+    # Month + zone + client slicers — the whole page renders for the chosen month,
+    # zones and clients, defaulting to the most recent month and everything else.
+    # Every downstream section keys off `snapshot`/`selected`/`status_zoned`.
     months = sorted(status["report_date"].dropna().unique(), reverse=True)
     month_labels = [pd.Timestamp(m).strftime("%b %Y") for m in months]
     zones = sorted(status["zone"].dropna().astype(str).unique().tolist())
-    picker_col, zone_col = st.columns([1, 2])
+    clients = clients_present(status)
+    picker_col, zone_col, client_col = st.columns([1, 2, 1.4])
     with picker_col:
         picked = st.selectbox("Report month", month_labels, index=0)
     with zone_col:
@@ -4570,10 +4724,22 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
             default=zones,
             help="Filter the whole page to one or more zones. Clear the box to show all zones.",
         )
+    with client_col:
+        selected_clients = st.multiselect(
+            "Clients",
+            clients,
+            default=clients,
+            key="portfolio_clients",
+            help="Filter the whole page to the plants running under one entity "
+                 "(from the Plant Register). Clear the box to show all.",
+        )
     selected = months[month_labels.index(picked)]
     month_text = picked
     active_zones = selected_zones or zones  # empty selection = all zones
-    zone_mask = status["zone"].isin(active_zones)
+    active_clients = selected_clients or clients
+    # Client narrows the page exactly like zone — applied before the stage buttons,
+    # so every figure on the page (including the by-supplier split) moves together.
+    zone_mask = status["zone"].isin(active_zones) & status["client"].isin(active_clients)
     # Which stages exist is a property of the data, not of the degradation signal,
     # so the stage buttons can be built before the toggle below is applied.
     stage_source = status[zone_mask & (status["report_date"] == selected)]
@@ -4664,6 +4830,7 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
     # Each module holds a fixed number of membranes, so the membranes to replace is
     # the modules-to-replace figure (the hero number) times that per-module count.
     membranes = MEMBRANES_PER_MODULE * need
+    client_need = modules_by_client(snapshot, "need")
     hero_col, mem_col = st.columns([3, 1])
     with hero_col:
         hero_card(
@@ -4681,7 +4848,8 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
                 <div class="hero-title">Membranes to Replace</div>
                 <div class="hero-value" style="color:#2563eb;
                      font-size:clamp(1.9rem,3.5vw,3rem);">{membranes:,}</div>
-                <div class="hero-subtitle">{MEMBRANES_PER_MODULE} × {need:,} modules</div>
+                <div class="hero-subtitle">{MEMBRANES_PER_MODULE} × {need:,} modules<br>
+                     {client_split_caption(client_need)}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -5104,11 +5272,15 @@ def render_dashboard(df: pd.DataFrame, mis: pd.DataFrame) -> None:
     if status.empty:
         st.info("No readings are available to measure against a limit.")
         return
+    # The entity each plant runs under, for the ROCHEM/ROSERVE split of the
+    # requirement this page raises.
+    status = attach_client(status, load_plants())
 
     months = sorted(status["report_date"].dropna().unique(), reverse=True)
     month_labels = [pd.Timestamp(m).strftime("%b %Y") for m in months]
     zones = sorted(status["zone"].dropna().astype(str).unique().tolist())
-    picker_col, zone_col = st.columns([1, 2])
+    clients = clients_present(status)
+    picker_col, zone_col, client_col = st.columns([1, 2, 1.4])
     with picker_col:
         picked = st.selectbox("Report month", month_labels, index=0, key="limits_month")
     with zone_col:
@@ -5116,11 +5288,20 @@ def render_dashboard(df: pd.DataFrame, mis: pd.DataFrame) -> None:
             "Zones", zones, default=zones, key="limits_zones",
             help="Filter the whole page to one or more zones. Clear the box to show all.",
         )
+    with client_col:
+        selected_clients = st.multiselect(
+            "Clients", clients, default=clients, key="limits_clients",
+            help="Filter the whole page to the plants running under one entity "
+                 "(from the Plant Register). Clear the box to show all.",
+        )
     selected = months[month_labels.index(picked)]
     month_text = picked
     active_zones = selected_zones or zones
+    active_clients = selected_clients or clients
     snapshot = status[
-        status["zone"].isin(active_zones) & (status["report_date"] == selected)
+        status["zone"].isin(active_zones)
+        & status["client"].isin(active_clients)
+        & (status["report_date"] == selected)
     ]
     if snapshot.empty:
         st.info(f"No modules in the selected zones for {month_text}.")
@@ -5219,6 +5400,7 @@ def render_dashboard(df: pd.DataFrame, mis: pd.DataFrame) -> None:
 
     # ----- 2. Headline -----
     st.markdown("---")
+    client_replace = modules_by_client(evaluated, "replace")
     hero_col, mem_col = st.columns([3, 1])
     with hero_col:
         hero_card(
@@ -5236,11 +5418,21 @@ def render_dashboard(df: pd.DataFrame, mis: pd.DataFrame) -> None:
                 <div class="hero-title">Membranes Required</div>
                 <div class="hero-value" style="color:#2563eb;
                      font-size:clamp(1.9rem,3.5vw,3rem);">{membranes:,}</div>
-                <div class="hero-subtitle">{MEMBRANES_PER_MODULE} x {replace:,} modules</div>
+                <div class="hero-subtitle">{MEMBRANES_PER_MODULE} x {replace:,} modules<br>
+                     {client_split_caption(client_replace)}</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
+
+    # ----- 2b. Required from, by entity -----
+    st.markdown("")
+    st.markdown("**Required from**")
+    render_client_requirement(evaluated, "replace")
+    st.caption(
+        "The same requirement, split by the entity each plant runs under "
+        "(Plant Register → Client)."
+    )
 
     st.markdown("")
     kpis = st.columns(5)
@@ -5285,19 +5477,17 @@ def render_dashboard(df: pd.DataFrame, mis: pd.DataFrame) -> None:
             )
     st.markdown("")
     display = table.drop(columns=["stage_key"])
-    total_row = {
-        "Stage": "Total",
-        "Limit (uS/cm)": np.nan,
-        "Modules": int(display["Modules"].sum()),
-        "Bypassed": int(display["Bypassed"].sum()),
-        "Over Limit": int(display["Over Limit"].sum()),
-        "To Replace": int(display["To Replace"].sum()),
-        "Membranes": int(display["Membranes"].sum()),
-        "% of Stage": round(
-            display["To Replace"].sum() / display["Modules"].sum() * 100, 1
-        ) if display["Modules"].sum() else 0.0,
-        "Median Cond": np.nan,
-    }
+    # Built from the columns present so the per-client membrane columns total too;
+    # a limit and a median don't add up, so they stay blank on the total row.
+    skip = {"Stage", "Limit (uS/cm)", "% of Stage", "Median Cond"}
+    total_row = {"Stage": "Total", "Limit (uS/cm)": np.nan, "Median Cond": np.nan}
+    for column in display.columns:
+        if column in skip:
+            continue
+        total_row[column] = int(display[column].sum())
+    total_row["% of Stage"] = round(
+        display["To Replace"].sum() / display["Modules"].sum() * 100, 1
+    ) if display["Modules"].sum() else 0.0
     display = pd.concat([display, pd.DataFrame([total_row])], ignore_index=True)
     st.dataframe(display, width="stretch", hide_index=True)
     st.download_button(
@@ -5361,6 +5551,7 @@ def render_dashboard(df: pd.DataFrame, mis: pd.DataFrame) -> None:
             "Plant": current_plant_name(pdf),
             "Plant No": plant_no_column(pdf["plant_sr_no"]).iloc[0],
             "Zone": pdf["zone"].iloc[0],
+            "Client": pdf["client"].iloc[0] if "client" in pdf else UNASSIGNED_CLIENT,
             "Modules": len(pdf),
             "Over Limit": int(pdf["over_limit"].sum()),
             "Bypassed": int((pdf["status"] == "bypass").sum()),

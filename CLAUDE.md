@@ -178,6 +178,17 @@ mislabels their Plant SR No. `readings` and `parameters` both carry `plant_sr_no
 - The Portfolio's stage buttons filter the whole page, but `render_stage_requirement()` is
   deliberately fed the month's **unfiltered** snapshot — the breakdown must keep showing
   every stage no matter which button is pressed.
+- **The membrane requirement is split by the entity that supplies it**, never keyed in:
+  `attach_client()` joins the register's `client` (ROCHEM / ROSERVE / RENT) onto the
+  fleet-status rows by `plant_sr_no`, and `modules_by_client()` breaks whichever verdict
+  the page runs on (`need` on the Portfolio, `replace` on the limit page) down by it.
+  `clients_present()` always reports ROCHEM and ROSERVE — a column that vanished at zero
+  would read as an unanswered question — then appends whatever else the rows carry, so the
+  per-client figures always add back up to the total beside them. A plant the register
+  doesn't hold is `UNASSIGNED_CLIENT`, never the ROCHEM default: billing a stranger's
+  membranes to ROCHEM is the one error the split exists to prevent. Both pages also carry a
+  **Clients** filter that narrows the page exactly like the zone filter (applied before the
+  stage buttons, so every figure moves together).
 - **Every other page reads one month; Module History reads a window.**
   `module_history_frame()` takes the last N months **that plant actually reported**
   (not calendar months, so a skipped IMR doesn't shorten the comparison) and
