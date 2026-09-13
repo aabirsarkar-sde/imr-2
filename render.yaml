@@ -1,0 +1,25 @@
+# Render deployment blueprint. Point Render at this repo and it reads this file
+# instead of asking for build/start commands by hand.
+#
+# Each secret is marked `sync: false`, which means "ask me for the value in
+# the dashboard, never store it in the repo" — the database URL and API keys must
+# not live in git.
+services:
+  - type: web
+    name: ro-membrane-health
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # $PORT is assigned by the host; 0.0.0.0 makes the app reachable from outside
+    # the container; headless stops the framework prompting for an email on a
+    # machine with no browser.
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.5
+      - key: DATABASE_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false

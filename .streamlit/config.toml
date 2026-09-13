@@ -1,0 +1,12 @@
+# App-level configuration. Committed (unlike secrets.toml) because how the
+# product presents itself has to travel with the code to every deployment.
+
+[client]
+# Drop the framework's developer toolbar (Deploy button, hamburger menu) from the
+# rendered page. This is the supported way to keep framework chrome out of a
+# product UI; the toolbar still surfaces for error states.
+toolbarMode = "minimal"
+
+[browser]
+# Don't phone usage statistics home from a customer's deployment.
+gatherUsageStats = false

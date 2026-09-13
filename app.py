@@ -8485,15 +8485,93 @@ def render_excel_workbook(data: bytes, label: str, key: str) -> None:
     wb.close()
 
 
+# --------------------------------------------------------------------------- #
+# White-labelling the served page
+#
+# set_page_config sets the tab title and icon, but only once the app has booted —
+# the HTML itself is served from the framework's own index.html, so the first
+# paint of a cold tab flashes the framework's favicon and the title "Streamlit"
+# before our values land. The only place to fix that is the served file, so the
+# three assets that name the framework are rewritten in place on startup.
+#
+# Best-effort by design: an install on a read-only filesystem simply keeps the
+# stock assets. That is cosmetic, never fatal, so nothing here may raise. The
+# Apache licence header in index.html is deliberately left untouched — the
+# framework is Apache-2.0 and that notice stays with the file.
+# --------------------------------------------------------------------------- #
+
+APP_TITLE = "RO Membrane Health"
+APP_ICON_PATH = APP_DIR / "assets" / "app_icon.png"
+
+_BRANDED = False
+
+
+def brand_served_page() -> None:
+    """Rewrite the framework's static title and favicon to this product's.
+
+    Runs once per process and only writes a file whose content would actually
+    change, so it costs one small read per boot and survives a re-run untouched.
+    The very first page load after a cold start is served before any script runs,
+    so that one load can still show the stock tab title; every load after it is
+    branded for the life of the process."""
+    global _BRANDED
+    if _BRANDED:
+        return
+    _BRANDED = True
+    try:
+        static_dir = Path(st.__file__).resolve().parent / "static"
+
+        index = static_dir / "index.html"
+        html = index.read_text(encoding="utf-8")
+        titled = html.replace("<title>Streamlit</title>", f"<title>{APP_TITLE}</title>")
+        if titled != html:
+            index.write_text(titled, encoding="utf-8")
+
+        if APP_ICON_PATH.exists():
+            favicon = static_dir / "favicon.png"
+            icon_bytes = APP_ICON_PATH.read_bytes()
+            if not favicon.exists() or favicon.read_bytes() != icon_bytes:
+                favicon.write_bytes(icon_bytes)
+    except Exception:  # noqa: BLE001 - branding is cosmetic; never block the app
+        pass
+
+
 def main() -> None:
+    brand_served_page()
     st.set_page_config(
-        page_title="RO Membrane Health Dashboard",
-        page_icon=":bar_chart:",
+        page_title=APP_TITLE,
+        # The product's own mark, so the tab never shows the framework's. Falls
+        # back to an emoji if the asset is missing from a deployment.
+        page_icon=str(APP_ICON_PATH) if APP_ICON_PATH.exists() else ":droplet:",
         layout="wide",
     )
     st.markdown(
         """
         <style>
+        /* ---- White-label: no framework or host chrome in the product UI ----
+           `.streamlit/config.toml` already sets toolbarMode = "minimal", which
+           removes the Deploy button and the hamburger menu server-side. This is
+           the belt-and-braces half: it also covers the icons a HOST injects into
+           the page (Share / favourite / edit / repo link / "Manage app"), which
+           no config option controls.
+
+           Deliberately narrow: `stToolbar` is the whole header row, and it holds
+           the button that re-opens a collapsed sidebar in its LEFT section, so
+           only the right-hand action group is hidden. Hiding the header outright
+           would strand anyone who collapsed the sidebar. */
+        [data-testid="stToolbarActions"],
+        [data-testid="stMainMenu"],
+        [data-testid="stAppDeployButton"],
+        [data-testid="stStatusWidget"],
+        [data-testid="stDecoration"],
+        [data-testid="manage-app-button"],
+        [class*="viewerBadge"],
+        #MainMenu,
+        footer { display: none !important; }
+        /* The header is kept in the DOM for the sidebar control, but it must not
+           paint a band across the top of the page. */
+        [data-testid="stHeader"] { background: transparent; }
+
         .block-container { padding-top: 1.8rem; }
         .metric-card {
             border: 1px solid #e5e7eb;
