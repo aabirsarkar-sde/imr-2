@@ -2678,13 +2678,16 @@ def load_module_membrane_types() -> pd.DataFrame:
     return df.reindex(columns=MODULE_TYPE_COLUMNS).reset_index(drop=True)
 
 
-def save_module_membrane_types(engine: Engine, edited: pd.DataFrame) -> int:
+def save_module_membrane_types(
+    engine: Engine, edited: pd.DataFrame, allowed: set[int] | None = None
+) -> int:
     """Persist the membrane type for the modules that were on screen.
 
     Every shown module's stored row is replaced, so clearing a module's type
     deletes its row and puts it back on whatever the stage register says — the
     editor is how you both set an exception and take one back. Modules the editor
-    didn't show are untouched. Returns the number of picks kept."""
+    didn't show are untouched. `allowed` is the ST register's plant SRs: rows for
+    any other plant are dropped rather than written. Returns the picks kept."""
     clean = edited.copy()
     for col in MODULE_TYPE_KEY:
         if col not in clean:
@@ -2702,6 +2705,15 @@ def save_module_membrane_types(engine: Engine, edited: pd.DataFrame) -> int:
         pd.to_numeric(clean["plant_sr_no"], errors="coerce").astype("Int64")
         if "plant_sr_no" in clean else pd.NA
     )
+    if allowed is not None:
+        # Only a plant the ST register names may be typed. The editor never offers
+        # the others, but the rule belongs at the write boundary too — a row that
+        # cannot be seen or edited should not be creatable either.
+        clean = clean[clean["plant_sr_no"].map(
+            lambda sr: pd.notna(sr) and int(sr) in allowed
+        )]
+        if clean.empty:
+            return 0
     clean["updated_at"] = datetime.now(timezone.utc)
     kept = clean[clean["membrane_type"].notna()].reindex(columns=MODULE_TYPE_COLUMNS)
 
@@ -4924,9 +4936,12 @@ def attach_membrane_type(
     2. **The stage's type in the ST-module register** (`types`), as a starting
        point so the whole fleet doesn't have to be typed by hand before the split
        says anything useful.
-    3. `DEFAULT_MEMBRANE_TYPE` (PT) — what the rest of the fleet runs. Only a plant
-       on the ST register has ST modules at all, so for everyone else PT is a fact,
-       not a guess.
+    3. `DEFAULT_MEMBRANE_TYPE` (PT) — what the rest of the fleet runs.
+
+    All of it is gated on the register's allow-list: only a plant the ST-module
+    workbook names can hold anything but PT, whichever source answered. That is
+    the constraint the register exists to impose, and it is applied here rather
+    than only in the editor so a stale row can never move a number.
 
     The one exception to (3): a plant that IS on the register whose stage cell
     gives a count with no PT/ST marking is `UNKNOWN_MEMBRANE_TYPE`. There, the two
@@ -4943,12 +4958,19 @@ def attach_membrane_type(
 
     stage_lookup = build_membrane_type_by_key(types)
     module_lookup = build_module_type_lookup(picks)
+    allowed = st_register_plant_srs(types)
     resolved: list[str] = []
     sources: list[str] = []
     for plant_key, sr, stage_label, stage_key, module_label in zip(
         out["plant_key"], out["plant_sr_no"], out["stage_label"],
         out["stage_key"], out["module_label"],
     ):
+        # Off the allow-list there is nothing to resolve: the plant is PT, and a
+        # row left over from when it was on the list does not get a say.
+        if pd.isna(sr) or int(sr) not in allowed:
+            resolved.append(DEFAULT_MEMBRANE_TYPE)
+            sources.append(TYPE_SOURCE_DEFAULT)
+            continue
         pick = module_lookup.get(
             (str(plant_key), str(stage_label), str(module_label))
         )
@@ -4956,9 +4978,7 @@ def attach_membrane_type(
             resolved.append(pick)
             sources.append(TYPE_SOURCE_MODULE)
             continue
-        from_register = (
-            stage_lookup.get((int(sr), str(stage_key))) if pd.notna(sr) else None
-        )
+        from_register = stage_lookup.get((int(sr), str(stage_key)))
         if from_register in MEMBRANE_TYPE_OPTIONS:
             resolved.append(str(from_register))
             sources.append(TYPE_SOURCE_REGISTER)
@@ -5066,7 +5086,8 @@ def membrane_register_issues(frame: pd.DataFrame, types: pd.DataFrame) -> list[s
     wrong membrane type on an order."""
     issues: list[str] = []
     if types is None or types.empty:
-        return ["No ST-module register was found, so no stage can be typed."]
+        # No register workbook is the normal case: the types are marked in-app.
+        return issues
 
     # 1. A row whose stage cells don't add up to the Total the sheet declares.
     for sr, rows in types.groupby("plant_sr_no"):
@@ -5167,17 +5188,19 @@ def render_membrane_type_requirement(
     defaulted = int(sources.get(TYPE_SOURCE_REGISTER, 0))
     fleet_default = int(sources.get(TYPE_SOURCE_DEFAULT, 0))
     unknown = total_modules - picked - defaulted - fleet_default
-    st.caption(
-        f"**PT is the fleet default**; ST comes only from the sites on the ST-module "
-        f"register. Of the modules above, **{fleet_default:,}** are PT by default, "
-        f"**{defaulted:,}** typed by that register, **{picked:,}** picked by hand"
-        + (
-            f", and **{unknown:,}** sit in a stage the register counts but never marks "
-            "PT or ST — the only modules left unspecified. Mark them under "
-            "**Plant Register → ST module exceptions**."
-            if unknown else
-            ". Adjust any of them under **Plant Register → ST module exceptions**."
+    parts = [f"**{fleet_default:,}** PT by default"]
+    if defaulted:
+        parts.append(f"**{defaulted:,}** typed by the ST-module register")
+    if picked:
+        parts.append(f"**{picked:,}** marked by hand")
+    if unknown:
+        parts.append(
+            f"**{unknown:,}** in a stage the register counts but never marks PT or ST"
         )
+    st.caption(
+        "**PT is the fleet default** — a module counts as PT unless it is marked ST. "
+        "Of the modules above: " + ", ".join(parts) + ". Mark ST modules under "
+        "**Plant Register → ST module exceptions**."
     )
 
     detail = build_membrane_type_detail(frame, flag_column)
@@ -8293,30 +8316,34 @@ def plant_module_type_frame(status: pd.DataFrame, plant_key: object) -> pd.DataF
 
 
 def st_register_plant_srs(types: pd.DataFrame) -> set[int]:
-    """The plant SRs that run ST modules at all — the ST register IS that list."""
+    """The plant SRs named by the ST-module register workbook — **the allow-list**.
+
+    A plant on this list may run ST modules and may be typed in the app; a plant
+    off it is PT, cannot be edited, and any stray row it has is ignored. Keeping
+    the constraint to one function means the UI and the numbers enforce the same
+    rule: hiding a plant from the editor without also ignoring its saved rows
+    would leave a type nobody can see and nobody can change still moving the
+    membrane split."""
     if types is None or types.empty:
         return set()
     return {int(sr) for sr in types["plant_sr_no"].dropna()}
 
 
 def build_mixed_plant_table(status: pd.DataFrame, types: pd.DataFrame) -> pd.DataFrame:
-    """Module counts by type for the ST-register plants only, in the latest month
+    """Module counts by type for the ST-register sites only, in the latest month
     each reported.
 
-    Scoped to that register on purpose: it is the list of sites that have any ST
-    modules, so it is also the complete list of sites where the question "PT or
-    ST?" has more than one answer. Every other plant is PT and has nothing to
-    decide. Sorted by what still needs a human — unmarked modules first, then the
-    mixed trains."""
+    Scoped to the allow-list: those are the only plants where "PT or ST?" has more
+    than one answer. Everywhere else is PT and has nothing to decide, so listing it
+    would be 140 rows of noise. Sorted by what still needs a human: unmarked
+    modules first, then the mixed trains."""
     columns = ["plant_key", "Plant", "Plant No", "Modules", "PT", "ST",
                "Not specified", "Stages", "Train"]
     if status.empty:
         return pd.DataFrame(columns=columns)
-    on_register = st_register_plant_srs(types)
+    sites = st_register_plant_srs(types)
     scoped = status[
-        status["plant_sr_no"].map(
-            lambda sr: pd.notna(sr) and int(sr) in on_register
-        )
+        status["plant_sr_no"].map(lambda sr: pd.notna(sr) and int(sr) in sites)
     ]
     if scoped.empty:
         return pd.DataFrame(columns=columns)
@@ -8361,9 +8388,11 @@ def build_mixed_plant_table(status: pd.DataFrame, types: pd.DataFrame) -> pd.Dat
 def render_module_type_editor(status: pd.DataFrame) -> None:
     """Pick, per module, whether it runs a PT or an ST membrane.
 
-    The ST-module register types a stage at a time and is only a starting point —
-    this is where the exceptions are recorded, and a pick here beats the register
-    everywhere the requirement is split."""
+    Two facts, two sources, and they are deliberately different. WHICH SITES may
+    run ST is the ST-module workbook's answer — an allow-list, changed by shipping
+    a new file, which is the right friction for a fact that changes once a year.
+    WHICH MODULES at those sites are ST is this editor's answer, because that
+    changes every time a stage is re-membraned and no file will keep up."""
     st.markdown("---")
     st.subheader("ST module exceptions (PT / ST)", anchor="module-types")
     engine = get_engine()
@@ -8374,72 +8403,76 @@ def render_module_type_editor(status: pd.DataFrame) -> None:
         return
 
     types = load_module_types()
-    on_register = st_register_plant_srs(types)
-    if not on_register:
+    allowed = st_register_plant_srs(types)
+    if not allowed:
         st.info(
-            "No ST-module register was found in the app directory, so no plant is "
-            "marked as running ST modules and the whole fleet counts as PT."
+            "No ST-module register is in the app directory, so no plant is allowed "
+            "to run ST modules and the whole fleet counts as PT. Add the register "
+            "workbook (a Site Name / Plant Sr. No. / Number of Module sheet) to the "
+            "app folder to open those sites for typing — it is never ingested as a "
+            "monthly report."
         )
         return
 
     st.caption(
-        f"The fleet runs **PT**. These **{len(on_register):,} sites** are the ones "
-        "with ST modules — they are the only plants this applies to, and the only "
-        "ones listed here. The ST-module workbook types each of their stages; set a "
-        "module below and your pick wins over it. Everything else in the fleet is "
-        "PT and is not a question, so it isn't asked."
+        f"The fleet runs **PT**. The ST-module workbook names the **{len(allowed):,} "
+        "sites** that may run ST, and only those can be typed here — every other "
+        "plant is PT and isn't a question. For these, mark the modules (or whole "
+        "stages) that run **ST**; the workbook's own stage types stand in until you "
+        "do, and your mark always wins."
     )
 
     overview = build_mixed_plant_table(status, types)
     if overview.empty:
         st.info(
-            "None of the plants on the ST register has readings yet, so there are "
-            "no modules to type."
+            "None of the sites on the ST register has readings yet, so there are no "
+            "modules to type."
         )
         return
-    mixed = int((overview["Train"] == "Mixed").sum())
-    unmarked_plants = int(overview["Not specified"].gt(0).sum())
-    unmarked_modules = int(overview["Not specified"].sum())
     st_modules = int(overview["ST"].sum())
+    mixed = int((overview["Train"] == "Mixed").sum())
+    unmarked_modules = int(overview["Not specified"].sum())
+    unmarked_plants = int(overview["Not specified"].gt(0).sum())
+
     cards = st.columns(4)
     with cards[0]:
-        metric_card("ST sites", f"{len(overview):,}", "on the register, with readings")
-    with cards[1]:
-        metric_card("ST modules", f"{st_modules:,}", "across those sites", "#7c3aed")
-    with cards[2]:
         metric_card(
-            "Mixed trains", f"{mixed:,}", "run both PT and ST",
-            "#2563eb" if mixed else "#0f172a",
+            "ST sites", f"{len(overview):,}",
+            f"of {len(allowed):,} on the register · rest of fleet is PT", "#7c3aed",
         )
+    with cards[1]:
+        metric_card("ST modules", f"{st_modules:,}", "across those sites",
+                    "#7c3aed" if st_modules else "#0f172a")
+    with cards[2]:
+        metric_card("Mixed trains", f"{mixed:,}", "run both PT and ST",
+                    "#2563eb" if mixed else "#0f172a")
     with cards[3]:
         metric_card(
             "Needs marking", f"{unmarked_modules:,}",
             f"module(s) at {unmarked_plants:,} site(s)" if unmarked_modules
-            else "every module is typed",
+            else "nothing outstanding",
             "#b45309" if unmarked_modules else "#16a34a",
         )
     if unmarked_modules:
         st.caption(
-            "\"Needs marking\" is a stage the register lists with a module count but "
-            "no PT/ST against it. Those are the only modules counted as "
-            f"**{UNKNOWN_MEMBRANE_TYPE}** anywhere — pick a type below and they stop "
+            "**Needs marking** is a stage the workbook counts but never marks PT or "
+            "ST. Those are the only modules counted as "
+            f"**{UNKNOWN_MEMBRANE_TYPE}** anywhere — type them below and they stop "
             "being a question."
         )
 
-    with st.expander(f"The {len(overview):,} ST sites by type"):
+    with st.expander(f"The {len(overview):,} ST site(s) by type"):
         st.dataframe(
             overview.drop(columns=["plant_key"]), width="stretch", hide_index=True
         )
 
-    # ----- the per-module editor, over the ST sites only -----
+    # ----- the per-module editor, over the allow-listed sites only -----
     scoped = status[
-        status["plant_sr_no"].map(lambda sr: pd.notna(sr) and int(sr) in on_register)
+        status["plant_sr_no"].map(lambda sr: pd.notna(sr) and int(sr) in allowed)
     ]
     options = plant_options(scoped)
     if not options:
         return
-    # Offer the plants that still need work first; the overview is already in that
-    # order, so it is what decides the picker's order too.
     rank = {key: index for index, key in enumerate(overview["plant_key"])}
     options = sorted(options, key=lambda option: rank.get(option[0], len(rank)))
     picked = st.selectbox(
@@ -8447,8 +8480,9 @@ def render_module_type_editor(status: pd.DataFrame) -> None:
         options,
         format_func=lambda option: plant_option_label(option, options),
         key="module_types_plant",
-        help="Only the sites on the ST-module register appear here — they are the "
-             "only ones with ST modules. Sites still needing a marking come first.",
+        help="Only the sites the ST-module workbook names can be typed — they are "
+             "the only ones that run ST modules. Sites still needing a marking "
+             "come first.",
     )
     plant_key, plant_name, plant_sr_no = picked
     frame = plant_module_type_frame(scoped, plant_key)
@@ -8493,6 +8527,7 @@ def render_module_type_editor(status: pd.DataFrame) -> None:
                             "plant": stage_rows["plant"],
                         }
                     ),
+                    allowed,
                 )
                 load_module_membrane_types.clear()
                 st.success(
@@ -8548,6 +8583,7 @@ def render_module_type_editor(status: pd.DataFrame) -> None:
                     "plant": frame["plant"].values,
                 }
             ),
+            allowed,
         )
         load_module_membrane_types.clear()
         st.success(

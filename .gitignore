@@ -11,5 +11,8 @@ __pycache__/
 # Uploaded plant reports (data, not code)
 uploaded_reports/
 
+# Excel lock files — created whenever a workbook is open, never wanted
+~$*
+
 # Legacy manual entry file (no longer used)
 manual_readings.csv

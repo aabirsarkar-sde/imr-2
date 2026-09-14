@@ -44,10 +44,11 @@ runs on Postgres (prod) and SQLite (tests).
 
 1. **Discovery** — `report_paths()` globs `*.xlsx/*.xls/*.csv` from the app directory and
    `uploaded_reports/`, skipping `manual_readings.csv` (legacy) and Excel temp files (`~$`).
-   **Three kinds of workbook live in that directory and only one is a monthly report.**
+   **Up to three kinds of workbook live in that directory and only one is a monthly
+   report.**
    `report_paths()` excludes the other two so they never land as readings: the O&M register
    (`is_master_om_file`, seeds `plants`) and the ST-module register (`is_st_module_file`,
-   types each stage PT or ST). Their headers are nearly identical — Site Name / Plant Sr No /
+   the allow-list of sites that may run ST modules). Their headers are nearly identical — Site Name / Plant Sr No /
    Installed Capacity — so `is_master_om_list()` explicitly rejects anything carrying the
    ST register's "Number of Module" columns; without that the ST file reads as the fleet
    register and could seed the plant table with 13 plants instead of 155.
@@ -210,29 +211,39 @@ mislabels their Plant SR No. `readings` and `parameters` both carry `plant_sr_no
   membranes to ROCHEM is the one error the split exists to prevent. Both pages also carry a
   **Clients** filter that narrows the page exactly like the zone filter (applied before the
   stage buttons, so every figure moves together).
-- **The fleet runs PT; ST is an exception at a dozen named sites.** The ST-module
-  register workbook ("ST Module Details … .xlsx") IS that list — `st_register_plant_srs()`
-  reads it — and a plant not on it has no ST modules, full stop. `attach_membrane_type()`
-  answers each module in a fixed order, recording which source answered in
-  `membrane_type_source`:
+- **The fleet runs PT; ST is an exception at a handful of sites. Two facts, two
+  sources, deliberately different.** WHICH SITES may run ST is the ST-module register
+  workbook's answer — `st_register_plant_srs()` is an **allow-list**, changed by shipping
+  a new file, which is the right friction for something that changes once a year. WHICH
+  MODULES at those sites are ST is the app's answer, marked per module, because that
+  changes every time a stage is re-membraned and no file keeps up.
+  **The allow-list is enforced in three places, not one**: the editor only offers those
+  plants, `save_module_membrane_types(..., allowed)` refuses to write rows for any other,
+  and `attach_membrane_type()` ignores rows for a plant that is off the list — so a
+  register edit that drops a site can never leave a type nobody can see still moving the
+  numbers. `attach_membrane_type()` answers each module in a fixed order, recording which
+  source answered in `membrane_type_source`:
   1. `module_membrane_types` — what somebody picked in-app, per (plant_key, stage_label,
      module_label). **This is the grain that matters** at an ST site: the train mixes the
      two, and a stage re-membraned in halves mixes them inside one stage, so neither a
      plant-level nor a stage-level answer is always right. Edited on **Plant Register →
-     ST module exceptions** (`render_module_type_editor`), which is **scoped to the
-     register's plants** — offering the whole fleet would ask ~140 questions that have
-     no answer. Whole-stage shortcuts write straight through (a 60-module stage is not
-     going to be clicked 60 times); the table handles exceptions inside a stage. No month
-     column: a module keeps its type until someone changes it.
-  2. That register's type for the stage, where it marks one.
+     ST module exceptions** (`render_module_type_editor`), scoped to the allow-list.
+     Whole-stage shortcuts write straight through (a 60-module stage is not going to be
+     clicked 60 times); the table handles exceptions inside a stage. No month column: a
+     module keeps its type until someone changes it.
+  2. That register's type for the stage, where it marks one — a starting point so the
+     allow-listed sites aren't blank on day one.
   3. `DEFAULT_MEMBRANE_TYPE` (PT) — a fact about the rest of the fleet, not a guess.
+     With no register file at all, `load_module_types()` is empty, the allow-list is
+     empty, and the whole fleet is PT with nothing typeable — the editor says so instead
+     of failing.
 
-  `UNKNOWN_MEMBRANE_TYPE` survives for exactly one case: a plant **on** the register
-  whose stage cell gives a module count with no PT/ST against it (two cells currently do).
-  There the two genuinely coexist and the sheet declined to say, so it is a question for
-  a human — and the only place the app should be asking one. An earlier build defaulted
-  the whole off-register fleet to unspecified, which buried those two real questions under
-  a hundred fake ones.
+  `UNKNOWN_MEMBRANE_TYPE` survives for exactly one case: an allow-listed stage the
+  workbook counts but never marks PT or ST. There the two genuinely coexist and the sheet
+  declined to say, so it is a question for a human — answered in the editor. An earlier build defaulted the whole off-register fleet to
+  unspecified, which buried the few real questions under a hundred fake ones — **when a
+  default is a fact about the domain (this fleet is PT), use it; "unknown" is for actual
+  questions.**
 
   `modules_by_membrane_type()` breaks whichever verdict the page runs on down by type,
   and `build_membrane_type_detail()` groups by **stage AND type**, because a mixed stage
