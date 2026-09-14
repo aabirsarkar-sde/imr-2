@@ -28,6 +28,7 @@ from sqlalchemy import (
     MetaData,
     Table,
     Text,
+    bindparam,
     create_engine,
     inspect,
     text,
@@ -2911,6 +2912,153 @@ class Issue:
     message: str
 
 
+# The content hash catches a byte-identical file re-uploaded under the SAME name,
+# and nothing else. What actually happens is last month's workbook saved under
+# this month's name, or this month's sheet filled in by copying the previous
+# column down — a well-formed report carrying readings nobody took. So the upload
+# gate compares each plant against what is already stored and warns.
+#
+# A warning, never a blocker: an amended resubmission is indistinguishable from a
+# copy-paste, and only the person holding the workbook can tell them apart.
+
+# Below this many modules with an actual reading, agreement proves nothing — a
+# two-module train can repeat a round number by chance, and a wholly bypassed
+# train repeats every month by definition (a fact about the plant, not laziness).
+REPEAT_MIN_MODULES = 3
+# Real RO readings drift every month; a whole train agreeing to the litre is a
+# copy. The slack is for the operator who pasted and then fixed a module or two.
+REPEAT_MATCH_RATIO = 0.9
+# One line per repeating plant, up to this many — a master sheet that repeats
+# wholesale should say so once, not bury the other quality flags.
+MAX_REPEAT_ISSUES = 10
+
+
+def module_reading_signature(frame: pd.DataFrame) -> dict[tuple[str, str], tuple]:
+    """One plant-month's readings as {(stage, module) -> (flow, conductivity)}.
+    The stage is canonicalized and the module label normalized, so a sheet
+    re-typed from "I STAGE" to "1st Stage" between months does not read as a
+    different set of modules and hide a copy."""
+    signature: dict[tuple[str, str], tuple] = {}
+    for row in frame.itertuples(index=False):
+        module = normalize_text(row.module_label) or normalize_text(row.module_number)
+        flow = pd.to_numeric(row.flow_lph, errors="coerce")
+        conductivity = pd.to_numeric(row.conductivity_us_cm, errors="coerce")
+        signature[(canonical_stage(row.stage) or UNSTAGED_LABEL, module)] = (
+            None if pd.isna(flow) else round(float(flow), 3),
+            None if pd.isna(conductivity) else round(float(conductivity), 3),
+        )
+    return signature
+
+
+def stored_readings_for_plants(
+    engine: Engine, filename: str, frame: pd.DataFrame
+) -> pd.DataFrame:
+    """Every already-committed reading for the plants in `frame`, from OTHER files.
+    Excluding this file's own rows is what lets a report be re-parsed without being
+    found identical to the copy of itself it is about to replace."""
+    sr_nos = sorted(
+        {int(v) for v in pd.to_numeric(frame["plant_sr_no"], errors="coerce").dropna()}
+    )
+    # Only a plant with no SR falls back to its name — the name is not an identity
+    # (two trains share one), so it is a last resort, never a parallel key.
+    names = sorted(
+        {str(v) for v in frame.loc[frame["plant_sr_no"].isna(), "plant"].dropna()}
+    )
+    clauses: list[str] = []
+    binds: list[object] = []
+    params: dict[str, object] = {"f": filename}
+    if sr_nos:
+        clauses.append("plant_sr_no IN :srs")
+        params["srs"] = sr_nos
+        binds.append(bindparam("srs", expanding=True))
+    if names:
+        clauses.append("plant IN :names")
+        params["names"] = names
+        binds.append(bindparam("names", expanding=True))
+    if not clauses:
+        return pd.DataFrame()
+
+    statement = text(
+        "SELECT source_file, plant, plant_sr_no, stage, module_number, module_label, "
+        "report_date, flow_lph, conductivity_us_cm FROM readings "
+        f"WHERE source_file <> :f AND ({' OR '.join(clauses)})"
+    ).bindparams(*binds)
+    with engine.connect() as conn:
+        rows = [dict(row) for row in conn.execute(statement, params).mappings()]
+    return pd.DataFrame(rows)
+
+
+def repeat_submission_issues(
+    engine: Engine, filename: str, readings: pd.DataFrame
+) -> list[Issue]:
+    """One WARN per plant in this report whose readings we already hold.
+
+    Per plant (keyed on `plant_identity_key`, never the display name — a master
+    sheet can be honest for thirty plants and copied for one), the file's latest
+    month is compared against that plant's newest stored report:
+      * same month from another file -> always warned; two copies of one
+        plant-month double-count its modules wherever they are rolled up.
+      * earlier month -> warned only when enough modules were compared and nearly
+        all of them are identical.
+    Only a module that reported a number THIS month is compared: a blank or
+    bypassed module says nothing about whether anyone went and measured."""
+    current = readings.copy()
+    current["report_date"] = pd.to_datetime(current["report_date"], errors="coerce")
+    current = current.dropna(subset=["report_date"])
+    if current.empty:
+        return []
+    current["plant_key"] = plant_identity_key(current).astype(str)
+
+    prior = stored_readings_for_plants(engine, filename, current)
+    if prior.empty:
+        return []
+    prior["report_date"] = pd.to_datetime(prior["report_date"], errors="coerce")
+    prior = prior.dropna(subset=["report_date"])
+    if prior.empty:
+        return []
+    prior["plant_key"] = plant_identity_key(prior).astype(str)
+
+    issues: list[Issue] = []
+    for plant_key, group in current.groupby("plant_key"):
+        month = group["report_date"].max()
+        rows = group[group["report_date"] == month]
+        history = prior[prior["plant_key"] == plant_key]
+        same_month = history[history["report_date"] == month]
+        earlier = history[history["report_date"] < month]
+        if not same_month.empty:
+            code, previous = "duplicate_month", same_month
+        elif not earlier.empty:
+            code = "repeat_month"
+            previous = earlier[earlier["report_date"] == earlier["report_date"].max()]
+        else:
+            continue
+
+        signature = module_reading_signature(rows)
+        before = module_reading_signature(previous)
+        compared = [key for key, value in signature.items() if value != (None, None)]
+        matched = [key for key in compared if before.get(key) == signature[key]]
+        ratio = len(matched) / len(compared) if compared else 0.0
+        if code == "repeat_month" and (
+            len(compared) < REPEAT_MIN_MODULES or ratio < REPEAT_MATCH_RATIO
+        ):
+            continue
+
+        plant = current_plant_name(rows)
+        source = previous["source_file"].dropna()
+        source = str(source.iloc[0]) if not source.empty else "an earlier report"
+        counts = f"{len(matched)} of {len(compared)} module readings identical"
+        if code == "duplicate_month":
+            issues.append(Issue("WARN", code,
+                f"{plant} — {month:%b %Y} was already received in '{source}' "
+                f"({counts}). Committing leaves two copies of one plant-month."))
+        else:
+            issues.append(Issue("WARN", code,
+                f"{plant} — {month:%b %Y} repeats "
+                f"{previous['report_date'].max():%b %Y} ('{source}'): {counts}. "
+                f"Check the plant was actually re-measured."))
+    return issues
+
+
 def looks_like_raw_filename(plant_group: str) -> bool:
     """Heuristic: a plant_group that still looks like an undigested filename
     (underscores, long digit runs, or many tokens) — a sign the date/label split
@@ -2990,6 +3138,16 @@ def validate_parse(engine: Engine, filename: str, result: ParseResult) -> list[I
     if already:
         issues.append(Issue("INFO", "will_replace",
             f"'{filename}' is already in the database — committing replaces it."))
+
+    try:
+        repeats = repeat_submission_issues(engine, filename, readings)
+    except Exception:  # noqa: BLE001 - a missing flag must never cost the report
+        repeats = []
+    issues.extend(repeats[:MAX_REPEAT_ISSUES])
+    if len(repeats) > MAX_REPEAT_ISSUES:
+        issues.append(Issue("WARN", "repeat_more",
+            f"…and {len(repeats) - MAX_REPEAT_ISSUES} more plant(s) in this file "
+            f"repeat a report already in the database."))
 
     return issues
 
