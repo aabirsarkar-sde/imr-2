@@ -969,7 +969,7 @@ def extract_operating_parameters(
                 "value": float(value),
                 "unit": unit,
             }
-
+    #checking something
     return list(found.values())
 
 
