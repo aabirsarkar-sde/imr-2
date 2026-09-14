@@ -44,6 +44,13 @@ runs on Postgres (prod) and SQLite (tests).
 
 1. **Discovery** — `report_paths()` globs `*.xlsx/*.xls/*.csv` from the app directory and
    `uploaded_reports/`, skipping `manual_readings.csv` (legacy) and Excel temp files (`~$`).
+   **Three kinds of workbook live in that directory and only one is a monthly report.**
+   `report_paths()` excludes the other two so they never land as readings: the O&M register
+   (`is_master_om_file`, seeds `plants`) and the ST-module register (`is_st_module_file`,
+   types each stage PT or ST). Their headers are nearly identical — Site Name / Plant Sr No /
+   Installed Capacity — so `is_master_om_list()` explicitly rejects anything carrying the
+   ST register's "Number of Module" columns; without that the ST file reads as the fleet
+   register and could seed the plant table with 13 plants instead of 155.
 
 2. **Metadata** — `parse_report_metadata()` derives `plant_group` + `report_date` from the
    *filename* (month-name + year; date defaults to last day of that month).
@@ -81,7 +88,7 @@ runs on Postgres (prod) and SQLite (tests).
   `ingested_files`). `READINGS_COLUMNS` / `MIS_COLUMNS` derive from the table definitions,
   and the normalizers `reindex(columns=...)` to them — **add a column to the `Table` and it
   flows through automatically.**
-- **Two tables hold facts no workbook can carry**, edited in-app rather than parsed, so
+- **Three tables hold facts no workbook can carry**, edited in-app rather than parsed, so
   ingest never touches them and a re-parse never clears them:
   - `plant_downtime` (plant_sr_no, month "YYYY-MM", not_running, remarks) — a plant that
     wasn't running that month. A plant that didn't run sends nothing, which is
@@ -89,11 +96,25 @@ runs on Postgres (prod) and SQLite (tests).
     from "expected" instead of chasing them. Set on the Tracker; `save_downtime()` is
     scoped to the plants shown, so unticking clears a mark and hidden plants are untouched.
     A plant that DID submit overrides a stale mark.
+  - `module_membrane_types` (plant_key, stage_label, module_label, membrane_type) —
+    whether that module runs a PT or an ST element. No workbook says this per module,
+    and the ST-module register only says it per stage. See the membrane-type bullet
+    under Key conventions.
   - `bypass_notes` (plant_key, stage_label, module_label, month, reason, remarks) — WHO
     bypassed a module. The sheet only ever says "BY PASS"; `BYPASS_REASON_OPTIONS` is
     ROCHEM vs Client, and blank ("Not recorded") is a real state, never defaulted.
     `attach_bypass_notes()` joins them onto the fleet-status frame in the Portfolio;
     clearing both fields deletes the note.
+- **Schema work runs once per process, keyed on the schema itself.** `main()` calls
+  `bootstrap_schema(url, schema_fingerprint())` (a `@st.cache_resource`), not `init_db()`
+  directly — that block is ~30 statements and Streamlit re-runs the whole script on every
+  click, which against a remote Postgres is seconds of latency per widget. **The
+  fingerprint is not optional**: Streamlit hot-reloads the script on file change WITHOUT
+  restarting the process, so a cache keyed only on the URL survives a code change — add a
+  table and `create_all()` never runs again until someone restarts, leaving the app
+  querying a relation that doesn't exist. Hashing every table and column on `DB_METADATA`
+  into the key makes a schema change bust it by itself. `ingest_reports` deliberately
+  stays outside: it has to see files that arrive after boot.
 - **`init_db()` calls `create_all()`, which creates MISSING tables but does NOT ALTER
   existing ones.** So adding a column to an existing table needs a one-time migration
   against the live DB. The established pattern (used for `status`, `plant_sr_no`, `n_mis`):
@@ -189,6 +210,40 @@ mislabels their Plant SR No. `readings` and `parameters` both carry `plant_sr_no
   membranes to ROCHEM is the one error the split exists to prevent. Both pages also carry a
   **Clients** filter that narrows the page exactly like the zone filter (applied before the
   stage buttons, so every figure moves together).
+- **The fleet runs PT; ST is an exception at a dozen named sites.** The ST-module
+  register workbook ("ST Module Details … .xlsx") IS that list — `st_register_plant_srs()`
+  reads it — and a plant not on it has no ST modules, full stop. `attach_membrane_type()`
+  answers each module in a fixed order, recording which source answered in
+  `membrane_type_source`:
+  1. `module_membrane_types` — what somebody picked in-app, per (plant_key, stage_label,
+     module_label). **This is the grain that matters** at an ST site: the train mixes the
+     two, and a stage re-membraned in halves mixes them inside one stage, so neither a
+     plant-level nor a stage-level answer is always right. Edited on **Plant Register →
+     ST module exceptions** (`render_module_type_editor`), which is **scoped to the
+     register's plants** — offering the whole fleet would ask ~140 questions that have
+     no answer. Whole-stage shortcuts write straight through (a 60-module stage is not
+     going to be clicked 60 times); the table handles exceptions inside a stage. No month
+     column: a module keeps its type until someone changes it.
+  2. That register's type for the stage, where it marks one.
+  3. `DEFAULT_MEMBRANE_TYPE` (PT) — a fact about the rest of the fleet, not a guess.
+
+  `UNKNOWN_MEMBRANE_TYPE` survives for exactly one case: a plant **on** the register
+  whose stage cell gives a module count with no PT/ST against it (two cells currently do).
+  There the two genuinely coexist and the sheet declined to say, so it is a question for
+  a human — and the only place the app should be asking one. An earlier build defaulted
+  the whole off-register fleet to unspecified, which buried those two real questions under
+  a hundred fake ones.
+
+  `modules_by_membrane_type()` breaks whichever verdict the page runs on down by type,
+  and `build_membrane_type_detail()` groups by **stage AND type**, because a mixed stage
+  must not collapse into one line item. `build_mixed_plant_table()` is the exception
+  view: which trains run both, and which plants still have untyped modules.
+  The register's own Total column is parsed but **never used as a count** (it disagrees
+  with its stage cells for at least one plant); `membrane_register_issues()` surfaces
+  that, its typeless cells, and any drift between its module counts and the IMRs.
+  An earlier version asked a human to type two quantities per plant per month — removed
+  as unsustainable. The lesson is not "derive everything": it is that input should be a
+  standing fact somebody sets once (a module's type), not a number re-entered monthly.
 - **Every other page reads one month; Module History reads a window.**
   `module_history_frame()` takes the last N months **that plant actually reported**
   (not calendar months, so a skipped IMR doesn't shorten the comparison) and
@@ -211,5 +266,9 @@ No test suite, and no sample workbooks are committed (they get auto-ingested int
 they're kept out of the repo). For data/extraction/schema changes, drop a real IMR workbook
 somewhere temporary, then write a throwaway script that builds a **SQLite** engine, ingests
 that file via `ingest_reports()`, and asserts on the result — then delete the script (don't
-commit it). This exercises the real ingest pipeline without touching production. Boot the app
-(`DATABASE_URL=sqlite:////tmp/x.db streamlit run app.py`) to confirm pages render (HTTP 200).
+commit it). This exercises the real ingest pipeline without touching production. **Rendering is verified with `AppTest`**
+(`streamlit.testing.v1`), driving each page function directly — `AppTest.from_function`
+needs real source lines, so write the check to a file rather than piping it to stdin.
+Booting the app and curling its routes proves only that the server is up: Streamlit is an
+SPA, every route serves the same shell, and the script does not execute until a browser
+opens a websocket, so an HTTP 200 says nothing about whether a page renders.

@@ -462,6 +462,31 @@ def is_master_om_file(path: Path) -> bool:
     return is_master_om_list(head)
 
 
+def is_st_module_file(path: Path) -> bool:
+    """True if `path` is the ST-module register (which stage of which plant runs
+    PT modules and which runs ST). Like is_master_om_file, reads only the top rows."""
+    if path.suffix.lower() not in (".xlsx", ".xls"):
+        return False
+    try:
+        head = pd.read_excel(path, sheet_name=0, header=None, nrows=8)
+    except Exception:  # noqa: BLE001
+        return False
+    return is_st_module_list(head)
+
+
+def st_module_paths(root: Path) -> list[Path]:
+    """The ST-module register file(s) on disk."""
+    found: list[Path] = []
+    for source_root in (root, root / UPLOAD_DIR_NAME):
+        if not source_root.exists():
+            continue
+        for pattern in REPORT_GLOBS:
+            for path in source_root.glob(pattern):
+                if not path.name.startswith("~$") and is_st_module_file(path):
+                    found.append(path)
+    return sorted(found)
+
+
 def report_paths(root: Path) -> list[Path]:
     source_roots = [root, root / UPLOAD_DIR_NAME]
     paths: list[Path] = []
@@ -476,9 +501,13 @@ def report_paths(root: Path) -> list[Path]:
             if path.name != MANUAL_DATA_FILE and not path.name.startswith("~$")
         )
 
-    # The O&M register is not a monthly report — it seeds the editable `plants`
-    # table (seed_plants_if_empty), so keep it out of the readings/mis ingest.
-    return sorted(p for p in paths if not is_master_om_file(p))
+    # Neither register is a monthly report: the O&M list seeds the editable
+    # `plants` table (seed_plants_if_empty) and the ST-module list says which
+    # stages run PT and which run ST (load_module_types). Both would otherwise be
+    # parsed as IMR workbooks and land as junk rows in readings/mis.
+    return sorted(
+        p for p in paths if not is_master_om_file(p) and not is_st_module_file(p)
+    )
 
 
 def master_om_paths(root: Path) -> list[Path]:
@@ -1017,7 +1046,118 @@ def find_master_om_header_row(raw: pd.DataFrame) -> int | None:
 
 
 def is_master_om_list(raw: pd.DataFrame) -> bool:
-    return find_master_om_header_row(raw) is not None
+    # The ST module register carries the same Site Name / Plant Sr No / Installed
+    # Capacity header, so it would read as an O&M list; its "Number of Module"
+    # columns are what tell the two apart. Screened here because being mistaken
+    # for the fleet register would let it seed the plant table with 13 plants.
+    return find_master_om_header_row(raw) is not None and not is_st_module_list(raw)
+
+
+def find_st_module_header_row(raw: pd.DataFrame) -> int | None:
+    """Row index of the ST-module register header (Site Name / Plant Sr No /
+    Number of Module). The per-stage module counts are what distinguish it from
+    the O&M register, whose header is otherwise identical."""
+    for row_index in range(min(len(raw), 8)):
+        joined = " ".join(normalize_text(v) for v in raw.iloc[row_index].tolist())
+        if "plant sr no" in joined and "number of module" in joined:
+            return row_index
+    return None
+
+
+def is_st_module_list(raw: pd.DataFrame) -> bool:
+    return find_st_module_header_row(raw) is not None
+
+
+# "4 ST", "16PT", or a bare "60" — a count, and the membrane type when the sheet
+# states one.
+_ST_MODULE_CELL = re.compile(r"(\d+(?:\.\d+)?)\s*([A-Za-z]*)")
+
+
+def parse_st_module_cell(value: object) -> tuple[int, str | None] | None:
+    """One stage cell of the ST register as (module count, membrane type).
+
+    The type is None when the cell states a count but no type — that is a real
+    state (two cells in the current file do it), and guessing PT or ST there is
+    exactly the error that would put the wrong membranes on a purchase order."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    text_value = re.sub(r"\s+", " ", str(value)).strip()
+    if not text_value:
+        return None
+    match = _ST_MODULE_CELL.search(text_value)
+    if match is None:
+        return None
+    kind = match.group(2).upper()
+    return int(float(match.group(1))), kind if kind in MEMBRANE_TYPE_OPTIONS else None
+
+
+def extract_st_module_rows(raw: pd.DataFrame, *, source_file: str) -> list[dict[str, object]]:
+    """Parse the ST-module register into one row per (plant, stage).
+
+    Layout: a header row (Sr.No / Site Name / Plant Sr. No. / Installed Capacity /
+    "Number of Module" spanning the stage columns), then a sub-header row naming
+    the stages ("1st", "2nd", "3rd", "4th", "Total"), then one row per plant whose
+    stage cells read like "4 ST" or "12 PT".
+
+    The declared Total is carried through but never used as the module count — the
+    two disagree for at least one plant in the current file, and the per-stage
+    cells are the ones a requirement is actually split on."""
+    header_row = find_st_module_header_row(raw)
+    if header_row is None or header_row + 1 >= len(raw):
+        return []
+
+    header_cells = raw.iloc[header_row].tolist()
+    mapping = map_mis_columns(header_cells)
+    site_col = mapping.get("site_name")
+    sr_col = mapping.get("plant_sr_no")
+    if sr_col is None:
+        return []
+
+    # The stage columns are named on the row BELOW the header, under the merged
+    # "Number of Module" banner.
+    stage_cols: dict[int, str] = {}
+    total_col: int | None = None
+    for col_index, cell in enumerate(raw.iloc[header_row + 1].tolist()):
+        label = normalize_text(cell)
+        if not label:
+            continue
+        if label == "total":
+            total_col = col_index
+            continue
+        stage_key = canonical_stage(label)
+        if stage_key is not None:
+            stage_cols[col_index] = stage_key
+    if not stage_cols:
+        return []
+
+    records: list[dict[str, object]] = []
+    for row_index in range(header_row + 2, len(raw)):
+        plant_sr_no = pd.to_numeric(value_at(raw, row_index, sr_col), errors="coerce")
+        if pd.isna(plant_sr_no):
+            continue
+        site = value_at(raw, row_index, site_col) if site_col is not None else None
+        site_text = None if pd.isna(site) else (str(site).strip() or None)
+        declared = (
+            pd.to_numeric(value_at(raw, row_index, total_col), errors="coerce")
+            if total_col is not None else np.nan
+        )
+        for col_index, stage_key in stage_cols.items():
+            parsed = parse_st_module_cell(value_at(raw, row_index, col_index))
+            if parsed is None:
+                continue
+            modules, membrane_type = parsed
+            records.append(
+                {
+                    "plant_sr_no": int(plant_sr_no),
+                    "site_name": site_text,
+                    "stage_key": stage_key,
+                    "membrane_type": membrane_type,
+                    "modules": modules,
+                    "declared_total": None if pd.isna(declared) else int(declared),
+                    "source_file": source_file,
+                }
+            )
+    return records
 
 
 def extract_master_om_rows(
@@ -1334,6 +1474,25 @@ BYPASS_NOTES_TABLE = Table(
     Column("updated_at", DateTime),
 )
 
+# Which membrane type each MODULE runs, picked in-app. The ST-module register
+# types a whole stage at a time, which is the common case but not the true one: a
+# train mixes PT and ST, and a stage that was re-membraned in halves mixes them
+# inside one stage. The type is a property of the element sitting in the module,
+# so that is the grain it is recorded at — keyed like bypass_notes, on plant_key
+# (the SR) and the labels the sheet uses. No month: a module keeps its type until
+# somebody changes it, unlike a bypass, which is true of one month only.
+MODULE_TYPES_TABLE = Table(
+    "module_membrane_types",
+    DB_METADATA,
+    Column("plant_key", Text, primary_key=True),
+    Column("stage_label", Text, primary_key=True),
+    Column("module_label", Text, primary_key=True),
+    Column("membrane_type", Text),  # MEMBRANE_TYPE_OPTIONS
+    Column("plant_sr_no", Integer),
+    Column("plant", Text),
+    Column("updated_at", DateTime),
+)
+
 # The per-stage absolute conductivity limit above which a module is a replacement
 # candidate outright, regardless of how its peers are doing. Editable in-app (the
 # Dashboard page), so it is stored rather than hard-coded; DEFAULT_STAGE_LIMITS
@@ -1352,6 +1511,8 @@ PLANTS_COLUMNS = [c.name for c in PLANTS_TABLE.columns]
 DOWNTIME_COLUMNS = [c.name for c in PLANT_DOWNTIME_TABLE.columns]
 BYPASS_NOTE_COLUMNS = [c.name for c in BYPASS_NOTES_TABLE.columns]
 BYPASS_NOTE_KEY = ["plant_key", "stage_label", "module_label", "month"]
+MODULE_TYPE_COLUMNS = [c.name for c in MODULE_TYPES_TABLE.columns]
+MODULE_TYPE_KEY = ["plant_key", "stage_label", "module_label"]
 
 
 def database_url() -> str | None:
@@ -1380,22 +1541,38 @@ def get_engine() -> Engine | None:
     return create_engine(url, pool_pre_ping=True)
 
 
+def schema_fingerprint() -> str:
+    """A short hash of the schema as the CODE defines it — every table and column
+    on DB_METADATA.
+
+    This is what makes caching the bootstrap safe. Streamlit re-executes the
+    script on file change WITHOUT restarting the process, so a `cache_resource`
+    keyed only on the connection URL survives a code change: add a table, and
+    `create_all()` never runs again until someone restarts the process, leaving
+    the app querying a relation that does not exist. Folding the schema into the
+    key means adding a table or a column busts the cache by itself, while an
+    ordinary rerun — where nothing about the schema moved — still costs nothing."""
+    shape = "|".join(
+        f"{table.name}:{','.join(column.name for column in table.columns)}"
+        for table in DB_METADATA.sorted_tables
+    )
+    return hashlib.sha256(shape.encode("utf-8")).hexdigest()[:16]
+
+
 @st.cache_resource(show_spinner="Preparing the database...")
-def bootstrap_schema(url: str) -> bool:
-    """Create and migrate the schema ONCE per process, not once per rerun.
+def bootstrap_schema(url: str, schema: str) -> bool:
+    """Create and migrate the schema once per (process, connection, schema shape).
 
-    Streamlit re-executes the whole script on every click, and `init_db()` +
-    `seed_plants_if_empty()` are ~30 statements — table reflection for every
-    table, a column diff for the migrated ones, and the status back-fills — each
-    one a network round trip to a remote Postgres (plus a `pool_pre_ping`
-    SELECT 1 per connection checkout). Paid per interaction that is seconds of
-    latency on every widget; paid per process it is nothing.
+    `init_db()` + `seed_plants_if_empty()` are ~30 statements — table reflection
+    for every table, a column diff for the migrated ones, the status back-fills —
+    and against a remote Postgres each is a network round trip (plus a
+    `pool_pre_ping` SELECT 1 per connection checkout). Paid on every rerun, which
+    is every click, that is seconds of latency on each widget; paid once, nothing.
 
-    Schema work is exactly what may be cached this way: it is idempotent, and it
-    cannot come out differently on the second run of the same process. Keyed on
-    the connection URL, so pointing the app at another database re-runs it, and a
-    new deploy (a new process) re-runs it too. Data-level work — `ingest_reports`
-    — deliberately stays out of here: it has to see files that arrive later."""
+    Keyed on the connection URL so pointing at another database re-runs it, and on
+    `schema` (see `schema_fingerprint`) so changing the schema re-runs it too.
+    Data-level work — `ingest_reports` — deliberately stays out: it has to see
+    files that arrive later."""
     engine = get_engine()
     if engine is None:
         return False
@@ -2059,6 +2236,39 @@ def canonical_client(client: object) -> str | None:
     return _CLIENT_BY_KEY.get(key) or _CLIENT_ALIASES.get(key)
 
 
+# The two membrane types a train runs. Which one a given stage of a given plant
+# uses is not in any IMR — it comes from the ST-module register
+# (`load_module_types()`), and a stage the register doesn't cover is reported as
+# UNKNOWN_MEMBRANE_TYPE rather than assumed: ordering PT elements for an ST stage
+# is precisely the mistake this split exists to prevent.
+MEMBRANE_TYPE_OPTIONS = ["PT", "ST"]
+# The fleet runs PT. ST is the exception — the ST-module register is the list of
+# the sites that have any, a dozen out of ~155 — so a module is PT unless
+# something says otherwise, and only a plant ON that list can hold ST modules at
+# all. UNKNOWN is kept for one narrow case: a register cell that gives a module
+# count with no PT/ST marking, at a site that definitely has both. That is a real
+# question for a human; the rest of the fleet was never a question.
+DEFAULT_MEMBRANE_TYPE = "PT"
+UNKNOWN_MEMBRANE_TYPE = "Not specified"
+# Where a module's type came from, shown next to it so a pick is never confused
+# with a default: the answer changes what you would do about it.
+TYPE_SOURCE_MODULE = "Set here"
+TYPE_SOURCE_REGISTER = "From ST register"
+TYPE_SOURCE_DEFAULT = "Fleet default (PT)"
+TYPE_SOURCE_NONE = "—"
+
+
+def canonical_membrane_type(value: object) -> str | None:
+    """Map a raw value to PT or ST, or None for a blank or unrecognized one.
+
+    None is a real state — "nobody has said" — and is never resolved to either
+    type, here or anywhere downstream."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    key = re.sub(r"[^A-Za-z]", "", str(value)).upper()
+    return key if key in MEMBRANE_TYPE_OPTIONS else None
+
+
 # Who took a bypassed module offline. Blank means nobody has said yet — that is a
 # real state (the sheet arrives with the bypass but no explanation), so it is left
 # blank rather than defaulted to either party.
@@ -2441,6 +2651,71 @@ def save_bypass_notes(engine: Engine, edited: pd.DataFrame) -> int:
             )
         if not kept.empty:
             kept.to_sql("bypass_notes", conn, if_exists="append", index=False,
+                        method="multi", chunksize=500)
+    return len(kept)
+
+
+@st.cache_data(show_spinner="Loading module membrane types...")
+def load_module_membrane_types() -> pd.DataFrame:
+    """Every module whose membrane type somebody has picked in-app.
+
+    One row per (plant, stage, module). A module with no row has not been typed
+    here — the stage register may still have something to say about it, and if it
+    doesn't, the module is reported as unspecified rather than guessed."""
+    engine = get_engine()
+    if engine is None:
+        return pd.DataFrame(columns=MODULE_TYPE_COLUMNS)
+    df = pd.read_sql("SELECT * FROM module_membrane_types", engine)
+    if df.empty:
+        return pd.DataFrame(columns=MODULE_TYPE_COLUMNS)
+    for col in MODULE_TYPE_KEY:
+        df[col] = df[col].fillna("").astype(str).str.strip()
+    df["membrane_type"] = df["membrane_type"].map(canonical_membrane_type)
+    df = df[(df[MODULE_TYPE_KEY] != "").all(axis=1) & df["membrane_type"].notna()]
+    # The key is the table's PK, but a hand-edited row could still double up and a
+    # duplicated index would break the lookup join.
+    df = df.drop_duplicates(MODULE_TYPE_KEY, keep="last")
+    return df.reindex(columns=MODULE_TYPE_COLUMNS).reset_index(drop=True)
+
+
+def save_module_membrane_types(engine: Engine, edited: pd.DataFrame) -> int:
+    """Persist the membrane type for the modules that were on screen.
+
+    Every shown module's stored row is replaced, so clearing a module's type
+    deletes its row and puts it back on whatever the stage register says — the
+    editor is how you both set an exception and take one back. Modules the editor
+    didn't show are untouched. Returns the number of picks kept."""
+    clean = edited.copy()
+    for col in MODULE_TYPE_KEY:
+        if col not in clean:
+            return 0
+        clean[col] = clean[col].fillna("").astype(str).str.strip()
+    clean = clean[(clean[MODULE_TYPE_KEY] != "").all(axis=1)]
+    if clean.empty:
+        return 0
+    clean = clean.drop_duplicates(MODULE_TYPE_KEY, keep="last")
+    clean["membrane_type"] = (
+        clean["membrane_type"].map(canonical_membrane_type)
+        if "membrane_type" in clean else None
+    )
+    clean["plant_sr_no"] = (
+        pd.to_numeric(clean["plant_sr_no"], errors="coerce").astype("Int64")
+        if "plant_sr_no" in clean else pd.NA
+    )
+    clean["updated_at"] = datetime.now(timezone.utc)
+    kept = clean[clean["membrane_type"].notna()].reindex(columns=MODULE_TYPE_COLUMNS)
+
+    with engine.begin() as conn:
+        for _, row in clean.iterrows():
+            conn.execute(
+                text(
+                    "DELETE FROM module_membrane_types WHERE plant_key = :p "
+                    "AND stage_label = :s AND module_label = :m"
+                ),
+                {"p": row["plant_key"], "s": row["stage_label"], "m": row["module_label"]},
+            )
+        if not kept.empty:
+            kept.to_sql("module_membrane_types", conn, if_exists="append", index=False,
                         method="multi", chunksize=500)
     return len(kept)
 
@@ -2834,6 +3109,37 @@ def load_plants() -> pd.DataFrame:
         # Same for the client column — blank reads as the default (ROCHEM).
         df["client"] = df["client"].map(lambda v: canonical_client(v) or DEFAULT_CLIENT)
     return df.sort_values(["zone", "plant_sr_no"], na_position="last").reset_index(drop=True)
+
+
+@st.cache_data(show_spinner="Loading the ST/PT module register...")
+def load_module_types() -> pd.DataFrame:
+    """Which membrane type each stage of each plant runs, from the ST-module
+    register on disk.
+
+    Read straight from the workbook rather than ingested into a table: it is a
+    reference register of a dozen sites that changes when someone ships a new
+    file, not monthly data, and it ships with the deployment. Cached per process,
+    so the parse happens once per boot like every other `load_*()`.
+
+    Returns one row per (plant, stage). Plants and stages the file doesn't mention
+    are simply absent — callers report them as UNKNOWN_MEMBRANE_TYPE."""
+    columns = [
+        "plant_sr_no", "site_name", "stage_key", "membrane_type", "modules",
+        "declared_total", "source_file",
+    ]
+    records: list[dict[str, object]] = []
+    for path in st_module_paths(APP_DIR):
+        try:
+            raw = pd.read_excel(path, sheet_name=0, header=None)
+        except Exception:  # noqa: BLE001 - a malformed register must not break the app
+            continue
+        records.extend(extract_st_module_rows(raw, source_file=path.name))
+    if not records:
+        return pd.DataFrame(columns=columns)
+    frame = pd.DataFrame(records, columns=columns)
+    # Last file wins if two registers name the same plant-stage.
+    frame = frame.drop_duplicates(["plant_sr_no", "stage_key"], keep="last")
+    return frame.reset_index(drop=True)
 
 
 # Far-future sentinel (pandas max is 2262-04-11): register rows are stamped with
@@ -4582,6 +4888,321 @@ def render_client_requirement(frame: pd.DataFrame, flag_column: str = "need") ->
             )
 
 
+def build_membrane_type_by_key(types: pd.DataFrame) -> dict[tuple[int, str], str]:
+    """(plant_sr_no, stage_key) -> membrane type, from the ST-module register.
+
+    Keyed per STAGE, not per plant: a train mixes the two — 3337 runs ST in its
+    first two stages and PT in its third — so a plant-level answer would be wrong
+    for most of the fleet."""
+    if types is None or types.empty:
+        return {}
+    lookup: dict[tuple[int, str], str] = {}
+    for sr, stage_key, kind in zip(
+        types["plant_sr_no"], types["stage_key"], types["membrane_type"]
+    ):
+        if pd.isna(sr) or not stage_key:
+            continue
+        lookup[(int(sr), str(stage_key))] = (
+            str(kind) if kind in MEMBRANE_TYPE_OPTIONS else UNKNOWN_MEMBRANE_TYPE
+        )
+    return lookup
+
+
+def attach_membrane_type(
+    rows: pd.DataFrame,
+    types: pd.DataFrame | None = None,
+    picks: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Add `membrane_type` and `membrane_type_source` to fleet-status rows.
+
+    Resolved per MODULE, in this order:
+
+    1. **What somebody picked in-app** for that exact module (`picks`, the
+       `module_membrane_types` table). A train mixes the two and a half-replaced
+       stage mixes them within one stage, so the module is the only grain that can
+       always be right — and a human is the only source that knows.
+    2. **The stage's type in the ST-module register** (`types`), as a starting
+       point so the whole fleet doesn't have to be typed by hand before the split
+       says anything useful.
+    3. `DEFAULT_MEMBRANE_TYPE` (PT) — what the rest of the fleet runs. Only a plant
+       on the ST register has ST modules at all, so for everyone else PT is a fact,
+       not a guess.
+
+    The one exception to (3): a plant that IS on the register whose stage cell
+    gives a count with no PT/ST marking is `UNKNOWN_MEMBRANE_TYPE`. There, the two
+    types genuinely coexist and the sheet declined to say which — a question for a
+    human, and the only thing the editor should be asking about.
+
+    `membrane_type_source` carries which answered, because a pick, a register entry
+    and a fleet default are different things to the person reading the number."""
+    out = rows.copy()
+    if out.empty:
+        out["membrane_type"] = pd.Series(dtype=object)
+        out["membrane_type_source"] = pd.Series(dtype=object)
+        return out
+
+    stage_lookup = build_membrane_type_by_key(types)
+    module_lookup = build_module_type_lookup(picks)
+    resolved: list[str] = []
+    sources: list[str] = []
+    for plant_key, sr, stage_label, stage_key, module_label in zip(
+        out["plant_key"], out["plant_sr_no"], out["stage_label"],
+        out["stage_key"], out["module_label"],
+    ):
+        pick = module_lookup.get(
+            (str(plant_key), str(stage_label), str(module_label))
+        )
+        if pick:
+            resolved.append(pick)
+            sources.append(TYPE_SOURCE_MODULE)
+            continue
+        from_register = (
+            stage_lookup.get((int(sr), str(stage_key))) if pd.notna(sr) else None
+        )
+        if from_register in MEMBRANE_TYPE_OPTIONS:
+            resolved.append(str(from_register))
+            sources.append(TYPE_SOURCE_REGISTER)
+            continue
+        if from_register == UNKNOWN_MEMBRANE_TYPE:
+            # On the ST list, but this stage's cell states a count and no type.
+            resolved.append(UNKNOWN_MEMBRANE_TYPE)
+            sources.append(TYPE_SOURCE_NONE)
+            continue
+        resolved.append(DEFAULT_MEMBRANE_TYPE)
+        sources.append(TYPE_SOURCE_DEFAULT)
+    out["membrane_type"] = resolved
+    out["membrane_type_source"] = sources
+    return out
+
+
+def build_module_type_lookup(picks: pd.DataFrame | None) -> dict[tuple[str, str, str], str]:
+    """(plant_key, stage_label, module_label) -> the type picked in-app."""
+    if picks is None or picks.empty:
+        return {}
+    return {
+        (str(row.plant_key), str(row.stage_label), str(row.module_label)):
+            str(row.membrane_type)
+        for row in picks.itertuples()
+        if row.membrane_type in MEMBRANE_TYPE_OPTIONS
+    }
+
+
+def membrane_types_present(frame: pd.DataFrame) -> list[str]:
+    """The types a split reports: PT and ST always, then whatever else the rows
+    carry (stages the register doesn't cover), so the figures add up to the total."""
+    if frame is None or frame.empty or "membrane_type" not in frame:
+        return list(MEMBRANE_TYPE_OPTIONS)
+    extra = sorted(
+        t for t in frame["membrane_type"].dropna().astype(str).unique()
+        if t not in MEMBRANE_TYPE_OPTIONS
+    )
+    return list(MEMBRANE_TYPE_OPTIONS) + extra
+
+
+def modules_by_membrane_type(
+    frame: pd.DataFrame, flag_column: str = "need", types: list[str] | None = None
+) -> dict[str, int]:
+    """membrane type -> flagged modules in `frame`, on whichever verdict the page
+    runs ("need" on the Portfolio, "replace" on the limit page)."""
+    keys = types if types is not None else membrane_types_present(frame)
+    counts = {kind: 0 for kind in keys}
+    if (
+        frame is None or frame.empty
+        or "membrane_type" not in frame or flag_column not in frame
+    ):
+        return counts
+    flagged = frame[frame[flag_column].fillna(False).astype(bool)]
+    for kind, modules in flagged.groupby("membrane_type").size().items():
+        counts[str(kind)] = counts.get(str(kind), 0) + int(modules)
+    return counts
+
+
+def build_membrane_type_detail(
+    frame: pd.DataFrame, flag_column: str = "need"
+) -> pd.DataFrame:
+    """One row per (plant, stage) with something to replace, and the type it takes.
+
+    This is the line-item view of the split — what a purchase order is written
+    from, since a plant orders per stage, not per fleet total."""
+    columns = ["Plant", "Plant No", "Stage", "Type", "Modules", "Membranes"]
+    if frame is None or frame.empty or flag_column not in frame:
+        return pd.DataFrame(columns=columns)
+    flagged = frame[frame[flag_column].fillna(False).astype(bool)]
+    if flagged.empty:
+        return pd.DataFrame(columns=columns)
+    # Grouped by TYPE as well as stage: now that the type is picked per module, a
+    # single stage can legitimately hold both, and collapsing it to one row would
+    # put half the order under the wrong element.
+    grouped = (
+        flagged.groupby(["plant_key", "stage_key", "membrane_type"], dropna=False)
+        .agg(
+            plant=("plant", "last"),
+            plant_sr_no=("plant_sr_no", "first"),
+            modules=("plant_key", "size"),
+        )
+        .reset_index()
+    )
+    grouped["stage_rank"] = grouped["stage_key"].map(
+        lambda k: STAGE_ORDER.index(k) if k in STAGE_ORDER else len(STAGE_ORDER)
+    )
+    grouped = grouped.sort_values(["modules", "plant", "stage_rank"], ascending=[False, True, True])
+    return pd.DataFrame(
+        {
+            "Plant": grouped["plant"],
+            "Plant No": plant_no_column(grouped["plant_sr_no"]),
+            "Stage": grouped["stage_key"].map(stage_display),
+            "Type": grouped["membrane_type"],
+            "Modules": grouped["modules"].astype(int),
+            "Membranes": grouped["modules"].astype(int) * MEMBRANES_PER_MODULE,
+        }
+    ).reset_index(drop=True)
+
+
+def membrane_register_issues(frame: pd.DataFrame, types: pd.DataFrame) -> list[str]:
+    """Where the ST register and the IMRs disagree, as lines for the reader.
+
+    Reported rather than silently reconciled: every one of these is a question for
+    whoever maintains the register, and guessing an answer here would put the
+    wrong membrane type on an order."""
+    issues: list[str] = []
+    if types is None or types.empty:
+        return ["No ST-module register was found, so no stage can be typed."]
+
+    # 1. A row whose stage cells don't add up to the Total the sheet declares.
+    for sr, rows in types.groupby("plant_sr_no"):
+        declared = rows["declared_total"].dropna()
+        if declared.empty:
+            continue
+        stated = int(declared.iloc[0])
+        summed = int(rows["modules"].sum())
+        if stated != summed:
+            issues.append(
+                f"**{rows['site_name'].iloc[0]} ({int(sr)})** — the register's stage "
+                f"cells add to {summed} modules but its Total column says {stated}. "
+                "The stage cells are what the split uses."
+            )
+
+    # 2. A stage that states a count but no type.
+    typeless = types[types["membrane_type"].isna()]
+    for row in typeless.itertuples():
+        issues.append(
+            f"**{row.site_name} ({int(row.plant_sr_no)})** — {stage_display(row.stage_key)} "
+            f"gives {int(row.modules)} modules with no PT/ST marking, so its membranes "
+            f"are counted as \"{UNKNOWN_MEMBRANE_TYPE}\"."
+        )
+
+    # 3. The register's module count for a stage vs what the IMR actually reports —
+    #    a drift that means the register is stale (or the sheet gained a stage).
+    if frame is not None and not frame.empty:
+        seen = (
+            frame.dropna(subset=["plant_sr_no"])
+            .groupby([frame["plant_sr_no"].astype("Int64"), "stage_key"])
+            .size()
+        )
+        lookup = {
+            (int(row.plant_sr_no), str(row.stage_key)): (int(row.modules), row.site_name)
+            for row in types.itertuples()
+        }
+        for (sr, stage_key), actual in seen.items():
+            entry = lookup.get((int(sr), str(stage_key)))
+            if entry is None:
+                continue
+            registered, site = entry
+            if registered != int(actual):
+                issues.append(
+                    f"**{site} ({int(sr)})** — the register lists {registered} modules in "
+                    f"{stage_display(stage_key)}, this month's IMR reports {int(actual)}."
+                )
+    return issues
+
+
+def render_membrane_type_requirement(
+    frame: pd.DataFrame, flag_column: str = "need", *, key: str = "portfolio"
+) -> None:
+    """The requirement split by membrane type — how many PT elements and how many
+    ST, derived from the ST-module register rather than typed in.
+
+    An earlier version of this asked someone to key the two quantities in per
+    plant per month, which is not a thing anyone can keep up. The register answers
+    it once per stage and the arithmetic follows the modules."""
+    types = load_module_types()
+    kinds = membrane_types_present(frame)
+    counts = modules_by_membrane_type(frame, flag_column, kinds)
+    plants_hit = {
+        kind: int(
+            frame.loc[
+                (frame["membrane_type"] == kind)
+                & frame[flag_column].fillna(False).astype(bool),
+                "plant_key",
+            ].nunique()
+        )
+        if not frame.empty and "membrane_type" in frame else 0
+        for kind in kinds
+    }
+    cards = st.columns(len(kinds))
+    for column, kind in zip(cards, kinds):
+        modules = counts.get(kind, 0)
+        known = kind in MEMBRANE_TYPE_OPTIONS
+        with column:
+            metric_card(
+                f"{kind} membranes" if known else kind,
+                f"{modules * MEMBRANES_PER_MODULE:,}",
+                f"{modules:,} module(s) · {plants_hit.get(kind, 0):,} plant(s)",
+                ("#2563eb" if kind == "PT" else "#7c3aed") if known and modules
+                else ("#b45309" if not known and modules else "#0f172a"),
+            )
+
+    # Where each module's answer came from — a pick is settled, a stage default is
+    # still waiting to be confirmed, and the reader should be able to tell.
+    flagged = (
+        frame[frame[flag_column].fillna(False).astype(bool)]
+        if not frame.empty and flag_column in frame else frame.head(0)
+    )
+    total_modules = len(flagged)
+    sources = (
+        flagged["membrane_type_source"].value_counts()
+        if total_modules and "membrane_type_source" in flagged else pd.Series(dtype=int)
+    )
+    picked = int(sources.get(TYPE_SOURCE_MODULE, 0))
+    defaulted = int(sources.get(TYPE_SOURCE_REGISTER, 0))
+    fleet_default = int(sources.get(TYPE_SOURCE_DEFAULT, 0))
+    unknown = total_modules - picked - defaulted - fleet_default
+    st.caption(
+        f"**PT is the fleet default**; ST comes only from the sites on the ST-module "
+        f"register. Of the modules above, **{fleet_default:,}** are PT by default, "
+        f"**{defaulted:,}** typed by that register, **{picked:,}** picked by hand"
+        + (
+            f", and **{unknown:,}** sit in a stage the register counts but never marks "
+            "PT or ST — the only modules left unspecified. Mark them under "
+            "**Plant Register → ST module exceptions**."
+            if unknown else
+            ". Adjust any of them under **Plant Register → ST module exceptions**."
+        )
+    )
+
+    detail = build_membrane_type_detail(frame, flag_column)
+    issues = membrane_register_issues(frame, types)
+    with st.expander(
+        f"PT / ST line items — {len(detail):,} plant-stage(s)"
+        + (f" · {len(issues):,} register note(s)" if issues else "")
+    ):
+        if detail.empty:
+            st.info("Nothing to replace in the current selection.")
+        else:
+            st.dataframe(detail, width="stretch", hide_index=True)
+            st.download_button(
+                "Download PT/ST requirement (CSV)",
+                detail.to_csv(index=False).encode("utf-8"),
+                file_name="pt_st_membrane_requirement.csv",
+                mime="text/csv",
+                key=f"{key}_membrane_type_csv",
+            )
+        if issues:
+            st.markdown("**Register notes**")
+            for line in issues:
+                st.markdown(f"- {line}")
+
+
 def build_stage_requirement(snapshot: pd.DataFrame) -> pd.DataFrame:
     """Modules and membranes to replace, one row per stage of the RO train.
 
@@ -4648,6 +5269,12 @@ def render_stage_requirement(month_snapshot: pd.DataFrame, month_text: str) -> N
         "the total below."
     )
 
+    # Which membranes they are. Derived per stage from the ST-module register, so
+    # nothing has to be keyed in month by month.
+    st.markdown("")
+    st.markdown("**PT / ST split**")
+    render_membrane_type_requirement(month_snapshot, "need", key="portfolio")
+
     st.markdown("")
     st.markdown("**By stage**")
     cards = st.columns(len(table))
@@ -4706,6 +5333,12 @@ def render_portfolio_page(df: pd.DataFrame, params: pd.DataFrame, mis: pd.DataFr
     # fact, not a workbook one, so it is joined on here too — it is what splits the
     # membrane requirement by supplier below.
     status = attach_client(status, load_plants())
+    # Which membrane type each stage takes is a register fact too — the ST-module
+    # list, keyed per (plant, stage) — and it is what splits the requirement into
+    # PT and ST elements below.
+    status = attach_membrane_type(
+        status, load_module_types(), load_module_membrane_types()
+    )
 
     # Month + zone + client slicers — the whole page renders for the chosen month,
     # zones and clients, defaulting to the most recent month and everything else.
@@ -5275,6 +5908,11 @@ def render_dashboard(df: pd.DataFrame, mis: pd.DataFrame) -> None:
     # The entity each plant runs under, for the ROCHEM/ROSERVE split of the
     # requirement this page raises.
     status = attach_client(status, load_plants())
+    # And which membrane type each stage takes, for the PT/ST split of the same
+    # requirement.
+    status = attach_membrane_type(
+        status, load_module_types(), load_module_membrane_types()
+    )
 
     months = sorted(status["report_date"].dropna().unique(), reverse=True)
     month_labels = [pd.Timestamp(m).strftime("%b %Y") for m in months]
@@ -5433,6 +6071,11 @@ def render_dashboard(df: pd.DataFrame, mis: pd.DataFrame) -> None:
         "The same requirement, split by the entity each plant runs under "
         "(Plant Register → Client)."
     )
+
+    # ----- 2c. Which membranes, by type -----
+    st.markdown("")
+    st.markdown("**PT / ST split**")
+    render_membrane_type_requirement(evaluated, "replace", key="limits")
 
     st.markdown("")
     kpis = st.columns(5)
@@ -7615,6 +8258,305 @@ def render_plant_register(engine: Engine) -> None:
             f"{c}: {int(clients[c])}" for c in CLIENT_OPTIONS if clients.get(c, 0) > 0
         ))
 
+    # Which membrane each module runs is a per-plant register fact too — and the
+    # only one recorded per MODULE, because a train mixes PT and ST.
+    status = attach_membrane_type(
+        compute_fleet_status(load_readings(), load_mis()),
+        load_module_types(),
+        load_module_membrane_types(),
+    )
+    render_module_type_editor(status)
+
+
+def plant_module_type_frame(status: pd.DataFrame, plant_key: object) -> pd.DataFrame:
+    """One plant's modules as of its own latest report, with the type each one
+    currently resolves to and where that answer came from.
+
+    Keyed off the plant's OWN latest month, not the fleet's: a site that skipped
+    this month still has modules to type, and they are the same modules."""
+    columns = [
+        "plant_key", "plant", "plant_sr_no", "stage_key", "stage_label",
+        "module_label", "module_sort", "status", "membrane_type",
+        "membrane_type_source", "report_date",
+    ]
+    rows = status[status["plant_key"] == plant_key]
+    if rows.empty:
+        return pd.DataFrame(columns=columns)
+    latest = rows["report_date"].max()
+    rows = rows[rows["report_date"] == latest].copy()
+    rows["module_sort"] = rows["module_label"].map(module_sort_key)
+    rows["stage_rank"] = rows["stage_key"].map(
+        lambda k: STAGE_ORDER.index(k) if k in STAGE_ORDER else len(STAGE_ORDER)
+    )
+    rows = rows.sort_values(["stage_rank", "module_sort"])
+    return rows.reindex(columns=columns).reset_index(drop=True)
+
+
+def st_register_plant_srs(types: pd.DataFrame) -> set[int]:
+    """The plant SRs that run ST modules at all — the ST register IS that list."""
+    if types is None or types.empty:
+        return set()
+    return {int(sr) for sr in types["plant_sr_no"].dropna()}
+
+
+def build_mixed_plant_table(status: pd.DataFrame, types: pd.DataFrame) -> pd.DataFrame:
+    """Module counts by type for the ST-register plants only, in the latest month
+    each reported.
+
+    Scoped to that register on purpose: it is the list of sites that have any ST
+    modules, so it is also the complete list of sites where the question "PT or
+    ST?" has more than one answer. Every other plant is PT and has nothing to
+    decide. Sorted by what still needs a human — unmarked modules first, then the
+    mixed trains."""
+    columns = ["plant_key", "Plant", "Plant No", "Modules", "PT", "ST",
+               "Not specified", "Stages", "Train"]
+    if status.empty:
+        return pd.DataFrame(columns=columns)
+    on_register = st_register_plant_srs(types)
+    scoped = status[
+        status["plant_sr_no"].map(
+            lambda sr: pd.notna(sr) and int(sr) in on_register
+        )
+    ]
+    if scoped.empty:
+        return pd.DataFrame(columns=columns)
+    latest = scoped.groupby("plant_key")["report_date"].transform("max")
+    snap = scoped[scoped["report_date"] == latest]
+    records: list[dict[str, object]] = []
+    for plant_key, rows in snap.groupby("plant_key", sort=False):
+        counts = rows["membrane_type"].value_counts()
+        pt = int(counts.get("PT", 0))
+        st_count = int(counts.get("ST", 0))
+        unknown = int(counts.get(UNKNOWN_MEMBRANE_TYPE, 0))
+        records.append(
+            {
+                "plant_key": plant_key,
+                "Plant": current_plant_name(rows),
+                "Plant No": rows["plant_sr_no"].dropna().iloc[0]
+                if rows["plant_sr_no"].notna().any() else None,
+                "Modules": len(rows),
+                "PT": pt,
+                "ST": st_count,
+                "Not specified": unknown,
+                "Stages": int(rows["stage_key"].nunique()),
+                "Train": (
+                    "Needs marking" if unknown
+                    else "Mixed" if pt and st_count
+                    else "ST only" if st_count
+                    else "PT only"
+                ),
+            }
+        )
+    frame = pd.DataFrame(records, columns=columns)
+    frame["Plant No"] = plant_no_column(frame["Plant No"])
+    order = {"Needs marking": 0, "Mixed": 1, "ST only": 2, "PT only": 3}
+    frame["_rank"] = frame["Train"].map(order).fillna(4)
+    return (
+        frame.sort_values(["_rank", "Not specified", "Modules"], ascending=[True, False, False])
+        .drop(columns=["_rank"])
+        .reset_index(drop=True)
+    )
+
+
+def render_module_type_editor(status: pd.DataFrame) -> None:
+    """Pick, per module, whether it runs a PT or an ST membrane.
+
+    The ST-module register types a stage at a time and is only a starting point —
+    this is where the exceptions are recorded, and a pick here beats the register
+    everywhere the requirement is split."""
+    st.markdown("---")
+    st.subheader("ST module exceptions (PT / ST)", anchor="module-types")
+    engine = get_engine()
+    if engine is None:
+        return
+    if status.empty:
+        st.info("No readings yet, so there are no modules to type.")
+        return
+
+    types = load_module_types()
+    on_register = st_register_plant_srs(types)
+    if not on_register:
+        st.info(
+            "No ST-module register was found in the app directory, so no plant is "
+            "marked as running ST modules and the whole fleet counts as PT."
+        )
+        return
+
+    st.caption(
+        f"The fleet runs **PT**. These **{len(on_register):,} sites** are the ones "
+        "with ST modules — they are the only plants this applies to, and the only "
+        "ones listed here. The ST-module workbook types each of their stages; set a "
+        "module below and your pick wins over it. Everything else in the fleet is "
+        "PT and is not a question, so it isn't asked."
+    )
+
+    overview = build_mixed_plant_table(status, types)
+    if overview.empty:
+        st.info(
+            "None of the plants on the ST register has readings yet, so there are "
+            "no modules to type."
+        )
+        return
+    mixed = int((overview["Train"] == "Mixed").sum())
+    unmarked_plants = int(overview["Not specified"].gt(0).sum())
+    unmarked_modules = int(overview["Not specified"].sum())
+    st_modules = int(overview["ST"].sum())
+    cards = st.columns(4)
+    with cards[0]:
+        metric_card("ST sites", f"{len(overview):,}", "on the register, with readings")
+    with cards[1]:
+        metric_card("ST modules", f"{st_modules:,}", "across those sites", "#7c3aed")
+    with cards[2]:
+        metric_card(
+            "Mixed trains", f"{mixed:,}", "run both PT and ST",
+            "#2563eb" if mixed else "#0f172a",
+        )
+    with cards[3]:
+        metric_card(
+            "Needs marking", f"{unmarked_modules:,}",
+            f"module(s) at {unmarked_plants:,} site(s)" if unmarked_modules
+            else "every module is typed",
+            "#b45309" if unmarked_modules else "#16a34a",
+        )
+    if unmarked_modules:
+        st.caption(
+            "\"Needs marking\" is a stage the register lists with a module count but "
+            "no PT/ST against it. Those are the only modules counted as "
+            f"**{UNKNOWN_MEMBRANE_TYPE}** anywhere — pick a type below and they stop "
+            "being a question."
+        )
+
+    with st.expander(f"The {len(overview):,} ST sites by type"):
+        st.dataframe(
+            overview.drop(columns=["plant_key"]), width="stretch", hide_index=True
+        )
+
+    # ----- the per-module editor, over the ST sites only -----
+    scoped = status[
+        status["plant_sr_no"].map(lambda sr: pd.notna(sr) and int(sr) in on_register)
+    ]
+    options = plant_options(scoped)
+    if not options:
+        return
+    # Offer the plants that still need work first; the overview is already in that
+    # order, so it is what decides the picker's order too.
+    rank = {key: index for index, key in enumerate(overview["plant_key"])}
+    options = sorted(options, key=lambda option: rank.get(option[0], len(rank)))
+    picked = st.selectbox(
+        "Plant",
+        options,
+        format_func=lambda option: plant_option_label(option, options),
+        key="module_types_plant",
+        help="Only the sites on the ST-module register appear here — they are the "
+             "only ones with ST modules. Sites still needing a marking come first.",
+    )
+    plant_key, plant_name, plant_sr_no = picked
+    frame = plant_module_type_frame(scoped, plant_key)
+    if frame.empty:
+        st.info(f"No modules on record for {plant_name}.")
+        return
+
+    month_text = pd.Timestamp(frame["report_date"].iloc[0]).strftime("%b %Y")
+    counts = frame["membrane_type"].value_counts()
+    st.caption(
+        f"**{plant_label_with_sr(plant_name, plant_sr_no)}** · {len(frame):,} modules "
+        f"as of {month_text} · PT {int(counts.get('PT', 0)):,} · "
+        f"ST {int(counts.get('ST', 0)):,} · "
+        f"{UNKNOWN_MEMBRANE_TYPE} {int(counts.get(UNKNOWN_MEMBRANE_TYPE, 0)):,}"
+    )
+
+    # ----- whole-stage shortcuts -----
+    # A 60-module stage is not going to be clicked 60 times, and a stage is uniform
+    # far more often than not. These write straight through, so the button IS the
+    # save; the table below is for the exceptions inside a stage.
+    st.markdown("**Set a whole stage**")
+    for stage_key in stage_keys_present(frame):
+        stage_rows = frame[frame["stage_key"] == stage_key]
+        label_col, *type_cols = st.columns([2, 1, 1])
+        with label_col:
+            st.markdown(
+                f"{stage_display(stage_key)} — {len(stage_rows):,} module(s)"
+            )
+        for column, kind in zip(type_cols, MEMBRANE_TYPE_OPTIONS):
+            if column.button(
+                f"All {kind}", key=f"module_types_bulk::{plant_key}::{stage_key}::{kind}"
+            ):
+                saved = save_module_membrane_types(
+                    engine,
+                    pd.DataFrame(
+                        {
+                            "plant_key": stage_rows["plant_key"].astype(str),
+                            "stage_label": stage_rows["stage_label"].astype(str),
+                            "module_label": stage_rows["module_label"].astype(str),
+                            "membrane_type": kind,
+                            "plant_sr_no": stage_rows["plant_sr_no"],
+                            "plant": stage_rows["plant"],
+                        }
+                    ),
+                )
+                load_module_membrane_types.clear()
+                st.success(
+                    f"{stage_display(stage_key)} set to {kind} — {saved:,} module(s)."
+                )
+                rerun_app()
+
+    editable = pd.DataFrame(
+        {
+            "Stage": frame["stage_key"].map(stage_display),
+            "Module": frame["module_label"].map(format_module_number),
+            "Status": frame["status"].map(
+                lambda v: "Bypassed" if v == "bypass" else "Active"
+            ),
+            "Type": frame["membrane_type"].map(
+                lambda v: v if v in MEMBRANE_TYPE_OPTIONS else None
+            ),
+            "Source": frame["membrane_type_source"],
+        }
+    )
+    edited = st.data_editor(
+        editable,
+        width="stretch",
+        hide_index=True,
+        height=min(560, 80 + 36 * len(editable)),
+        key=f"module_types_editor::{plant_key}",
+        disabled=["Stage", "Module", "Status", "Source"],
+        column_config={
+            "Type": st.column_config.SelectboxColumn(
+                "Type", options=MEMBRANE_TYPE_OPTIONS, width="small",
+                help="PT or ST. Clear a cell to drop the pick and fall back to the "
+                     "ST register's answer for that stage.",
+            ),
+            "Source": st.column_config.TextColumn(
+                "Source", width="medium",
+                help=f"'{TYPE_SOURCE_MODULE}' is a pick made here; "
+                     f"'{TYPE_SOURCE_REGISTER}' comes from the ST-module workbook.",
+            ),
+        },
+    )
+    if st.button(
+        "💾 Save module types", type="primary", key=f"module_types_save::{plant_key}"
+    ):
+        saved = save_module_membrane_types(
+            engine,
+            pd.DataFrame(
+                {
+                    "plant_key": frame["plant_key"].astype(str).values,
+                    "stage_label": frame["stage_label"].astype(str).values,
+                    "module_label": frame["module_label"].astype(str).values,
+                    "membrane_type": edited["Type"].values,
+                    "plant_sr_no": frame["plant_sr_no"].values,
+                    "plant": frame["plant"].values,
+                }
+            ),
+        )
+        load_module_membrane_types.clear()
+        st.success(
+            f"Saved — {saved:,} module(s) typed for "
+            f"{plant_label_with_sr(plant_name, plant_sr_no)}."
+        )
+        rerun_app()
+
+
 
 def render_downtime_editor(roster: pd.DataFrame, month: str, month_label: str) -> None:
     """Tick the plants that were not running in `month`.
@@ -8691,7 +9633,7 @@ def main() -> None:
     try:
         # Once per process (see bootstrap_schema); the ingest below still runs
         # every rerun, because a report can land at any time.
-        bootstrap_schema(database_url() or "")
+        bootstrap_schema(database_url() or "", schema_fingerprint())
         summary = ingest_reports(engine, str(APP_DIR))
         # Rebuild from durable bytes anything whose derived rows went missing
         # (e.g. Cloud restart wiped disk but report_files survived). Usually a no-op.
